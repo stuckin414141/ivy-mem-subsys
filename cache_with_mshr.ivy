@@ -1,0 +1,1227 @@
+#lang ivy1.8
+
+include numbers
+include order
+
+type key
+interpret key -> bv[3]
+
+type word
+interpret word -> bv[64]
+
+type line
+interpret line -> bv[61]
+
+type bit
+interpret bit -> bv[1]
+type bv2
+interpret bv2 -> bv[2]
+# MSHR coalescing-queue position (0..4 used; a bv so quantifiers stay finite).
+type qidx
+interpret qidx -> bv[3]
+# cache backing-store index (2-way, 16 slots): 4 bits = concat(key, way).
+type cache_idx
+interpret cache_idx -> bv[4]
+# top bits of a word address above the 2-bit within-beat index.
+type address_hi
+interpret address_hi -> bv[62]
+
+type two_words
+type four_words
+individual mzero : four_words
+
+# Pack four words into a beat (W0 in the low position); unp0..3 extract them.
+function cat_w(H : word, L : word) : two_words
+function cat_d(H : two_words, L : two_words) : four_words
+function pack4(W3 : word, W2 : word, W1 : word, W0 : word) : four_words
+function unp0(M : four_words) : word
+function unp1(M : four_words) : word
+function unp2(M : four_words) : word
+function unp3(M : four_words) : word
+
+property [p_unp0] forall W3 : word, W2 : word, W1 : word, W0 : word. unp0(pack4(W3, W2, W1, W0)) = W0
+property [p_unp1] forall W3 : word, W2 : word, W1 : word, W0 : word. unp1(pack4(W3, W2, W1, W0)) = W1
+property [p_unp2] forall W3 : word, W2 : word, W1 : word, W0 : word. unp2(pack4(W3, W2, W1, W0)) = W2
+property [p_unp3] forall W3 : word, W2 : word, W1 : word, W0 : word. unp3(pack4(W3, W2, W1, W0)) = W3
+
+type addr
+type woffset
+type way
+isolate data_impl = {
+    interpret two_words -> bv[128]
+    interpret four_words -> bv[256]
+    interpret cat_w -> concat
+    interpret cat_d -> concat
+    definition pack4(W3, W2, W1, W0) = cat_d(cat_w(W3, W2), cat_w(W1, W0))
+    definition unp0(M) = bfe[0][63](M)
+    definition unp1(M) = bfe[64][127](M)
+    definition unp2(M) = bfe[128][191](M)
+    definition unp3(M) = bfe[192][255](M)
+    definition mzero = 0
+}
+
+function concatbv3(H : line, O : woffset) : addr
+function high(A : addr) : line
+function low(A : addr) : woffset
+function concatbv2(B : bit, J : bv2) : woffset
+function beat_of(O : woffset) : bit
+# the slot index of a (set, way) pair, and the two abstract ways.
+function slot(K : key, W : way) : cache_idx
+individual w0 : way
+individual w1 : way
+# beat addressing on the 256-bit bus.
+function ahigh(A : addr) : address_hi
+function waddr(HB : address_hi, J : bv2) : addr
+# the cache set index, hashed from the line address.  Kept ABSTRACT
+# (uninterpreted) -- its bit-vector definition is hidden inside addr_thy so
+# client VCs never bit-blast the 61-bit line->key extraction.  No proof step
+# needs hash's concrete value, only that it is a consistent function (+ the
+# slot/key layout facts).
+function hash(H : line) : key
+
+# ============================================================================
+# addr_thy -- the SINGLE addressing-model isolate (reused VERBATIM from
+# simple_sequential_cache.ivy).  It fixes the small sorts to concrete
+# bit-vectors GLOBALLY, proves all layout facts as `property`s, and HIDES a
+# bit-vector model of the abstract sort `addr` in its `implementation` section
+# so `addr` stays abstract (decidable FAU fragment) in every client isolate.
+# ============================================================================
+isolate addr_thy = {
+    interpret woffset -> bv[3]
+    interpret way -> bv[1]
+    interpret concatbv2 -> concat
+    interpret slot -> concat
+    definition beat_of(O) = bfe[2][2](O)
+    definition w0 = 0
+    definition w1 = 1
+
+    property [p_slot_key]   forall K : key, W : way. bfe[1][3](slot(K, W)) = K
+    property [p_key_slots]  forall I : cache_idx, K : key. bfe[1][3](I) = K -> (I = slot(K, w0) | I = slot(K, w1))
+    property [p_way2]  forall W : way. W = w0 | W = w1
+    property [p_way_ne] w0 ~= w1
+    property [p_boff_beat]  forall B : bit, J : bv2. beat_of(concatbv2(B, J)) = B
+    property [p_cover] forall O : woffset, B : bit. beat_of(O) = B ->
+        (O = concatbv2(B, 0) | O = concatbv2(B, 1) | O = concatbv2(B, 2) | O = concatbv2(B, 3))
+    property [p_full_inj] forall H1 : line, O1 : woffset, H2 : line, O2 : woffset. (concatbv3(H1, O1) = concatbv3(H2, O2)) -> (H1 = H2 & O1 = O2)
+    property [p_beataddr] forall H : line, B : bit, J : bv2. waddr(ahigh(concatbv3(H, concatbv2(B, 0))), J) = concatbv3(H, concatbv2(B, J))
+    property [p_highfull] forall H : line, O : woffset. high(concatbv3(H, O)) = H
+    property [p_lowfull]  forall H : line, O : woffset. low(concatbv3(H, O)) = O
+
+    implementation {
+        interpret addr -> bv[64]
+        definition high(A) = bfe[3][63](A)
+        definition low(A) = bfe[0][2](A)
+        interpret concatbv3 -> concat
+        definition ahigh(A) = bfe[2][63](A)
+        interpret waddr -> concat
+        # hidden bit-vector model of hash (local to addr_thy; keeps hash
+        # abstract for every client isolate).
+        definition hash(H) = bfe[0][2](H)
+    }
+} with this
+
+# ============================================================================
+# Shared "wires" -- global specification state referred to by every isolate.
+# Wires are havocked after every exported action, so the SINGLE exported
+# action `clock` (plus its monitors) must re-drive every wire each edge;
+# the invariants over them are the combinational "driver equations".
+# ============================================================================
+# user request bus (environment -> cache), driven each posedge by `clock`.
+wire user_req_en    : bool
+wire user_req_addr  : addr
+wire user_req_wen   : bool
+wire user_req_wdata : word
+# user response bus (cache -> environment): a one-edge valid pulse carrying the
+# address and data of a completed READ.  (Writes complete silently.)
+wire user_valid : bool
+wire user_addr  : addr
+wire user_data  : word
+# user ready wire (cache -> environment): high iff the cache will accept a new
+# CPU request THIS edge.  `clock` samples it and invalidates the request wires
+# when it is low.
+wire user_ready : bool
+# request bus (cache -> memory_controller)
+wire cache_to_mem_en    : bool
+wire cache_to_mem_wen   : bool
+wire cache_to_mem_addr  : addr
+wire cache_to_mem_wdata : four_words
+# response bus (memory_controller -> cache), registered.  These wires are
+# DEFINITION-driven from private registers of the memory_controller
+# implementation (the c0/c1 pattern of refinement3.ivy): in every other
+# isolate they are unconstrained each edge except for the controller's
+# specification invariants.
+wire mem_response_valid : bool
+wire mem_response_data  : four_words
+wire mem_response_ready : bool
+wire mem_response_addr  : addr
+# response-type tag: high iff this response carries READ data (vs. a write ack).
+# The cache uses it to only capture read responses into fill buffers.
+wire mem_response_rd    : bool
+
+after init {
+    user_req_en    := false;
+    user_req_addr  := 0;
+    user_req_wen   := false;
+    user_req_wdata := 0;
+    user_valid := false;
+    user_addr  := 0;
+    user_data  := 0;
+    user_ready := true;
+    cache_to_mem_en    := false;
+    cache_to_mem_wen   := false;
+    cache_to_mem_addr  := 0;
+    cache_to_mem_wdata := mzero;
+}
+
+action clock(env_en : bool, env_addr : addr, env_wen : bool, env_wdata : word) = {
+    user_req_en    := env_en & user_ready;
+    user_req_addr  := env_addr;
+    user_req_wen   := env_wen;
+    user_req_wdata := env_wdata;
+}
+export clock
+
+function mem_latency : nat
+definition mem_latency = 8
+
+# ============================================================================
+# The REFERENCE MODEL (reference-tagging style, per the Ivy tutorial in
+# doc/examples/hardware/reference_tagging.md).
+#
+# The cache guarantees COHERENCE, not consistency, so there is NO abstract
+# memory in the specification.  The spec is a TRACE of the accepted
+# operations, in acceptance order: entry T records the operation's kind
+# (st(T).op), its word address, and its datum -- for a write the value
+# written; for a read the value RETURNED, recorded by trace.observe at the
+# moment the cache responds (op_done marks that it has been).  The
+# correctness statement is a pair of invariants over this operation
+# sequence alone:
+#
+#   [coh_lw]  every answered read returns the value of the LAST write to
+#             its address preceding it in the trace;
+#   [coh_nw]  ... or the initial value 0 if no such write exists.
+#
+# "The last write" is NAMED BY GHOST RELATIONS derived from the ops alone
+# (a skolemized "no write in between" quantifier would leave Ivy's
+# decidable fragment, and these invariants travel into every isolate that
+# mentions trace state): lwc_r(A, W) tracks the last write to each address
+# as the trace grows, each accepted read snapshots it as op_lw_r(R, W),
+# and the pure-forall invariants lwc_* / lw_* pin both down declaratively
+# (the related W is a write to that address, and no later write to it
+# precedes the read).
+#
+# The per-entry field st(T).mem -- the fold of the writes among entries
+# 1..T -- is retained purely as a GHOST PROOF DEVICE (a derived history
+# variable): the cache's invariants relate every microarchitectural element
+# to it, and lw_memd / lw_memat connect it back to the last-write ghosts,
+# from which coh_lw / coh_nw follow locally at each observe.  It is not
+# part of the specification.
+#
+# The trace is advanced (trace.step) exactly when the cache ACCEPTS a new
+# operation from the user; the accepted operation is thereby associated
+# with a tag -- its index in the trace.  (A set-conflict miss is DROPPED,
+# i.e. NOT accepted: it is never serviced, produces no response, and does
+# not advance the trace.)
+# ============================================================================
+type op_kind = {op_read, op_write}
+
+isolate trace = {
+    specification {
+        instance tag : unbounded_sequence
+
+        # one trace entry: the operation itself, plus (GHOST) the folded
+        # memory after it and the last-write snapshot of a read.
+        type state_t = struct {
+            mem(A : addr) : word,   # GHOST: fold of the writes (proof device)
+            op      : op_kind,
+            op_addr : addr,
+            op_data : word,         # write: value written; read: value returned
+            op_done : bool,         # a read has been answered (op_data valid)
+            op_lwd  : word          # GHOST (reads): datum of the last write to
+                                    # op_addr before this read (0 if none)
+        }
+
+        var now : tag               # length of the trace so far
+        var st(T : tag) : state_t   # the recorded states
+
+        # ---- ghost last-write bookkeeping, derived from the ops alone ----
+        # W is the tag of the last write to A in the trace SO FAR (0: none)
+        relation lwc_r(A : addr, W : tag)
+        # ... and that write's datum (0 if none)
+        function lwd(A : addr) : word
+        # W is the tag of the last write to read R's address BEFORE R
+        # (0: none) -- R's acceptance-time snapshot of lwc_r
+        relation op_lw_r(R : tag, W : tag)
+
+        after init {
+            now := 0;
+            st(T).mem(A : addr) := 0;
+            st(T).op      := op_read;
+            st(T).op_addr := 0;
+            st(T).op_data := 0;
+            st(T).op_done := false;
+            st(T).op_lwd  := 0;
+            lwc_r(A, W)   := W = 0;
+            lwd(A)        := 0;
+            op_lw_r(R, W) := W = 0;
+        }
+
+        # ghost action, called by the cache when it accepts an operation on
+        # word address (h, o).  A write is complete at acceptance (its datum
+        # is its own) and becomes the last write to its address; a read
+        # snapshots the last write to ITS address (op_lw_r / op_lwd) and has
+        # its op_data recorded later, by observe.
+        action step(h : line, o : woffset, wen : bool, wd : word) = {
+            var prev : tag := now;
+            now := now.next;
+            st(now).mem(A : addr) := st(prev).mem(A);
+            st(now).op_addr := concatbv3(h, o);
+            st(now).op_done := wen;
+            if wen {
+                st(now).op      := op_write;
+                st(now).op_data := wd;
+                st(now).op_lwd  := 0;
+                st(now).mem(concatbv3(h, o)) := wd;
+                lwc_r(concatbv3(h, o), W) := W = now;
+                lwd(concatbv3(h, o)) := wd;
+            } else {
+                st(now).op      := op_read;
+                st(now).op_data := 0;
+                st(now).op_lwd  := lwd(concatbv3(h, o));
+                op_lw_r(now, W) := lwc_r(concatbv3(h, o), W);
+            };
+        }
+
+        # ghost action, called by the cache at the moment it RESPONDS to the
+        # read accepted at trace position t: records the returned value in
+        # the trace.  The CALLER proves the value equals the read's
+        # PRE-state memory at its address (a read's entry carries its
+        # predecessor's memory unchanged); coherence over the operation
+        # sequence then follows locally here, via lw_memat / lw_is_wr.
+        action observe(t : tag, v : word) = {
+            require t ~= 0 & t <= now;
+            require st(t).op = op_read & ~st(t).op_done;
+            require v = st(t).mem(st(t).op_addr);
+            st(t).op_data := v;
+            st(t).op_done := true;
+        }
+
+        # ---- ghost-memory bookkeeping (proof devices, not the spec) ----
+        # consecutive recorded entries are related by one fold step
+        invariant [tr_step] (tag.succ(T,U) & U <= now) ->
+            st(U).mem(A) = (st(U).op_data if (st(U).op = op_write & A = st(U).op_addr) else st(T).mem(A))
+        # the top of the fold is the last-write datum at every address ...
+        invariant [lw_memd] st(now).mem(A) = lwd(A)
+        # ... and a read's own entry holds its last-write datum at its
+        # address (this is what turns observe's require into coh_val)
+        invariant [lw_memat] (R <= now & st(R).op = op_read) ->
+            st(R).mem(st(R).op_addr) = st(R).op_lwd
+
+        # ---- lwc_r really is "the last write so far": a related W ~= 0 is
+        # a write to A ... ----
+        invariant [lwc_wr] (lwc_r(A,W) & W ~= 0) ->
+            (W <= now & st(W).op = op_write & st(W).op_addr = A)
+        # ... no LATER write to A exists ...
+        invariant [lwc_latest] (lwc_r(A,W) & W < V & V <= now & st(V).op = op_write) ->
+            st(V).op_addr ~= A
+        # ... W = 0 means NO write to A exists at all ...
+        invariant [lwc_none] (lwc_r(A,0) & V <= now & st(V).op = op_write) ->
+            st(V).op_addr ~= A
+        # ... lwd carries exactly the related write's datum, and each
+        # address relates to exactly one W ----
+        invariant [lwc_datum] (lwc_r(A,W) & W ~= 0) -> st(W).op_data = lwd(A)
+        invariant [lwc_datum0] lwc_r(A,0) -> lwd(A) = 0
+        invariant [lwc_fun] (lwc_r(A,W1) & lwc_r(A,W2)) -> W1 = W2
+
+        # ---- op_lw_r really is "the last write BEFORE read R": a related
+        # W ~= 0 is an earlier write to R's address holding R's op_lwd ... ----
+        invariant [lw_is_wr] (op_lw_r(R,W) & R <= now & st(R).op = op_read & W ~= 0) ->
+            (W < R & st(W).op = op_write & st(W).op_addr = st(R).op_addr
+             & st(W).op_data = st(R).op_lwd)
+        # ... no write to R's address lies strictly between W and R ...
+        invariant [lw_latest] (op_lw_r(R,W) & R <= now & st(R).op = op_read
+             & W < V & V < R & st(V).op = op_write) ->
+            st(V).op_addr ~= st(R).op_addr
+        # ... W = 0 means NO write to R's address precedes R ...
+        invariant [lw_none] (op_lw_r(R,0) & R <= now & st(R).op = op_read
+             & V < R & st(V).op = op_write) ->
+            st(V).op_addr ~= st(R).op_addr
+        invariant [lw_zero] (op_lw_r(R,0) & R <= now & st(R).op = op_read) ->
+            st(R).op_lwd = 0
+        invariant [lw_fun] (op_lw_r(R,W1) & op_lw_r(R,W2) & R <= now & st(R).op = op_read) ->
+            W1 = W2
+
+        # ================ the SPECIFICATION: coherence ================
+        # every answered read returned its last-write snapshot ...
+        invariant [coh_val] (R <= now & st(R).op = op_read & st(R).op_done) ->
+            st(R).op_data = st(R).op_lwd
+        # ... i.e. the value of the LAST write to its address before it in
+        # the trace (per lw_is_wr / lw_latest, W below is exactly that) ...
+        invariant [coh_lw] (op_lw_r(R,W) & W ~= 0
+             & R <= now & st(R).op = op_read & st(R).op_done) ->
+            st(R).op_data = st(W).op_data
+        # ... or 0 if no write to its address precedes it (per lw_none)
+        invariant [coh_nw] (op_lw_r(R,0)
+             & R <= now & st(R).op = op_read & st(R).op_done) ->
+            st(R).op_data = 0
+    }
+} with this
+
+# ---- ghost tag channel alongside the memory bus: every command the cache
+# issues carries the trace position its data (writeback) or target (read)
+# reflects; the controller's response carries the command's tag back. ----
+wire cache_to_mem_tag : trace.tag
+wire mem_response_tag : trace.tag
+
+after init {
+    cache_to_mem_tag := 0;
+}
+
+# ============================================================================
+# MSHR data structures.
+#
+# There are TWO MSHRs (mshr_id = bv[1]) so two line misses can be outstanding
+# concurrently, which is what creates the interesting bus-arbitration conflict
+# (an eviction writeback from one MSHR vs. a fetch read from the other).
+#
+# Macro-states (exactly the five from mshr.md):
+#   mshr_idle            -- free
+#   mshr_req_lower       -- lower 256-bit beat requested, awaiting its response
+#   mshr_finished_lower  -- lower beat captured, upper beat not yet issued
+#   mshr_req_upper       -- upper beat requested, awaiting its response
+#   mshr_drain           -- both beats captured; servicing the queued requests
+#                           IN ORDER, then (victim chosen HERE, at the last
+#                           moment) any eviction writeback, then the fill.
+#
+# The drain macro-state has an internal sub-phase (m_dphase) because the
+# writeback needs the bus for two beats and the whole eviction must be
+# race-free w.r.t. the victim line:
+#   dp_resp   -- servicing the queued requests in FIFO order
+#   dp_wb_lo  -- issuing the victim writeback lower beat  (bus)
+#   dp_wb_hi  -- issuing the victim writeback upper beat  (bus)
+#   dp_fill   -- writing the fetched line into the victim slot
+#
+# The coalescing queue is a FIFO: rq_head is the next entry to service,
+# rq_next the next free entry.  Entries are serviced strictly in ACCEPTANCE
+# ORDER -- this is what guarantees a queued read can never observe a write
+# accepted after it.  Requests coalescing onto a DRAINING owner also simply
+# enqueue (an immediate-serve fast path for a write would commit it into the
+# fill buffer ahead of older queued reads of the same line -- a real
+# memory-ordering violation under the per-operation trace spec).
+# rq_next never wraps: an MSHR accepts at most 4 operations per residency
+# episode (then reports full), which keeps the FIFO order argument trivial.
+# ============================================================================
+type mshr_state = { mshr_idle, mshr_req_lower, mshr_finished_lower, mshr_req_upper, mshr_drain }
+type dphase = { dp_resp, dp_wb_lo, dp_wb_hi, dp_fill }
+type mshr_id
+interpret mshr_id -> bv[1]
+
+# One queued request.  rq_off is the offset from the line base.
+type mshr_req = struct {
+    rq_off   : woffset,
+    rq_wen   : bool,
+    rq_wdata : word
+}
+
+type cache_entry = struct {
+    occupied : bool,
+    dirty    : bool,
+    tag      : line,
+    lru      : bit,          # 2-way LRU is one bit (0/1); avoids integer theory
+    val(O : woffset) : word
+}
+
+isolate simple_cache = {
+    specification {
+        function cache(I : cache_idx) : cache_entry
+
+        # ---- MSHR file (family of functions indexed by mshr_id) ----
+        function m_state(Id : mshr_id)          : mshr_state
+        function m_base(Id : mshr_id)           : line
+        function m_q(Id : mshr_id, K : qidx)    : mshr_req   # coalescing FIFO
+        function rq_head(Id : mshr_id)          : qidx       # next entry to service
+        function rq_next(Id : mshr_id)          : qidx       # next free entry
+        function rq_haswr(Id : mshr_id)         : bool       # a queued WRITE is pending
+        function m_fbuf(Id : mshr_id, O : woffset) : word    # fetched line data
+        function m_dirty(Id : mshr_id)          : bool       # line will be dirty on fill
+        function m_dphase(Id : mshr_id)         : dphase     # drain sub-phase
+        function m_victim_way(Id : mshr_id)     : way        # chosen at end of drain
+        # the victim as a DIRECT slot index (= slot(hash(m_base), m_victim_way)).
+        function m_victim_slot(Id : mshr_id)    : cache_idx
+
+        # ---- ghost reference tags ----
+        # tag of the operation queued at position K of MSHR Id.
+        function rq_tag(Id : mshr_id, K : qidx) : trace.tag
+        # trace position each cache entry's data reflects: stamped trace.now by
+        # a hit-write (the write's own tag) and commit_tag by the fill (the
+        # fill data is inv_fbuf-current as of the commit frontier).  Lets
+        # inv_coh be a LOCAL element-vs-trace-at-its-tag invariant (st entries
+        # are immutable, so other transitions frame over it), with the "still
+        # up to date" burden carried by inv_coh_fresh over ghost state only.
+        function e_tag(I : cache_idx) : trace.tag
+        # trace position of the last COMMITTED operation: st(commit_tag).mem is
+        # the memory with exactly the committed writes applied.  It equals
+        # trace.now except while an accepted write sits unserviced in an MSHR
+        # queue (queued writes commit at drain service; everything else commits
+        # at acceptance).  At most ONE accepted write can be uncommitted at any
+        # time: a queued write makes its MSHR full, which drops user_ready,
+        # blocking ALL further accepts until it commits.
+        var commit_tag : trace.tag
+        # tag of the operation the current user response answers.
+        var user_tag : trace.tag
+
+        # ---- transient per-cycle arbitration guards (reset each edge) ----
+        var port_used : bool   # user response port taken this edge
+        var bus_used  : bool   # cache->mem bus taken this edge
+
+        after init {
+            occupied(cache(I)) := false;
+            dirty(cache(I)) := false;
+            tag(cache(I)) := 0;
+            lru(cache(I)) := 0;
+            val(cache(I), O) := 0;
+            m_state(Id)  := mshr_idle;
+            m_base(Id)   := 0;
+            m_dirty(Id)  := false;
+            m_dphase(Id) := dp_resp;
+            m_victim_way(Id) := w0;
+            m_victim_slot(Id) := 0;
+            m_fbuf(Id, O) := 0;
+            rq_head(Id) := 0;
+            rq_next(Id) := 0;
+            rq_haswr(Id) := false;
+            rq_off(m_q(Id, K))   := 0;
+            rq_wen(m_q(Id, K))   := false;
+            rq_wdata(m_q(Id, K)) := 0;
+            rq_tag(Id, K) := 0;
+            e_tag(I) := 0;
+            commit_tag := 0;
+            user_tag   := 0;
+            port_used := false;
+            bus_used  := false;
+        }
+
+        # ---- entry K of MSHR Id is pending (accepted, not yet serviced) ----
+        relation rq_pend(Id : mshr_id, K : qidx)
+        definition rq_pend(Id, K) = rq_head(Id) <= K & K < rq_next(Id)
+
+        # ---- an MSHR is FULL if it has taken 4 operations this episode, OR a
+        # queued write is pending (a write terminates coalescing -- mshr.md). ----
+        relation mshr_full(Id : mshr_id)
+        definition mshr_full(Id) = rq_next(Id) = 4 | rq_haswr(Id)
+
+        # ---- an MSHR is EVICTING while it holds the bus/slot for a writeback or
+        # is about to overwrite the victim.  New user requests are blocked during
+        # this window so the victim line cannot be hit/rewritten mid-eviction. ----
+        relation evicting(Id : mshr_id)
+        definition evicting(Id) = (m_state(Id) = mshr_drain
+            & (m_dphase(Id) = dp_wb_lo | m_dphase(Id) = dp_wb_hi | m_dphase(Id) = dp_fill))
+
+        # ---- the committed abstract memory: the trace at the commit tag ----
+        function cmem(A : addr) : word
+        definition cmem(A) = trace.st(commit_tag).mem(A)
+
+        # ==================================================================
+        # helper actions
+        # ==================================================================
+
+        # append an accepted request to MSHR id's FIFO.  The caller has just
+        # stepped the trace, so the op's tag is trace.now.  A read commits at
+        # acceptance (it does not change the memory), so commit_tag advances;
+        # a write commits later, at drain service.
+        action enqueue(id : mshr_id, off : woffset, wen : bool, wd : word) = {
+            rq_off(m_q(id, rq_next(id)))   := off;
+            rq_wen(m_q(id, rq_next(id)))   := wen;
+            rq_wdata(m_q(id, rq_next(id))) := wd;
+            rq_tag(id, rq_next(id)) := trace.now;
+            if wen {
+                rq_haswr(id) := true;
+            } else {
+                commit_tag := trace.now;
+            };
+            rq_next(id) := rq_next(id) + 1;
+        }
+
+        # service the HEAD queue entry at drain: a READ returns from the fill
+        # buffer (takes the port; retries next edge if the port is busy); a
+        # WRITE commits into the fill buffer AND advances commit_tag to its
+        # tag (its trace entry already carries the write).
+        action svc_head(id : mshr_id) = {
+            var k : qidx := rq_head(id);
+            if rq_wen(m_q(id, k)) {
+                m_fbuf(id, rq_off(m_q(id, k))) := rq_wdata(m_q(id, k));
+                m_dirty(id) := true;
+                rq_haswr(id) := false;
+                commit_tag := rq_tag(id, k);
+                rq_head(id) := k + 1;
+            } else {
+                if ~port_used {
+                    user_valid := true;
+                    user_addr  := concatbv3(m_base(id), rq_off(m_q(id, k)));
+                    user_data  := m_fbuf(id, rq_off(m_q(id, k)));
+                    user_tag   := rq_tag(id, k);
+                    # record the returned value in the trace (obligation:
+                    # t_qrd names the entry; inv_fbuf + t_qread give the value)
+                    trace.observe(rq_tag(id, k), m_fbuf(id, rq_off(m_q(id, k))));
+                    port_used  := true;
+                    rq_head(id) := k + 1;
+                };
+            };
+        }
+
+        # write the fetched line into the (already-written-back) victim slot,
+        # then free the MSHR.
+        action do_fill(id : mshr_id) = {
+            var vslot : cache_idx := m_victim_slot(id);
+            var oway  : way := w1;
+            if m_victim_way(id) = w1 { oway := w0; };
+            var oslot : cache_idx := slot(hash(m_base(id)), oway);
+            tag(cache(vslot))      := m_base(id);
+            val(cache(vslot), O)   := m_fbuf(id, O);
+            e_tag(vslot)           := commit_tag;
+            dirty(cache(vslot))    := m_dirty(id);
+            occupied(cache(vslot)) := true;
+            lru(cache(vslot)) := 0;
+            lru(cache(oslot)) := 1;
+            m_state(id) := mshr_idle;
+        }
+
+        # STEP A: capture a memory read response into whichever MSHR's
+        # outstanding beat address matches (single outstanding => unique match).
+        action capture_resp(id : mshr_id) = {
+            if m_state(id) = mshr_req_lower & mem_response_addr = concatbv3(m_base(id), concatbv2(0,0)) {
+                m_fbuf(id, concatbv2(0,0)) := unp0(mem_response_data);
+                m_fbuf(id, concatbv2(0,1)) := unp1(mem_response_data);
+                m_fbuf(id, concatbv2(0,2)) := unp2(mem_response_data);
+                m_fbuf(id, concatbv2(0,3)) := unp3(mem_response_data);
+                m_state(id) := mshr_finished_lower;
+            } else { if m_state(id) = mshr_req_upper & mem_response_addr = concatbv3(m_base(id), concatbv2(1,0)) {
+                m_fbuf(id, concatbv2(1,0)) := unp0(mem_response_data);
+                m_fbuf(id, concatbv2(1,1)) := unp1(mem_response_data);
+                m_fbuf(id, concatbv2(1,2)) := unp2(mem_response_data);
+                m_fbuf(id, concatbv2(1,3)) := unp3(mem_response_data);
+                m_state(id) := mshr_drain;
+                m_dphase(id) := dp_resp;
+            } };
+        }
+
+        # STEP C: drain servicing for one MSHR (non-bus part: FIFO service,
+        # victim choice, and the fill).  The two writeback beats are issued by
+        # the bus arbiter (STEP D) since they need the bus.
+        action drain_step(id : mshr_id) = {
+            if m_state(id) = mshr_drain {
+                if m_dphase(id) = dp_resp {
+                    if rq_head(id) ~= rq_next(id) {
+                        call svc_head(id);
+                    } else {
+                        # queue drained: choose the victim NOW (last moment,
+                        # from current LRU).  If it is dirty & occupied we must
+                        # write it back; otherwise fill straight away.
+                        var vw : way := w1;
+                        if lru(cache(slot(hash(m_base(id)), w1))) = 1 { vw := w0; };
+                        m_victim_way(id) := vw;
+                        var vslot : cache_idx := slot(hash(m_base(id)), vw);
+                        m_victim_slot(id) := vslot;
+                        if occupied(cache(vslot)) & dirty(cache(vslot)) {
+                            m_dphase(id) := dp_wb_lo;
+                        } else {
+                            call do_fill(id);
+                        };
+                    };
+                } else { if m_dphase(id) = dp_fill {
+                    call do_fill(id);
+                } };
+            };
+        }
+
+        # drive the bus for a victim-writeback beat B of MSHR Id.  The command
+        # carries the victim entry's e_tag: the shipped data is the trace at
+        # that tag (inv_coh), so the buffer's local invariant needs no
+        # freshness argument at issue time.
+        action issue_wb(id : mshr_id, b : bit) = {
+            var vslot : cache_idx := m_victim_slot(id);
+            cache_to_mem_en    := true;
+            cache_to_mem_wen   := true;
+            cache_to_mem_addr  := concatbv3(tag(cache(vslot)), concatbv2(b, 0));
+            cache_to_mem_wdata := pack4(val(cache(vslot), concatbv2(b,3)),
+                                        val(cache(vslot), concatbv2(b,2)),
+                                        val(cache(vslot), concatbv2(b,1)),
+                                        val(cache(vslot), concatbv2(b,0)));
+            cache_to_mem_tag   := e_tag(vslot);
+        }
+
+        # drive the bus for a fetch read beat b of MSHR id.  The command
+        # carries the current commit frontier: the memory it will read equals
+        # the trace there (the controller's private inv_memat; no exception applies to a fetched line).
+        action issue_rd(id : mshr_id, b : bit) = {
+            cache_to_mem_en    := true;
+            cache_to_mem_wen   := false;
+            cache_to_mem_addr  := concatbv3(m_base(id), concatbv2(b, 0));
+            cache_to_mem_wdata := mzero;
+            cache_to_mem_tag   := commit_tag;
+        }
+
+        # ==================================================================
+        # the clocked datapath
+        # ==================================================================
+        after clock {
+            port_used := false;
+            bus_used  := false;
+            cache_to_mem_en    := false;
+            cache_to_mem_wen   := false;
+            cache_to_mem_addr  := 0;
+            cache_to_mem_wdata := mzero;
+            cache_to_mem_tag   := 0;
+            user_valid := false;
+            user_addr  := 0;
+            user_data  := 0;
+
+            # ===== STEP A: capture fetch (READ) responses =====
+            # (write acks carry a resident victim address, never an in-flight
+            # m_base, so they would match no MSHR anyway; gating on the read tag
+            # lets the proof invoke the controller's response guarantee inv_resp_rd.)
+            if mem_response_valid & mem_response_rd {
+                call capture_resp(0);
+                call capture_resp(1);
+            };
+
+            # ===== STEP B: serve the incoming CPU request (gets port priority) =====
+            # Every branch that ACCEPTS the request steps the trace (ghost),
+            # associating the operation with tag trace.now.
+            if user_req_en {
+                var rl : line    := high(user_req_addr);
+                var rs : key     := hash(rl);
+                var ro : woffset := low(user_req_addr);
+                var s0 : cache_idx := slot(rs, w0);
+                var s1 : cache_idx := slot(rs, w1);
+                var hit  : bool  := false;
+                var hslot : cache_idx := s1;
+                var hway : way   := w1;
+                if occupied(cache(s1)) & tag(cache(s1)) = rl { hit:=true; hslot:=s1; hway:=w1; }
+                else { if occupied(cache(s0)) & tag(cache(s0)) = rl { hit:=true; hslot:=s0; hway:=w0; } };
+                if hit {
+                    trace.step(rl, ro, user_req_wen, user_req_wdata);
+                    commit_tag := trace.now;   # a hit commits at acceptance
+                    if ~user_req_wen {
+                        user_valid := true; user_addr := user_req_addr; user_data := val(cache(hslot), ro);
+                        user_tag   := trace.now;
+                        port_used  := true;
+                        # record the returned value in the trace (obligation:
+                        # inv_coh + inv_coh_pres at U := the predecessor tag)
+                        trace.observe(trace.now, val(cache(hslot), ro));
+                    } else {
+                        val(cache(hslot), ro) := user_req_wdata;
+                        e_tag(hslot)          := trace.now;
+                        dirty(cache(hslot))   := true;
+                    };
+                    if hway = w1 { lru(cache(s0)):=1; lru(cache(s1)):=0; }
+                    else         { lru(cache(s0)):=0; lru(cache(s1)):=1; };
+                } else {
+                    # ---- miss: coalesce onto the owning MSHR, or allocate ----
+                    var owner_found : bool := false;
+                    var owner : mshr_id := 0;
+                    if m_state(0) ~= mshr_idle & m_base(0) = rl { owner_found:=true; owner:=0; }
+                    else { if m_state(1) ~= mshr_idle & m_base(1) = rl { owner_found:=true; owner:=1; } };
+                    if owner_found {
+                        # enqueue in FIFO order, even while the owner is
+                        # draining -- the entry is serviced after all older
+                        # entries, so a queued read can never observe a write
+                        # accepted after it.
+                        trace.step(rl, ro, user_req_wen, user_req_wdata);
+                        call enqueue(owner, ro, user_req_wen, user_req_wdata);
+                    } else {
+                        # new miss: allocate an idle MSHR, unless another active
+                        # MSHR already owns this SET (one MSHR per set -- avoids a
+                        # two-MSHR fill collision).  Otherwise the request is
+                        # DROPPED, i.e. NOT accepted: it is never serviced, gets
+                        # no response, and does not advance the trace (safe:
+                        # not responding never violates the response theorem).
+                        var conflict : bool := false;
+                        if m_state(0) ~= mshr_idle & hash(m_base(0)) = rs { conflict := true; };
+                        if m_state(1) ~= mshr_idle & hash(m_base(1)) = rs { conflict := true; };
+                        if ~conflict {
+                            var aid : mshr_id := 0;
+                            if m_state(0) ~= mshr_idle { aid := 1; };
+                            trace.step(rl, ro, user_req_wen, user_req_wdata);
+                            m_state(aid)  := mshr_req_lower;
+                            m_base(aid)   := rl;
+                            m_dirty(aid)  := false;
+                            m_dphase(aid) := dp_resp;
+                            m_fbuf(aid, O) := 0;
+                            rq_head(aid) := 0;
+                            rq_next(aid) := 0;
+                            rq_haswr(aid) := false;
+                            call enqueue(aid, ro, user_req_wen, user_req_wdata);
+                        };
+                    };
+                };
+            };
+
+            # ===== STEP C: drain servicing (FIFO service / fill) =====
+            call drain_step(0);
+            call drain_step(1);
+
+            # ===== STEP D: memory bus arbiter =====
+            # Priority: eviction WRITEBACKS (both MSHRs) before fetch READS
+            # (mshr.md: prioritize writes from evictions over reads from MSHRs).
+            # A single command per edge; issues only when memory is ready
+            # (command buffer free).  If not ready, the MSHR simply waits.
+            if mem_response_ready {
+                if m_state(0) = mshr_drain & m_dphase(0) = dp_wb_lo {
+                    call issue_wb(0, 0); m_dphase(0) := dp_wb_hi; bus_used := true;
+                } else { if m_state(0) = mshr_drain & m_dphase(0) = dp_wb_hi {
+                    call issue_wb(0, 1); m_dphase(0) := dp_fill; bus_used := true;
+                } else { if m_state(1) = mshr_drain & m_dphase(1) = dp_wb_lo {
+                    call issue_wb(1, 0); m_dphase(1) := dp_wb_hi; bus_used := true;
+                } else { if m_state(1) = mshr_drain & m_dphase(1) = dp_wb_hi {
+                    call issue_wb(1, 1); m_dphase(1) := dp_fill; bus_used := true;
+                } else { if m_state(0) = mshr_req_lower {
+                    call issue_rd(0, 0); bus_used := true;
+                } else { if m_state(0) = mshr_finished_lower {
+                    call issue_rd(0, 1); m_state(0) := mshr_req_upper; bus_used := true;
+                } else { if m_state(1) = mshr_req_lower {
+                    call issue_rd(1, 0); bus_used := true;
+                } else { if m_state(1) = mshr_finished_lower {
+                    call issue_rd(1, 1); m_state(1) := mshr_req_upper; bus_used := true;
+                } } } } } } } };
+            };
+
+            # ===== STEP E: readiness =====
+            # Accept a new request only when no MSHR is full (mshr.md), an MSHR
+            # is idle (so a new miss can always allocate), and no MSHR is mid-
+            # eviction (so the victim line cannot be disturbed).
+            user_ready := ~(mshr_full(0) | mshr_full(1))
+                        & (m_state(0) = mshr_idle | m_state(1) = mshr_idle)
+                        & ~evicting(0) & ~evicting(1);
+        }
+
+    # ========================================================================
+    # Reference-tagging invariants.  Each microarchitectural element carries a
+    # small local invariant relating its contents to the trace:
+    #   (1) structural   -- cache/MSHR/queue shape facts
+    #   (2) tags         -- queue tags vs. the trace; the commit-tag discipline
+    #   (3) coherence    -- resident lines, main memory, buffers vs. cmem
+    #                       (= the trace at the commit tag)
+    #   (4) theorem      -- the trace-level coherence spec (trace.coh_lw /
+    #                       coh_nw) is discharged via trace.observe; ref_done
+    #                       ties the response wires to the trace record
+    # NOTE: the invariants stay INSIDE the specification section so they are
+    # EXPORTED: only spec-section invariants are assumed by isolates that
+    # `with`-include this one, and the memory_controller isolate needs them
+    # to prove its private command-buffer invariants (inv_memat & co).
+    # ========================================================================
+
+    # ---- "line H is resident" -- it occupies one of its set's two ways ----
+    relation resident(H : line)
+    definition resident(H) =
+        (occupied(cache(slot(hash(H), w0))) & tag(cache(slot(hash(H), w0))) = H)
+      | (occupied(cache(slot(hash(H), w1))) & tag(cache(slot(hash(H), w1))) = H)
+
+    # ================ (1) structural ================
+    # ---- an occupied slot's tag hashes to the slot's own set ----
+    invariant [inv_hashkey] forall I : cache_idx.
+        occupied(cache(I)) -> hash(tag(cache(I))) = bfe[1][3](I)
+    # ---- a line lives in at most one slot ----
+    invariant [inv_syn] forall I1 : cache_idx, I2 : cache_idx.
+        (occupied(cache(I1)) & occupied(cache(I2)) & tag(cache(I1)) = tag(cache(I2))) -> I1 = I2
+    # ---- at most one MSHR per set (enforced by the allocation conflict check).
+    # Load-bearing: keeps the two MSHRs from ever touching the same cache slot. ----
+    invariant [inv_oneperset]
+        (m_state(0) ~= mshr_idle & m_state(1) ~= mshr_idle) ->
+        hash(m_base(0)) ~= hash(m_base(1))
+    # ---- an active MSHR's base line is NOT resident (its slot is only written
+    # at do_fill, which simultaneously drops the MSHR to idle). ----
+    invariant [inv_mbase_nr] forall Id : mshr_id.
+        m_state(Id) ~= mshr_idle -> ~resident(m_base(Id))
+    # ---- direct corollary of inv_mbase_nr + inv_hashkey: NO occupied slot holds
+    # an active MSHR's base line. ----
+    invariant [inv_mbase_notag] forall I : cache_idx, Id : mshr_id.
+        (m_state(Id) ~= mshr_idle & occupied(cache(I))) -> tag(cache(I)) ~= m_base(Id)
+    # ---- the stored victim slot is in m_base's set and occupied & dirty while an
+    # eviction is in progress. ----
+    invariant [inv_victim] forall Id : mshr_id.
+        evicting(Id) -> (bfe[1][3](m_victim_slot(Id)) = hash(m_base(Id))
+                       & occupied(cache(m_victim_slot(Id))) & dirty(cache(m_victim_slot(Id))))
+
+    # ---- queue pointer discipline ----
+    invariant [inv_q_bound] rq_head(Id) <= rq_next(Id) & rq_next(Id) <= 4
+    invariant [inv_q_idle] m_state(Id) = mshr_idle -> (rq_head(Id) = rq_next(Id) & ~rq_haswr(Id))
+    # ---- the queue is fully drained before the eviction phases begin (drain
+    # leaves dp_resp only when empty; evicting blocks all further accepts).
+    # Needed so do_fill (from dp_fill) re-establishes inv_q_idle. ----
+    invariant [inv_q_evict] evicting(Id) -> (rq_head(Id) = rq_next(Id) & ~rq_haswr(Id))
+    # ---- a queued write is the LAST accepted entry of its queue (a write
+    # terminates coalescing: it makes the MSHR full, dropping user_ready) ----
+    invariant [inv_q_wlast] (rq_pend(Id,K) & rq_wen(m_q(Id,K))) ->
+        (K + 1 = rq_next(Id) & rq_haswr(Id))
+    # ---- a pending write implies a NONEMPTY queue (guards the K+1 wraparound:
+    # without this, next=0 with haswr and "K=7" satisfies the last-slot fact
+    # vacuously, leaving a spurious CTI for inv_q_idle at do_fill) ----
+    invariant [inv_q_haswr] rq_haswr(Id) -> rq_head(Id) < rq_next(Id)
+    invariant [inv_q_haswr2] (rq_haswr(Id) & K + 1 = rq_next(Id) & K < 4) ->
+        (rq_head(Id) <= K & rq_wen(m_q(Id,K)))
+    # ---- at most one pending write GLOBALLY (any pending write drops ready) ----
+    invariant [inv_onewr] ~(rq_haswr(0) & rq_haswr(1))
+    # ---- the registered ready wire really means what STEP B assumes ----
+    invariant [inv_ready] user_ready ->
+        (~mshr_full(0) & ~mshr_full(1)
+         & (m_state(0) = mshr_idle | m_state(1) = mshr_idle)
+         & ~evicting(0) & ~evicting(1))
+
+    # ================ (2) tags ================
+    invariant [t_tag_le] rq_pend(Id,K) -> (rq_tag(Id,K) <= trace.now & rq_tag(Id,K) ~= 0)
+    invariant [t_ct_le] commit_tag <= trace.now
+    # with no pending write everything accepted has committed
+    invariant [t_ct_now] (~rq_haswr(0) & ~rq_haswr(1)) -> commit_tag = trace.now
+    # the unique pending write is the newest trace entry, one past commit_tag,
+    # and the trace entry records exactly this write
+    invariant [t_qwr] (rq_pend(Id,K) & rq_wen(m_q(Id,K))) ->
+        (rq_tag(Id,K) = trace.now
+         & trace.tag.succ(commit_tag, trace.now)
+         & trace.st(trace.now).op = op_write
+         & trace.st(trace.now).op_addr = concatbv3(m_base(Id), rq_off(m_q(Id,K)))
+         & trace.st(trace.now).op_data = rq_wdata(m_q(Id,K)))
+    # ---- a pending READ's trace record: an unanswered read at the queue's
+    # (line, offset) address.  ~op_done is what entitles svc_head to observe. ----
+    invariant [t_qrd] (rq_pend(Id,K) & ~rq_wen(m_q(Id,K))) ->
+        (trace.st(rq_tag(Id,K)).op = op_read
+         & ~trace.st(rq_tag(Id,K)).op_done
+         & trace.st(rq_tag(Id,K)).op_addr = concatbv3(m_base(Id), rq_off(m_q(Id,K))))
+    # ---- pending tags are pairwise distinct (each acceptance is a fresh
+    # trace position), so an observe cannot clobber another queued read ----
+    invariant [t_tag_uniq] (rq_pend(Id1,K1) & rq_pend(Id2,K2)
+        & rq_tag(Id1,K1) = rq_tag(Id2,K2)) -> (Id1 = Id2 & K1 = K2)
+    # ---- THE per-entry tag invariant: a pending READ's correct value -- the
+    # trace memory AT its own entry (= its pre-state: a read's entry carries
+    # its predecessor's memory unchanged), at its address -- equals the
+    # committed memory there.  Nothing that committed after the read was
+    # accepted has written its address: same-line writes are behind it in
+    # ITS OWN FIFO (uncommitted until serviced, and serviced after it);
+    # other lines never alias its address.  This is exactly what discharges
+    # observe's value-require at drain service (with inv_fbuf). ----
+    invariant [t_qread] (rq_pend(Id,K) & ~rq_wen(m_q(Id,K))) ->
+        trace.st(rq_tag(Id,K)).mem(concatbv3(m_base(Id), rq_off(m_q(Id,K))))
+          = cmem(concatbv3(m_base(Id), rq_off(m_q(Id,K))))
+
+    # ---- "line H sits in a dirty occupied slot" ----
+    relation dirty_here(H : line)
+    definition dirty_here(H) =
+        (occupied(cache(slot(hash(H),w0))) & dirty(cache(slot(hash(H),w0))) & tag(cache(slot(hash(H),w0))) = H)
+      | (occupied(cache(slot(hash(H),w1))) & dirty(cache(slot(hash(H),w1))) & tag(cache(slot(hash(H),w1))) = H)
+
+    # ================ (3) coherence vs. the trace ================
+    # Every element follows the same two-invariant pattern:
+    #   (data)  its contents equal the trace at ITS OWN tag -- local and
+    #           frame-stable, since recorded trace entries are immutable;
+    #   (pres)  the trace memory at its line is PRESERVED across all steps
+    #           from its tag up to the commit frontier -- ghost-only, no
+    #           datapath terms.  This is what lets a consumer at a later
+    #           trace position still use the data.
+    # ---- each cache entry matches the trace at its own tag ... ----
+    invariant [inv_coh] forall I : cache_idx, O : woffset.
+        occupied(cache(I)) -> val(cache(I),O) = trace.st(e_tag(I)).mem(concatbv3(tag(cache(I)),O))
+    # ---- ... its tag never leads the commit frontier ... ----
+    invariant [e_tag_le] occupied(cache(I)) -> e_tag(I) <= commit_tag
+    # ---- ... and nothing committed since e_tag(I) has written its line (a
+    # write to a resident line is a hit, which re-stamps e_tag).  A hit-read
+    # discharges the theorem by instantiating U at its own predecessor tag. ----
+    invariant [inv_coh_pres]
+        (occupied(cache(I)) & e_tag(I) <= U & U <= commit_tag) ->
+        trace.st(U).mem(concatbv3(tag(cache(I)),O)) = trace.st(e_tag(I)).mem(concatbv3(tag(cache(I)),O))
+
+    # ================ (3b) bus-command obligations -- the cache's half of
+    # the memory-interface contract ================
+    # The memory controller is verified as a separate ABSTRACT INTERFACE
+    # (see the memory_controller isolate): it GUARANTEES that read responses
+    # are correct for their tags (its specification invariants inv_resp_rd /
+    # resp_tag_le / inv_resp_rd_pres / inv_resp_owner, assumed here at STEP
+    # A), and in exchange ASSUMES that every command this cache drives is
+    # correct for its tag.  The if_* invariants below are that assumption,
+    # proved here: a writeback ships a victim entry's data, correct at its
+    # e_tag by inv_coh (inv_coh_pres supplying preservation to the commit
+    # frontier); a fetch read is an outstanding MSHR beat stamped with the
+    # commit frontier.  All invariants about the controller's INTERNAL state
+    # (command buffer, mmem -- including inv_memat) live in the
+    # memory_controller isolate's implementation section, NOT here.
+    # ---- a command's tag never leads the commit frontier ----
+    invariant [if_cmd_tag_le] cache_to_mem_en -> cache_to_mem_tag <= commit_tag
+    # ---- a WRITE command (victim writeback) is beat-aligned ... ----
+    invariant [if_wb_align] (cache_to_mem_en & cache_to_mem_wen) ->
+        low(cache_to_mem_addr) = concatbv2(beat_of(low(cache_to_mem_addr)), 0)
+    # ---- ... and ships the trace at its tag, at its four word addresses ... ----
+    invariant [if_wb_data] (cache_to_mem_en & cache_to_mem_wen) ->
+        ( unp0(cache_to_mem_wdata) = trace.st(cache_to_mem_tag).mem(concatbv3(high(cache_to_mem_addr), concatbv2(beat_of(low(cache_to_mem_addr)), 0)))
+        & unp1(cache_to_mem_wdata) = trace.st(cache_to_mem_tag).mem(concatbv3(high(cache_to_mem_addr), concatbv2(beat_of(low(cache_to_mem_addr)), 1)))
+        & unp2(cache_to_mem_wdata) = trace.st(cache_to_mem_tag).mem(concatbv3(high(cache_to_mem_addr), concatbv2(beat_of(low(cache_to_mem_addr)), 2)))
+        & unp3(cache_to_mem_wdata) = trace.st(cache_to_mem_tag).mem(concatbv3(high(cache_to_mem_addr), concatbv2(beat_of(low(cache_to_mem_addr)), 3))) )
+    # ---- ... and its line is preserved from its tag to the commit frontier
+    # (inherited from the victim's inv_coh_pres at issue; eviction blocks all
+    # accepts, so nothing can commit to the line on the issue edge) ----
+    invariant [if_wb_pres] (cache_to_mem_en & cache_to_mem_wen
+         & cache_to_mem_tag <= U & U <= commit_tag) ->
+        trace.st(U).mem(concatbv3(high(cache_to_mem_addr), O))
+          = trace.st(cache_to_mem_tag).mem(concatbv3(high(cache_to_mem_addr), O))
+    # ---- a READ command is an active MSHR's outstanding fetch beat, tagged
+    # with the commit frontier ----
+    invariant [if_rd_owner] (cache_to_mem_en & ~cache_to_mem_wen) ->
+        ( cache_to_mem_tag = commit_tag
+        & ( (m_state(0) = mshr_req_lower & cache_to_mem_addr = concatbv3(m_base(0), concatbv2(0,0)))
+          | (m_state(0) = mshr_req_upper & cache_to_mem_addr = concatbv3(m_base(0), concatbv2(1,0)))
+          | (m_state(1) = mshr_req_lower & cache_to_mem_addr = concatbv3(m_base(1), concatbv2(0,0)))
+          | (m_state(1) = mshr_req_upper & cache_to_mem_addr = concatbv3(m_base(1), concatbv2(1,0))) ) )
+
+    # ---- fill buffers track the committed memory: the lower beat once
+    # captured ... ----
+    invariant [inv_fbuf_lo] forall Id : mshr_id, O : woffset.
+        ((m_state(Id) = mshr_finished_lower | m_state(Id) = mshr_req_upper) & beat_of(O) = 0) ->
+        m_fbuf(Id,O) = cmem(concatbv3(m_base(Id),O))
+    # ---- ... and the whole line while draining.  (A pending queued write is
+    # not yet in fbuf -- and, being uncommitted, not in cmem either; at drain
+    # service it enters both simultaneously.) ----
+    invariant [inv_fbuf] forall Id : mshr_id, O : woffset.
+        m_state(Id) = mshr_drain -> m_fbuf(Id,O) = cmem(concatbv3(m_base(Id),O))
+
+    # ================ (4) refinement THEOREM ================
+    # The correctness statement itself lives in the trace isolate (coh_lw /
+    # coh_nw): every ANSWERED read returns the value of the last write to its
+    # address preceding it in the trace.  The cache discharges it by calling
+    # trace.observe at the moment it produces each read response; observe's
+    # require -- the returned value equals the ghost folded memory at the
+    # read's own entry (= its pre-state) -- is proved from
+    # inv_coh / inv_coh_pres at a hit and from inv_fbuf / t_qread at a drain
+    # service.  A queued read can never observe a write accepted after it:
+    # FIFO service order guarantees younger same-line writes commit only
+    # after the read is serviced.  (For writes the principle is structural:
+    # the trace entry AT a write's tag is its predecessor updated at exactly
+    # its address -- tr_step + t_qwr.)  Here we tie the response WIRES to
+    # the trace record:
+    invariant [ref_done] user_valid ->
+        (trace.st(user_tag).op = op_read
+         & trace.st(user_tag).op_done
+         & trace.st(user_tag).op_data = user_data
+         & trace.st(user_tag).op_addr = concatbv3(high(user_addr), low(user_addr)))
+    }
+} with this, trace, memory_controller, addr_thy
+
+# ============================================================================
+# memory_controller : concrete word memory behind a 256-bit bus, presented
+# to the cache as an ABSTRACT INTERFACE (assume/guarantee):
+#
+#   GUARANTEE (the specification invariants below, proved against the
+#   implementation in THIS isolate and assumed by the simple_cache isolate):
+#   every READ response is CORRECT FOR ITS TAG -- it carries the trace
+#   memory at the response's tag over its four beat addresses (inv_resp_rd,
+#   with the tag-bound and line-preservation companions resp_tag_le /
+#   inv_resp_rd_pres), and it answers the outstanding fetch beat of an
+#   active MSHR (inv_resp_owner).
+#
+#   ASSUMPTION (proved by the simple_cache isolate as its bus-command
+#   obligations if_*): every command the cache drives is correct for its
+#   tag -- a writeback ships the trace at its tag (if_wb_data / if_wb_pres),
+#   a read is an outstanding fetch beat tagged at the commit frontier
+#   (if_rd_owner).
+#
+# The machinery -- the word memory mmem, the one-deep command buffer, the
+# latency counter, and ALL invariants about them (including inv_memat, the
+# mmem-vs-committed-trace correspondence) -- lives in the IMPLEMENTATION
+# section: it is checked only in this isolate and is invisible to the
+# simple_cache isolate, whose VCs therefore contain neither the controller's
+# transition nor its command-buffer invariants.  In the simple_cache isolate
+# the response wires are simply havocked each edge, pinned only by the
+# specification invariants below (the c0/c1 pattern of
+# doc/examples/hardware/refinement3.ivy).
+# ============================================================================
+isolate memory_controller = {
+    specification {
+        # ---- (data) the returned READ data matches the trace at the
+        # response's tag, over the four beat addresses.  This is what the
+        # cache's STEP A captures into a fill buffer. ----
+        invariant [inv_resp_rd] (mem_response_valid & mem_response_rd) ->
+            (unp0(mem_response_data) = trace.st(mem_response_tag).mem(waddr(ahigh(mem_response_addr),0))
+           & unp1(mem_response_data) = trace.st(mem_response_tag).mem(waddr(ahigh(mem_response_addr),1))
+           & unp2(mem_response_data) = trace.st(mem_response_tag).mem(waddr(ahigh(mem_response_addr),2))
+           & unp3(mem_response_data) = trace.st(mem_response_tag).mem(waddr(ahigh(mem_response_addr),3)))
+        # ---- the response's tag never leads the commit frontier ... ----
+        invariant [resp_tag_le] (mem_response_valid & mem_response_rd) ->
+            mem_response_tag <= simple_cache.commit_tag
+        # ---- (pres) ... and the responded line is preserved from the
+        # response's tag to the commit frontier.  Instantiating U at the
+        # commit frontier gives capture "fbuf = cmem". ----
+        invariant [inv_resp_rd_pres]
+            (mem_response_valid & mem_response_rd
+             & mem_response_tag <= U & U <= simple_cache.commit_tag) ->
+            trace.st(U).mem(concatbv3(high(mem_response_addr),O))
+              = trace.st(mem_response_tag).mem(concatbv3(high(mem_response_addr),O))
+        # ---- a read response on the wire answers some active MSHR's
+        # outstanding fetch beat (its issuer is still in req_lower/req_upper:
+        # it advances only by capturing this very response) ----
+        invariant [inv_resp_owner] (mem_response_valid & mem_response_rd) ->
+            ( (simple_cache.m_state(0) = mshr_req_lower & mem_response_addr = concatbv3(simple_cache.m_base(0), concatbv2(0,0)))
+            | (simple_cache.m_state(0) = mshr_req_upper & mem_response_addr = concatbv3(simple_cache.m_base(0), concatbv2(1,0)))
+            | (simple_cache.m_state(1) = mshr_req_lower & mem_response_addr = concatbv3(simple_cache.m_base(1), concatbv2(0,0)))
+            | (simple_cache.m_state(1) = mshr_req_upper & mem_response_addr = concatbv3(simple_cache.m_base(1), concatbv2(1,0))) )
+    }
+
+    implementation {
+        function mmem(A : addr) : word
+
+        var command_buf_valid  : bool
+        var command_buf_wen    : bool
+        var command_buf_addr   : addr
+        var command_buf_tag    : trace.tag   # ghost: tag carried by the command
+        var svc_count : nat
+
+        # response registers: the response wires are DEFINED from these (a
+        # hidden monitor may not ASSIGN a wire other isolates reference --
+        # Ivy's interference check -- but a hidden DEFINITION is fine: the
+        # wire is simply havocked in the isolates that cannot see it).
+        var resp_valid_r : bool
+        var resp_rd_r    : bool
+        var resp_data_r  : four_words
+        var resp_addr_r  : addr
+        var resp_tag_r   : trace.tag
+
+        after init {
+            mmem(A) := 0;
+            command_buf_valid := false;
+            command_buf_wen   := false;
+            command_buf_addr  := 0;
+            command_buf_tag   := 0;
+            svc_count := 0;
+            resp_valid_r := false;
+            resp_rd_r    := false;
+            resp_data_r  := mzero;
+            resp_addr_r  := 0;
+            resp_tag_r   := 0;
+        }
+
+        after clock {
+            resp_valid_r := false;
+            resp_rd_r    := false;
+            if command_buf_valid {
+                if svc_count = 0 {
+                    # a WRITE resolve is a pure ack: the data was applied to
+                    # mmem eagerly at ACCEPT -- no read can be accepted in
+                    # between (single outstanding), so the early application
+                    # is unobservable, and the buffered-write exception /
+                    # inv_cb_wb carry chain are unneeded.
+                    if ~command_buf_wen {
+                        var hb : address_hi := ahigh(command_buf_addr);
+                        var m0 : word := mmem(waddr(hb, 0));
+                        var m1 : word := mmem(waddr(hb, 1));
+                        var m2 : word := mmem(waddr(hb, 2));
+                        var m3 : word := mmem(waddr(hb, 3));
+                        resp_data_r := pack4(m3, m2, m1, m0);
+                        resp_rd_r := true;
+                    };
+                    resp_addr_r  := command_buf_addr;
+                    resp_tag_r   := command_buf_tag;   # response inherits the command's tag
+                    resp_valid_r := true;
+                    command_buf_valid := false;
+                } else {
+                    svc_count := svc_count - 1;
+                }
+            };
+            if cache_to_mem_en & ~command_buf_valid {
+                command_buf_wen    := cache_to_mem_wen;
+                command_buf_addr   := cache_to_mem_addr;
+                command_buf_tag    := cache_to_mem_tag;
+                command_buf_valid  := true;
+                svc_count := mem_latency;
+                if cache_to_mem_wen {
+                    # eager ghost commit of the writeback beat (correct for
+                    # its tag by if_wb_data, current at the frontier by
+                    # if_wb_pres); the resolve later is a pure ack
+                    var hb : address_hi := ahigh(cache_to_mem_addr);
+                    mmem(waddr(hb, 0)) := unp0(cache_to_mem_wdata);
+                    mmem(waddr(hb, 1)) := unp1(cache_to_mem_wdata);
+                    mmem(waddr(hb, 2)) := unp2(cache_to_mem_wdata);
+                    mmem(waddr(hb, 3)) := unp3(cache_to_mem_wdata);
+                };
+            };
+        }
+
+        # ---- the response bus, driven combinationally from the registers.
+        # mem_response_ready = "the buffer is free" (the cache's arbiter
+        # gates on it, so an issued command is never dropped and a resolve
+        # edge never coincides with an issue). ----
+        definition mem_response_valid = resp_valid_r
+        definition mem_response_rd    = resp_rd_r
+        definition mem_response_data  = resp_data_r
+        definition mem_response_addr  = resp_addr_r
+        definition mem_response_tag   = resp_tag_r
+        definition mem_response_ready = ~command_buf_valid
+
+        # ---- private invariants: the command-buffer / mmem chain that
+        # discharges the specification guarantee.  Checked ONLY here. ----
+
+        # ---- the array equals the trace AT THE COMMIT FRONTIER except where
+        # the commit is legitimately ahead: (a) a dirty resident line; (b) a
+        # dirtied draining MSHR's base line (its committed writes are in
+        # fbuf, not yet here).  Stated DIRECTLY at commit_tag -- no ghost
+        # mem_tag and no quantifier over intermediate trace positions.  This
+        # is inductive without a (pres) companion because the frontier only
+        # ever advances by EXACTLY ONE trace step (t_ct_now at an accept,
+        # t_qwr at a drain write-service), so a single tr_step application
+        # re-proves the equality at every clean line: a committing WRITE
+        # always excepts its own line in the same edge (a hit-write dirties
+        # the slot; a drain service dirties its MSHR), and a committing READ
+        # leaves the trace memory unchanged.  This gives a fetch read its
+        # commit-frontier tag at accept (inv_cb_rd), with no rebase step. ----
+        invariant [inv_memat] forall H : line, O : woffset.
+            mmem(concatbv3(H,O)) = trace.st(simple_cache.commit_tag).mem(concatbv3(H,O))
+          | simple_cache.dirty_here(H)
+          | (simple_cache.m_state(0) = mshr_drain & simple_cache.m_dirty(0) & simple_cache.m_base(0) = H)
+          | (simple_cache.m_state(1) = mshr_drain & simple_cache.m_dirty(1) & simple_cache.m_base(1) = H)
+
+        invariant [cb_tag_le] command_buf_valid -> command_buf_tag <= simple_cache.commit_tag
+
+        # ---- the eviction writeback lands beat-by-beat while the victim is
+        # still resident-dirty (so its line is EXCEPTED in inv_memat): these
+        # carry the already-shipped beats across that window, so the fill --
+        # which de-excepts the line -- can discharge inv_memat for it.  A
+        # dphase past dp_wb_lo means the lower beat was accepted (issue is
+        # gated on ready = buffer-free, and dphase advances only on issue);
+        # dp_fill means both beats were.  Established at the accept edge from
+        # if_wb_data + if_wb_pres (U := commit_tag); preserved across the
+        # window because mid-eviction no accepts happen (evicting drops
+        # user_ready) and the only possible commits -- the OTHER MSHR's drain
+        # write-services -- touch a different set (inv_oneperset), hence a
+        # different line, so tr_step frames the victim line. ----
+        invariant [inv_wb_lo_shipped] forall Id : mshr_id, O : woffset.
+            (simple_cache.m_state(Id) = mshr_drain & simple_cache.m_dphase(Id) = dp_wb_hi
+             & beat_of(O) = 0) ->
+            mmem(concatbv3(tag(simple_cache.cache(simple_cache.m_victim_slot(Id))), O))
+              = trace.st(simple_cache.commit_tag).mem(concatbv3(tag(simple_cache.cache(simple_cache.m_victim_slot(Id))), O))
+        invariant [inv_wb_shipped] forall Id : mshr_id, O : woffset.
+            (simple_cache.m_state(Id) = mshr_drain & simple_cache.m_dphase(Id) = dp_fill) ->
+            mmem(concatbv3(tag(simple_cache.cache(simple_cache.m_victim_slot(Id))), O))
+              = trace.st(simple_cache.commit_tag).mem(concatbv3(tag(simple_cache.cache(simple_cache.m_victim_slot(Id))), O))
+        # ---- (data) a buffered fetch READ: the memory it will read equals
+        # the trace at its tag (established at accept from inv_memat -- no
+        # exception applies to a fetched line -- and preserved because mmem
+        # is frozen while any command is buffered) ... ----
+        invariant [inv_cb_rd] (command_buf_valid & ~command_buf_wen) ->
+            (mmem(waddr(ahigh(command_buf_addr),0)) = trace.st(command_buf_tag).mem(waddr(ahigh(command_buf_addr),0))
+           & mmem(waddr(ahigh(command_buf_addr),1)) = trace.st(command_buf_tag).mem(waddr(ahigh(command_buf_addr),1))
+           & mmem(waddr(ahigh(command_buf_addr),2)) = trace.st(command_buf_tag).mem(waddr(ahigh(command_buf_addr),2))
+           & mmem(waddr(ahigh(command_buf_addr),3)) = trace.st(command_buf_tag).mem(waddr(ahigh(command_buf_addr),3)))
+        # ---- (pres) the fetched line is preserved from the read's tag to
+        # the commit frontier: while the fetch is outstanding its line cannot
+        # commit (queued writes to it drain only after the fetch completes). ----
+        invariant [inv_cb_rd_pres]
+            (command_buf_valid & ~command_buf_wen
+             & command_buf_tag <= U & U <= simple_cache.commit_tag) ->
+            trace.st(U).mem(concatbv3(high(command_buf_addr),O))
+              = trace.st(command_buf_tag).mem(concatbv3(high(command_buf_addr),O))
+        # ---- a buffered read is some active MSHR's outstanding fetch beat
+        # (established from if_rd_owner at accept; gives the preservation
+        # proofs the commit-disjointness of the fetched line) ----
+        invariant [inv_cb_owner] (command_buf_valid & ~command_buf_wen) ->
+            ( (simple_cache.m_state(0) = mshr_req_lower & command_buf_addr = concatbv3(simple_cache.m_base(0), concatbv2(0,0)))
+            | (simple_cache.m_state(0) = mshr_req_upper & command_buf_addr = concatbv3(simple_cache.m_base(0), concatbv2(1,0)))
+            | (simple_cache.m_state(1) = mshr_req_lower & command_buf_addr = concatbv3(simple_cache.m_base(1), concatbv2(0,0)))
+            | (simple_cache.m_state(1) = mshr_req_upper & command_buf_addr = concatbv3(simple_cache.m_base(1), concatbv2(1,0))) )
+
+    }
+} with this, trace, simple_cache, addr_thy
