@@ -545,7 +545,7 @@ type cache_entry = struct {
 # relation nor its private invariants.
 # ============================================================================
 module cache_body(trace, user, bus) = {
-    specification {
+    specification {}
         function cache(I : cache_idx) : cache_entry
 
         # ---- MSHR file (family of functions indexed by mshr_id) ----
@@ -1134,7 +1134,7 @@ module cache_body(trace, user, bus) = {
          & trace.st(user_tag).op_done
          & trace.st(user_tag).op_data = data_r
          & trace.st(user_tag).op_addr = concatbv3(high(resp_addr_r), low(resp_addr_r)))
-    }
+    
 
     isolate iso = this with this, trace, user, bus, env, addr_thy, basis
 }
