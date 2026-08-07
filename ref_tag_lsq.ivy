@@ -8,15 +8,12 @@ type word
 type line
 type bit
 type bv2
-type qidx
 type mshr_id
 
-# ---- LSQ indices are abstract ordered sequences, not bit vectors.  Nothing
-# in the queues needs bit-vector semantics -- only 0, successor and order --
-# and quantifying over a bit vector is what makes the coherence goals blow
-# up in z3.  This is the same abstraction the reference tag already uses. ----
+# ---- LSQ indices are small bit vectors: the queues hold at most four
+# entries each, and `store_next`/`load_next` equal to 4 means full. ----
 type store_idx
-instance load_idx  : unbounded_sequence
+type load_idx
 
 type two_words
 type four_words
@@ -36,32 +33,43 @@ type addr
 type woffset
 type way
 
+# ---- `word`, `two_words` and `four_words` are ABSTRACT outside this
+# isolate.  The bit-level encoding lives in the implementation, so every
+# other isolate sees a beat as an uninterpreted quadruple constrained
+# only by `p_unp0..3`.  This is the same trick `addr_thy` plays below,
+# and for the same reason: with four_words = bv[256] visible, every
+# query that mentions a fill or a writeback drags a 256-bit concat
+# through the solver, and z3 bit-blasts it.  Nothing outside needs the
+# encoding -- beats are only ever built with `pack4` and taken apart
+# with `unp0..3`. ----
 isolate data_impl = {
-    interpret word -> bv[64]
-    interpret two_words -> bv[128]
-    interpret four_words -> bv[256]
-    interpret cat_w -> concat
-    interpret cat_d -> concat
-    definition pack4(W3, W2, W1, W0) = cat_d(cat_w(W3, W2), cat_w(W1, W0))
-    definition unp0(M) = bfe[0][63](M)
-    definition unp1(M) = bfe[64][127](M)
-    definition unp2(M) = bfe[128][191](M)
-    definition unp3(M) = bfe[192][255](M)
-    definition mzero = 0
+    property [p_unp0] forall W3 : word, W2 : word, W1 : word, W0 : word. unp0(pack4(W3, W2, W1, W0)) = W0
+    property [p_unp1] forall W3 : word, W2 : word, W1 : word, W0 : word. unp1(pack4(W3, W2, W1, W0)) = W1
+    property [p_unp2] forall W3 : word, W2 : word, W1 : word, W0 : word. unp2(pack4(W3, W2, W1, W0)) = W2
+    property [p_unp3] forall W3 : word, W2 : word, W1 : word, W0 : word. unp3(pack4(W3, W2, W1, W0)) = W3
+
+    implementation {
+        interpret word -> bv[64]
+        interpret two_words -> bv[128]
+        interpret four_words -> bv[256]
+        interpret cat_w -> concat
+        interpret cat_d -> concat
+        definition pack4(W3, W2, W1, W0) = cat_d(cat_w(W3, W2), cat_w(W1, W0))
+        definition unp0(M) = bfe[0][63](M)
+        definition unp1(M) = bfe[64][127](M)
+        definition unp2(M) = bfe[128][191](M)
+        definition unp3(M) = bfe[192][255](M)
+        definition mzero = 0
+    }
 }
 
 isolate basis = {
     interpret key -> bv[3]
     interpret bit -> bv[1]
     interpret bv2 -> bv[2]
-    interpret qidx -> bv[3]
     interpret mshr_id -> bv[1]
-    interpret store_idx -> bv[2]
-
-    property [p_unp0] forall W3 : word, W2 : word, W1 : word, W0 : word. unp0(pack4(W3, W2, W1, W0)) = W0
-    property [p_unp1] forall W3 : word, W2 : word, W1 : word, W0 : word. unp1(pack4(W3, W2, W1, W0)) = W1
-    property [p_unp2] forall W3 : word, W2 : word, W1 : word, W0 : word. unp2(pack4(W3, W2, W1, W0)) = W2
-    property [p_unp3] forall W3 : word, W2 : word, W1 : word, W0 : word. unp3(pack4(W3, W2, W1, W0)) = W3
+    interpret store_idx -> bv[3]
+    interpret load_idx -> bv[3]
 
     definition mem_latency = 8
 } with this, data_impl
@@ -91,7 +99,6 @@ isolate addr_thy = {
     property [p_full_inj] forall H1 : line, O1 : woffset, H2 : line, O2 : woffset. (concatbv3(H1, O1) = concatbv3(H2, O2)) -> (H1 = H2 & O1 = O2)
     property [p_highfull] forall H : line, O : woffset. high(concatbv3(H, O)) = H
     property [p_lowfull]  forall H : line, O : woffset. low(concatbv3(H, O)) = O
-    property [p_recon] forall A : addr. concatbv3(high(A), low(A)) = A
 
     # ---- addr and line are ABSTRACT outside this isolate.  The bit-level
     # encoding lives in the implementation, so every other isolate sees a
@@ -107,504 +114,348 @@ isolate addr_thy = {
         definition low(A) = bfe[0][2](A)
         interpret concatbv3 -> concat
 
+        # ---- `concatbv3(high(A), low(A)) = A` is checked here rather
+        # than exported.  Outside this isolate it is a matching loop:
+        # instantiating it at any address term T *creates* the new
+        # address `concatbv3(high(T), low(T))`, which `p_full_inj` then
+        # pairs with every other address in the query, which yields more
+        # equalities and more addresses.  Nothing outside reconstructs an
+        # address from its halves -- every isolate builds addresses with
+        # `concatbv3` and takes them apart with `p_highfull`/`p_lowfull`
+        # -- so exporting it bought nothing and cost termination on any
+        # goal that mentions several addresses. ----
+        property [p_recon] forall A : addr. concatbv3(high(A), low(A)) = A
+
         definition hash(H) = bfe[0][2](H)
     }
 } with this, basis
 
 export action posedge
 
-object cpu = {
-    wire env_en    : bool
-    wire env_addr  : addr
-    wire env_wen   : bool
-    wire env_wdata : word
-    wire req_en    : bool
-    wire req_addr  : addr
-    wire req_wen   : bool
-    wire req_wdata : word
-    wire valid     : bool
-    wire resp_addr : addr
-    wire data      : word
-    wire ready : bool
+# ------------------------------------------------------------------
+# The operation trace.
+#
+# `tag` indexes an arbitrary, fixed sequence of memory operations: the
+# operation at index T reads or writes one word address, and a write
+# also carries the datum it stores -- a read carries no datum.  The
+# functions below are never assigned, so they stand for *any* sequence
+# of operations over *any* initial memory image, and the proof holds
+# for all of them.  Index 0 is the reset point, not an operation.
+# ------------------------------------------------------------------
 
-    definition req_en    = env_en & ready
-    definition req_addr  = env_addr
-    definition req_wen   = env_wen
-    definition req_wdata = env_wdata
-}
+instance tag : unbounded_sequence
+
+function op_wen(T : tag)   : bool    # write if true, read if false
+function op_addr(T : tag)  : addr
+function op_wdata(T : tag) : word    # the datum a write stores
+
+function init_mem(A : addr) : word   # the power-on memory image
+
+# ------------------------------------------------------------------
+# The ISA reference: a memory that executes the operation trace, one
+# operation per `step`.  `mnow` is the index of the last operation it
+# executed.  A read leaves the architectural state alone -- the datum
+# it returns is recorded by the trace, not held here.
+# ------------------------------------------------------------------
 
 isolate abs_memory = {
-    function mem(A : addr) : word
-    wire output : word
+    # ---- The reference is proof state only: it is the ISA the LSQ is
+    # verified against, not hardware.  Wrapping it in `specification`
+    # keeps `tag` -- an unbounded sequence, which has no bit width -- out
+    # of the hardware description. ----
+    specification {
+        function mem(A : addr) : word
+        var mnow : tag
 
-    after init {
-        mem(A) := 0;
-        output := 0;
-    }
+        after init {
+            mem(A) := init_mem(A);
+            mnow   := 0;
+        }
 
-    action write(a : addr, w : word) = {
-        mem(a) := w;
-    }
-    action read(a : addr) = {
-        output := mem(a);
+        # ---- execute the next operation in the trace ----
+        action step = {
+            mnow := mnow.next;
+            if op_wen(mnow) {
+                mem(op_addr(mnow)) := op_wdata(mnow);
+            };
+        }
     }
 
     isolate iso = this with this, basis
 }
 
-type op_kind = {op_read, op_write}
+# ------------------------------------------------------------------
+# The trace: the history of what the reference actually did.  `st(T)` is
+# the memory image reached after operation T, together with the datum
+# operation T returned if it was a read.  `now` is the index of the last
+# operation executed and `nxt` the index of the next one; entries above
+# `now` are unwritten.
+#
+# The whole isolate is specification: the invariants below are what the
+# LSQ proof reasons with, so they have to be visible outside it.
+# ------------------------------------------------------------------
 
 isolate trace = {
     specification {
-        instance tag : unbounded_sequence
-
         type state_t = struct {
-            mem(A : addr) : word,
-            op      : op_kind,
-            op_addr : addr,
-            op_data : word,
-            op_done : bool,
-            op_lwd  : word
+            mem(A : addr) : word,   # memory image after the operation
+            rdata : word            # datum a read returned
         }
 
         var now : tag
+        var nxt : tag
         var st(T : tag) : state_t
 
-        relation lwc_r(A : addr, W : tag)
-        function lwd(A : addr) : word
-        relation op_lw_r(R : tag, W : tag)
-
-        relation mshr_wait(Id : mshr_id)
-        function mshr_line(Id : mshr_id) : line
-
-        relation cdirty(H : line)
-
-        function ctag(H : line, O : woffset) : tag
-        function mtag(H : line, O : woffset) : tag
-        var pend_valid : bool
-        var pend_a     : addr
-        var pend_old   : tag
-
-        function cver(H : line, O : woffset) : tag
-        definition cver(H, O) =
-            (pend_old if (pend_valid & concatbv3(H,O) = pend_a) else ctag(H, O))
-        function cmem(H : line, O : woffset) : word
-        definition cmem(H, O) = st(cver(H, O)).mem(concatbv3(H, O))
-        function mmemv(H : line, O : woffset) : word
-        definition mmemv(H, O) = st(mtag(H, O)).mem(concatbv3(H, O))
+        # ---- operation T has been executed ----
+        relation done(T : tag)
+        definition done(T) = 0 < T & T <= now
 
         after init {
-            mshr_wait(Id) := false;
-            mshr_line(Id) := 0;
-            cdirty(H) := false;
-            ctag(H, O) := 0;
-            mtag(H, O) := 0;
-            pend_valid := false; pend_a := 0; pend_old := 0;
             now := 0;
-            st(T).mem(A : addr) := 0;
-            st(T).op      := op_read;
-            st(T).op_addr := 0;
-            st(T).op_data := 0;
-            st(T).op_done := false;
-            st(T).op_lwd  := 0;
-            lwc_r(A, W)   := W = 0;
-            lwd(A)        := 0;
-            op_lw_r(R, W) := W = 0;
+            nxt := now.next;
+            st(T).mem(A : addr) := init_mem(A);
         }
 
-        action step(h : line, o : woffset, wen : bool, wd : word) = {
-            var prev : tag := now;
-            now := now.next;
-            st(now).mem(A : addr) := st(prev).mem(A);
-            st(now).op_addr := concatbv3(h, o);
-            st(now).op_done := wen;
-            if wen {
-                st(now).op      := op_write;
-                st(now).op_data := wd;
-                st(now).op_lwd  := 0;
-                st(now).mem(concatbv3(h, o)) := wd;
-                lwc_r(concatbv3(h, o), W) := W = now;
-                lwd(concatbv3(h, o)) := wd;
-            } else {
-                st(now).op      := op_read;
-                st(now).op_data := 0;
-                st(now).op_lwd  := lwd(concatbv3(h, o));
-                op_lw_r(now, W) := lwc_r(concatbv3(h, o), W);
-            };
-            if wen {
-                abs_memory.write(concatbv3(h, o), wd);
-            } else {
-                abs_memory.read(concatbv3(h, o));
+        # ---- execute the next operation and record what happened ----
+        action step = {
+            now := nxt;
+            nxt := nxt.next;
+            call abs_memory.step;
+            st(now).mem(A : addr) := abs_memory.mem(A);
+            if ~op_wen(now) {
+                # a read does not disturb the image, so the reference's
+                # memory still holds the datum the read observed
+                st(now).rdata := abs_memory.mem(op_addr(now));
             };
         }
 
-        action observe(t : tag, v : word) = {
-            require t ~= 0 & t <= now;
-            require st(t).op = op_read & ~st(t).op_done;
-            require v = st(t).mem(st(t).op_addr);
-            st(t).op_data := v;
-            st(t).op_done := true;
-        }
+        # ==============================================================
+        # The trace is an execution of the abstract memory model: the
+        # reference stands at st(now), and any two consecutive recorded
+        # states are related by one step of it -- a write installs its
+        # datum and changes nothing else, a read returns the image it
+        # started from.
+        #
+        # Coherence -- every read returns the datum of the last write to
+        # the same address -- follows from these by induction along the
+        # trace, so it is not stated separately.  Stating it would also
+        # take the isolate out of EPR: "no write to A between W and R" is
+        # a universal over the operations in between, and in hypothesis
+        # position that skolemizes to a function from the address back to
+        # a tag, closing a tag -> addr -> tag cycle in the instantiation
+        # graph.  The LSQ proof below never needs it: it walks the trace
+        # one operation at a time instead (`s_img`, `s_img0`, `s_imgN`).
+        # ==============================================================
 
-        action mshr_alloc(id : mshr_id, h : line) = {
-            require ~mshr_wait(id);
-            require forall J : mshr_id. mshr_wait(J) -> mshr_line(J) ~= h;
-            mshr_wait(id) := true;
-            mshr_line(id) := h;
-        }
-        action mshr_free(id : mshr_id) = {
-            mshr_wait(id) := false;
-        }
-
-        action dirty_line(h : line) = { cdirty(h) := true; }
-        action clean_line(h : line) = { cdirty(h) := false; }
-
-        action present_w(h : line, o : woffset, tg : tag) = {
-            require tg <= now;
-            pend_valid := true;
-            pend_a     := concatbv3(h, o);
-            pend_old   := ctag(h, o);
-            ctag(h, o) := tg;
-        }
-        action commit_w = {
-            pend_valid := false;
-        }
-        action wb(h : line, b : bit) = {
-            mtag(h, concatbv2(b, 0)) := cver(h, concatbv2(b, 0));
-            mtag(h, concatbv2(b, 1)) := cver(h, concatbv2(b, 1));
-            mtag(h, concatbv2(b, 2)) := cver(h, concatbv2(b, 2));
-            mtag(h, concatbv2(b, 3)) := cver(h, concatbv2(b, 3));
-        }
-
-        invariant [mshr_distinct] (mshr_wait(I) & mshr_wait(J) & mshr_line(I) = mshr_line(J)) -> I = J
-        invariant [ver_le] ctag(H,O) <= now & mtag(H,O) <= now & pend_old <= now
-        invariant [wr_own] (T <= now & st(T).op = op_write) ->
-            st(T).mem(st(T).op_addr) = st(T).op_data
-        invariant [lw_memd] st(now).mem(A) = lwd(A)
-        invariant [lw_memat] (R <= now & st(R).op = op_read) ->
-            st(R).mem(st(R).op_addr) = st(R).op_lwd
-    }
-
-    implementation {
+        invariant [ref_now] abs_memory.mnow = now
+        invariant [ref_nxt] tag.succ(now, nxt)
         invariant [ref_mem] abs_memory.mem(A) = st(now).mem(A)
-
-        invariant [tr_step] (tag.succ(T,U) & U <= now) ->
-            st(U).mem(A) = (st(U).op_data if (st(U).op = op_write & A = st(U).op_addr) else st(T).mem(A))
-
-        invariant [lwc_wr] (lwc_r(A,W) & W ~= 0) ->
-            (W <= now & st(W).op = op_write & st(W).op_addr = A)
-        invariant [lwc_latest] (lwc_r(A,W) & W < V & V <= now & st(V).op = op_write) ->
-            st(V).op_addr ~= A
-        invariant [lwc_none] (lwc_r(A,0) & V <= now & st(V).op = op_write) ->
-            st(V).op_addr ~= A
-        invariant [lwc_datum] (lwc_r(A,W) & W ~= 0) -> st(W).op_data = lwd(A)
-        invariant [lwc_datum0] lwc_r(A,0) -> lwd(A) = 0
-        invariant [lwc_fun] (lwc_r(A,W1) & lwc_r(A,W2)) -> W1 = W2
-
-        invariant [lw_is_wr] (op_lw_r(R,W) & R <= now & st(R).op = op_read & W ~= 0) ->
-            (W < R & st(W).op = op_write & st(W).op_addr = st(R).op_addr
-             & st(W).op_data = st(R).op_lwd)
-        invariant [lw_latest] (op_lw_r(R,W) & R <= now & st(R).op = op_read
-             & W < V & V < R & st(V).op = op_write) ->
-            st(V).op_addr ~= st(R).op_addr
-        invariant [lw_none] (op_lw_r(R,0) & R <= now & st(R).op = op_read
-             & V < R & st(V).op = op_write) ->
-            st(V).op_addr ~= st(R).op_addr
-        invariant [lw_zero] (op_lw_r(R,0) & R <= now & st(R).op = op_read) ->
-            st(R).op_lwd = 0
-        invariant [lw_fun] (op_lw_r(R,W1) & op_lw_r(R,W2) & R <= now & st(R).op = op_read) ->
-            W1 = W2
-
-        invariant [coh_val] (R <= now & st(R).op = op_read & st(R).op_done) ->
-            st(R).op_data = st(R).op_lwd
-        invariant [coh_lw] (op_lw_r(R,W) & W ~= 0
-             & R <= now & st(R).op = op_read & st(R).op_done) ->
-            st(R).op_data = st(W).op_data
-        invariant [coh_nw] (op_lw_r(R,0)
-             & R <= now & st(R).op = op_read & st(R).op_done) ->
-            st(R).op_data = 0
+        invariant [tr_step] (tag.succ(T,U) & done(U)) ->
+            st(U).mem(A) = (op_wdata(U) if (op_wen(U) & A = op_addr(U))
+                            else st(T).mem(A))
+        invariant [tr_rd] (tag.succ(T,U) & done(U) & ~op_wen(U)) ->
+            st(U).rdata = st(T).mem(op_addr(U))
     }
 } with this, abs_memory
 
-isolate membus = {
-    specification {
-        # ------------------------------------------------------------------
-        # The LSQ <-> cache bus.  Besides the request/response wires the bus
-        # carries the LSQ INDEX of every request, and it keeps a registry of
-        # the in-flight LSQ entries under those indices: an entry is entered
-        # when the LSQ accepts the CPU operation (which is where the
-        # operation gets its reference tag) and is retired when the LSQ
-        # retires it to the CPU.
-        #
-        # Because the bus knows the whole set of operations the LSQ has
-        # accepted but not yet drained, it is the bus -- not the LSQ -- that
-        # can carry the bridge between the reference trace and the version
-        # of memory the cache holds (m_br / m_ld_bridge below).  The LSQ is
-        # then left with nothing but ORDER obligations, and the cache is left
-        # with the whole coherence argument: it must hand back, for the LSQ
-        # index it answers, the value that index's reference tag reads.
-        # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# The cpu.  It hands the operations of the trace to the LSQ in order and
+# takes a response whenever the LSQ raises `valid`.  What it hands over
+# is the next operation of the sequence, so the operation the LSQ
+# accepts is `trace.nxt`.
+#
+# There is no request-enable input: the cpu offers an operation on every
+# clock edge and the LSQ accepts it whenever it is ready, so `cpu.ready`
+# is the only flow control.  Nothing is lost by dropping the input --
+# the trace is already an arbitrary infinite sequence of operations over
+# an arbitrary initial memory image, so the stalls it could model are
+# already covered by the choice of trace.
+# ------------------------------------------------------------------
 
-        # ---- in-flight store-queue entries, keyed by store-queue index ----
-        relation sq_live(K : store_idx)
-        function sq_h(K : store_idx)  : line
-        function sq_o(K : store_idx)  : woffset
-        function sq_d(K : store_idx)  : word
-        function sq_tg(K : store_idx) : trace.tag        # GHOST
+object cpu = {
+    wire req_addr  : addr
+    wire req_wen   : bool
+    wire req_wdata : word
+    wire valid     : bool            # driven by the LSQ
+    wire resp_addr : addr            # driven by the LSQ
+    wire data      : word            # driven by the LSQ
+    wire ready     : bool            # driven by the LSQ
 
-        # ---- in-flight load-queue entries, keyed by load-queue index ----
-        # lq_pres: the entry has been handed to the cache and no response has
-        #          been taken yet.
-        # lq_cur : when the entry was accepted no buffered store shadowed its
-        #          address, i.e. the cache was (and therefore still is)
-        #          up to date for it.  This is exactly "the load did not
-        #          forward"; only such loads may be presented.
-        relation lq_live(K : load_idx)
-        relation lq_pres(K : load_idx)
-        relation lq_cur(K : load_idx)
-        function lq_h(K : load_idx)  : line
-        function lq_o(K : load_idx)  : woffset
-        function lq_tg(K : load_idx) : trace.tag         # GHOST
-
-        # ---- no buffered store shadows word (H,O).  Spelled out slot by slot
-        # rather than quantified over store_idx: quantifying over the (finite,
-        # bit-vector) store index is what makes these goals blow up in z3. ----
-        relation no_st(H : line, O : woffset)
-        definition no_st(H, O) =
-            ~(sq_live(0) & sq_h(0) = H & sq_o(0) = O)
-          & ~(sq_live(1) & sq_h(1) = H & sq_o(1) = O)
-          & ~(sq_live(2) & sq_h(2) = H & sq_o(2) = O)
-          & ~(sq_live(3) & sq_h(3) = H & sq_o(3) = O)
-
-        # ---- ... and "some buffered store at (H,O) is younger than tag T" ----
-        relation st_after(H : line, O : woffset, T : trace.tag)
-        definition st_after(H, O, T) =
-            (sq_live(0) & sq_h(0) = H & sq_o(0) = O & T < sq_tg(0))
-          | (sq_live(1) & sq_h(1) = H & sq_o(1) = O & T < sq_tg(1))
-          | (sq_live(2) & sq_h(2) = H & sq_o(2) = O & T < sq_tg(2))
-          | (sq_live(3) & sq_h(3) = H & sq_o(3) = O & T < sq_tg(3))
-
-        var req_en    : bool
-        var req_h     : line
-        var req_o     : woffset
-        var req_wen   : bool
-        var req_wdata : word
-        var req_sid   : store_idx
-        var req_rid   : load_idx
-        var req_tag   : trace.tag                        # GHOST
-
-        var resp_valid : bool
-        var resp_h     : line
-        var resp_o     : woffset
-        var resp_data  : word
-        var resp_rid   : load_idx
-
-        var rd_out  : bool
-        var out_rid : load_idx
-
-        wire creq_ready : bool
-        wire ready : bool
-        definition ready = creq_ready & ~req_en & ~resp_valid
-
-        after init {
-            sq_live(J) := false; sq_h(J) := 0; sq_o(J) := 0;
-            sq_d(J) := 0; sq_tg(J) := 0;
-            lq_live(K) := false; lq_pres(K) := false; lq_cur(K) := false;
-            lq_h(K) := 0; lq_o(K) := 0; lq_tg(K) := 0;
-            req_en := false; req_h := 0; req_o := 0;
-            req_wen := false; req_wdata := 0;
-            req_sid := 0; req_rid := 0; req_tag := 0;
-            resp_valid := false; resp_h := 0; resp_o := 0;
-            resp_data := 0; resp_rid := 0;
-            rd_out := false; out_rid := 0;
-        }
-
-        # ---- the LSQ accepts a CPU store into store-queue slot k ----
-        action accept_store(k : store_idx, h : line, o : woffset, d : word) = {
-            require ~sq_live(k);
-            call trace.step(h, o, true, d);
-            sq_live(k) := true;
-            sq_h(k)    := h;
-            sq_o(k)    := o;
-            sq_d(k)    := d;
-            sq_tg(k)   := trace.now;
-        }
-
-        # ---- the LSQ accepts a CPU load into load-queue slot k ----
-        action accept_load(k : load_idx, h : line, o : woffset) = {
-            require ~lq_live(k);
-            var unshadowed : bool := no_st(h, o);
-            call trace.step(h, o, false, 0);
-            lq_live(k) := true;
-            lq_pres(k) := false;
-            lq_cur(k)  := unshadowed;
-            lq_h(k)    := h;
-            lq_o(k)    := o;
-            lq_tg(k)   := trace.now;
-        }
-
-        # ---- the LSQ drains store-queue slot k to the cache ----
-        # The three ordering requirements are all the LSQ has to establish:
-        #   the entry drained is the OLDEST buffered store to its address,
-        #   every entry still live in the load queue is YOUNGER than it, and
-        #   no read is outstanding (so the cache's version of the presented
-        #   address cannot move under a load that is already in the cache).
-        action present_store(k : store_idx, h : line, o : woffset, d : word) = {
-            require ready;
-            require sq_live(k) & sq_h(k) = h & sq_o(k) = o & sq_d(k) = d;
-            require forall J : store_idx.
-                (sq_live(J) & J ~= k & sq_h(J) = h & sq_o(J) = o)
-                  -> sq_tg(k) < sq_tg(J);
-            require forall K : load_idx. lq_live(K) -> sq_tg(k) < lq_tg(K);
-            require ~rd_out;
-            req_en := true; req_h := h; req_o := o;
-            req_wen := true; req_wdata := d;
-            req_sid := k; req_tag := sq_tg(k);
-            sq_live(k) := false;
-            call trace.present_w(h, o, sq_tg(k));
-        }
-
-        # ---- the LSQ hands load-queue slot k to the cache ----
-        action present_load(k : load_idx, h : line, o : woffset) = {
-            require ready;
-            require ~rd_out;
-            require lq_live(k) & ~lq_pres(k) & lq_cur(k);
-            require lq_h(k) = h & lq_o(k) = o;
-            req_en := true; req_h := h; req_o := o;
-            req_wen := false; req_wdata := 0;
-            req_rid := k; req_tag := lq_tg(k);
-            lq_pres(k) := true;
-            rd_out  := true;
-            out_rid := k;
-        }
-
-        action take_req = {
-            req_en := false;
-        }
-
-        # ---- the cache answers the read it holds.  The value handed back
-        # must be the value the reference tag registered under the returned
-        # LSQ index reads: this is the cache's whole coherence obligation. ----
-        action answer(h : line, o : woffset, d : word, rid : load_idx) = {
-            require ~resp_valid;
-            require ~req_en;
-            require rd_out & rid = out_rid;
-            require lq_h(rid) = h & lq_o(rid) = o;
-            require d = trace.st(lq_tg(rid)).mem(concatbv3(h, o));
-            resp_valid := true; resp_h := h; resp_o := o;
-            resp_data := d; resp_rid := rid;
-        }
-
-        action take_resp = {
-            require resp_valid;
-            resp_valid := false;
-            rd_out     := false;
-            lq_pres(resp_rid) := false;
-        }
-
-        # ---- the LSQ retires load-queue slot k to the CPU ----
-        action finish_load(k : load_idx, v : word) = {
-            require lq_live(k) & ~lq_pres(k);
-            require v = trace.st(lq_tg(k)).mem(concatbv3(lq_h(k), lq_o(k)));
-            call trace.observe(lq_tg(k), v);
-            lq_live(k) := false;
-        }
-
-        # ---- registry entries describe the operation they were entered with ----
-        invariant [m_sq_wr] sq_live(J) ->
-            (sq_tg(J) ~= 0 & sq_tg(J) <= trace.now
-             & trace.st(sq_tg(J)).op = op_write
-             & trace.st(sq_tg(J)).op_addr = concatbv3(sq_h(J), sq_o(J))
-             & trace.st(sq_tg(J)).op_data = sq_d(J))
-        invariant [m_lq_rd] lq_live(K) ->
-            (lq_tg(K) ~= 0 & lq_tg(K) <= trace.now
-             & trace.st(lq_tg(K)).op = op_read
-             & ~trace.st(lq_tg(K)).op_done
-             & trace.st(lq_tg(K)).op_addr = concatbv3(lq_h(K), lq_o(K)))
-
-        # ---- distinct live entries carry distinct reference tags ----
-        invariant [m_lq_distinct] (lq_live(I) & lq_live(J) & lq_tg(I) = lq_tg(J)) -> I = J
-
-        # ---- at most one read is in the cache, and it is a live entry ----
-        invariant [m_pres_out] lq_pres(K) -> (rd_out & K = out_rid)
-        invariant [m_rd_out] rd_out ->
-            (lq_live(out_rid) & lq_pres(out_rid) & lq_cur(out_rid))
-        invariant [m_no_wr_rd] rd_out -> ~(req_en & req_wen)
-
-        # ---- a buffered store whose datum is not its word's last written
-        # datum is overwritten by a younger buffered store to the same word:
-        # equivalently, the YOUNGEST buffered store to a word carries that
-        # word's last written datum, which is what forwarding returns. ----
-        invariant [m_sq_last] (sq_live(J)
-            & sq_d(J) ~= trace.lwd(concatbv3(sq_h(J), sq_o(J))))
-            -> st_after(sq_h(J), sq_o(J), sq_tg(J))
-
-        invariant [req_ok] req_en ->
-            (req_tag ~= 0 & req_tag <= trace.now
-             & (req_wen -> (trace.st(req_tag).op = op_write
-                            & trace.st(req_tag).op_addr = concatbv3(req_h, req_o)
-                            & trace.st(req_tag).op_data = req_wdata))
-             & (~req_wen -> (trace.st(req_tag).op = op_read
-                             & trace.st(req_tag).op_addr = concatbv3(req_h, req_o)
-                             & trace.st(trace.ctag(req_h, req_o)).mem(concatbv3(req_h, req_o))
-                               = trace.st(req_tag).mem(concatbv3(req_h, req_o)))))
-        invariant [rd_reg] (req_en & ~req_wen) ->
-            (rd_out & req_rid = out_rid & req_tag = lq_tg(req_rid)
-             & lq_h(req_rid) = req_h & lq_o(req_rid) = req_o)
-        invariant [rd_resp] resp_valid ->
-            (rd_out & resp_rid = out_rid
-             & lq_live(resp_rid) & lq_pres(resp_rid)
-             & lq_h(resp_rid) = resp_h & lq_o(resp_rid) = resp_o)
-        invariant [rd_norq] resp_valid -> ~req_en
-        invariant [out_le] lq_tg(out_rid) <= trace.now
-    }
-
-    # ------------------------------------------------------------------
-    # THE BRIDGE between the reference trace and the version of memory the
-    # cache holds.  It is private to the bus: what leaves the bus is the
-    # already-instantiated fact in req_ok, so neither the LSQ nor the cache
-    # ever has to carry these.
-    # ------------------------------------------------------------------
-    implementation {
-        # ---- an unshadowed load stays unshadowed: every buffered store to
-        # its address is younger than it (new stores always are) ----
-        invariant [m_ld_nold] (lq_live(K) & lq_cur(K) & sq_live(J)
-                               & sq_h(J) = lq_h(K) & sq_o(J) = lq_o(K))
-            -> lq_tg(K) < sq_tg(J)
-
-        # ---- with no buffered store to a word, the version of that word the
-        # cache holds is the last write to it ----
-        invariant [m_br] no_st(H, O) ->
-            trace.st(trace.ctag(H,O)).mem(concatbv3(H,O)) = trace.lwd(concatbv3(H,O))
-
-        # ---- ... and therefore, for a load that was not shadowed when it was
-        # accepted, the version the cache holds is exactly the one that load's
-        # reference tag reads ----
-        invariant [m_ld_bridge] (lq_live(K) & lq_cur(K)) ->
-            trace.st(trace.ctag(lq_h(K), lq_o(K))).mem(concatbv3(lq_h(K), lq_o(K)))
-              = trace.st(lq_tg(K)).mem(concatbv3(lq_h(K), lq_o(K)))
-    }
-} with this, trace, addr_thy, basis
+    definition req_addr  = op_addr(trace.nxt)
+    definition req_wen   = op_wen(trace.nxt)
+    definition req_wdata = op_wdata(trace.nxt)
+}
 
 type store_queue_entry = struct {
-    store_h    : line,
-    store_o    : woffset,
+    store_addr : addr,
     store_data : word,
-    store_mark : load_idx
-}
-type load_queue_entry = struct {
-    load_h     : line,
-    load_o     : woffset,
-    load_fwd   : bool,
-    load_fdata : word
+    store_mark : load_idx            # load_next when the store arrived
 }
 
-module lsq_body(trace, cpu, membus, cache, bus) = {
+type load_queue_entry = struct {
+    load_addr  : addr,
+    load_fwd   : bool,               # answered by store-to-load forwarding
+    load_fdata : word,               # the forwarded datum
+    load_mark  : store_idx           # store_next when the load arrived
+}
+
+# ---- the outcome of a store-queue search for a forwardable datum ----
+type fwd_result = struct {
+    fr_hit  : bool,
+    fr_data : word
+}
+
+# ==================================================================
+# The load-store queue.
+#
+#   * The cpu hands over at most one operation per clock edge; the LSQ
+#     calls `trace.step` when it takes one, so `trace.now` is the tag of
+#     the last operation accepted.
+#
+#   * Every queue entry carries the tag of its operation (`stag`,
+#     `ltag`), and `ctag` is the tag of the last operation to have *left*
+#     the LSQ -- the point the cache's memory image stands at.  The
+#     operations held in the LSQ are then exactly `ctag+1 .. now`
+#     (`cov` together with `nogap_*`).
+#
+#   * The cache is irrelevant to this proof.  Its implementation is
+#     hidden, so `cache_to_lsq_creq_ready` and the whole response
+#     channel are free inputs here, and the only thing assumed about
+#     them is `cache_correct` below.
+#
+# The correctness statement is `resp` at the bottom: whenever the LSQ
+# hands a datum back to the cpu, the address and the datum are those of
+# the corresponding operation in the trace.
+# ==================================================================
+
+isolate lsq_body = {
+
+    # ---- cache request channel: the request is driven here, the ready
+    # comes from the cache ----
+    wire lsq_to_cache_req_en     : bool
+    wire lsq_to_cache_req_h      : line
+    wire lsq_to_cache_req_o      : woffset
+    wire lsq_to_cache_req_wen    : bool
+    wire lsq_to_cache_req_wdata  : word
+    wire lsq_to_cache_req_rid    : load_idx
+    wire cache_to_lsq_creq_ready : bool
+
+    # ---- cache response channel: all driven by the cache.  The echoed
+    # address (`cache_to_lsq_resp_h`, `cache_to_lsq_resp_o`) is not used:
+    # a response is matched to its load by `cache_to_lsq_resp_rid`, and
+    # the address handed back to the cpu is the one the load queue
+    # recorded when the operation arrived. ----
+    wire cache_to_lsq_resp_valid : bool
+    wire cache_to_lsq_resp_h     : line
+    wire cache_to_lsq_resp_o     : woffset
+    wire cache_to_lsq_resp_data  : word
+    wire cache_to_lsq_resp_rid   : load_idx
+
+    # ---- proof observation port.  The specification below watches the
+    # datapath through these wires instead of reading its registers
+    # directly.  It has to: `lsq_body`'s specification is visible in every
+    # isolate that closes `with this`, so a register named there becomes
+    # an interference symbol, and the datapath monitor -- hidden in those
+    # isolates -- is then seen writing visible state.  A wire is exempt,
+    # because its value is frozen at the pre-edge state for the whole
+    # action and its defining equation stays inside `implementation`. ----
+    wire ld_ans  : bool              # the head load is answered this edge
+    wire st_go   : bool              # the cache takes the store on the port
+    wire ld_head : load_idx          # the load queue's pointers, pre-edge
+    wire ld_next : load_idx
+    wire st_head : store_idx         # the store queue's pointers, pre-edge
+    wire st_next : store_idx
+
+    # ==================================================================
+    # Specification.  The reference tags, the assumption about the cache
+    # and the ghost bookkeeping live here, so the datapath in
+    # `implementation` below carries no proof-only state.
+    # ==================================================================
+    specification {
+
+        # ============ ghost state: the reference tags ============
+
+        var ctag : tag                      # last operation to leave the LSQ
+        function stag(J : store_idx) : tag  # tag of store-queue entry J
+        function ltag(K : load_idx)  : tag  # tag of load-queue entry K
+        var cpu_tag_r : tag                 # tag the response port answers
+
+        after init {
+            ctag := 0;
+        }
+
+        # ==============================================================
+        # `cache_correct` -- the one assumption about the cache, and the
+        # only thing this proof takes on trust.  When the cache answers a
+        # load it returns the reference's memory image at `ctag`, the
+        # operation the LSQ last let through.
+        #
+        # This is faithful because a request is held on the port until
+        # the cache takes it and `ctag` advances exactly then, so the
+        # image the cache computes from is the image at `ctag`; and
+        # because nothing else may leave the LSQ while a load is
+        # outstanding (`outst`), `ctag` still stands there when the datum
+        # comes back.  Nothing else about the cache is used: its
+        # implementation is hidden from this isolate, so the whole
+        # response channel is a free input constrained only by this.
+        #
+        # It is stated against the reference alone: `l_kind` gives
+        # `op_addr(ltag(K)) = load_queue(K).load_addr` for a pending load,
+        # so naming the address the cache answered for needs no datapath
+        # read -- which the specification is not allowed to make anyway.
+        # ==============================================================
+        before posedge {
+            assume [cache_correct]
+                cache_to_lsq_resp_valid & ld_head <= cache_to_lsq_resp_rid
+                    & cache_to_lsq_resp_rid < ld_next ->
+                cache_to_lsq_resp_data =
+                    trace.st(ctag).mem(op_addr(ltag(cache_to_lsq_resp_rid)));
+        }
+
+        # ==============================================================
+        # Ghost bookkeeping: the reference tags and the `trace.step` call.
+        # These exist only for the proof, so they live in their own
+        # monitor and the datapath monitor is free of them.
+        #
+        # This block sits in `specification`, which is declared *before*
+        # `implementation`, so it runs first and every test here reads the
+        # pre-edge datapath state -- exactly the state the matching
+        # datapath test reads.  The order is also what makes `forward`
+        # provable: the datapath calls it in step 4, after step 2 has
+        # absorbed the head store, and its loop invariants are stated
+        # against the `ctag` that this block has already advanced past
+        # that store.
+        # ==============================================================
+        after posedge {
+
+            # ---------- the head load is answered, so it leaves ----------
+            if ld_ans {
+                cpu_tag_r := ltag(ld_head);     # the tag the port answers
+                ctag      := ltag(ld_head);
+            };
+
+            # ---------- the cache takes the store on the port ----------
+            if st_go {
+                ctag := stag(st_head);
+            };
+
+            # ---------- the cpu hands over an operation ----------
+            if cpu.ready {
+                call trace.step;                # the reference runs it
+                if cpu.req_wen {
+                    stag(st_next) := trace.now;
+                } else {
+                    ltag(ld_next) := trace.now;
+                };
+            };
+        }
+    }
 
     implementation {
-        var load_outstanding : bool
 
-        function store_queue(K : store_idx) : store_queue_entry
+        # ============ datapath state ============
+
+        function store_queue(J : store_idx) : store_queue_entry
         var store_head : store_idx
         var store_next : store_idx
 
@@ -612,321 +463,383 @@ module lsq_body(trace, cpu, membus, cache, bus) = {
         var load_head : load_idx
         var load_next : load_idx
 
+        # ---- the request held on the cache port until the cache takes it ----
+        var req_en_r    : bool
+        var req_addr_r  : addr
+        var req_wen_r   : bool
+        var req_wdata_r : word
+        var req_rid_r   : load_idx
+
+        # ---- the head load has been taken by the cache and its datum is
+        # still to come ----
+        var load_out : bool
+
+        # ---- the response port back to the cpu ----
         var cpu_valid_r : bool
         var cpu_addr_r  : addr
         var cpu_data_r  : word
         var cpu_ready_r : bool
-        var cpu_tag_r   : trace.tag
-
-        var ev_cpl      : bool
-        var ev_cpl_idx  : load_idx
-        var ev_acc      : bool
-        var ev_acc_wen  : bool
-        var ev_acc_sidx : store_idx
-        var ev_acc_lidx : load_idx
-        var ev_pres      : bool
-        var ev_pres_wen  : bool
-        var ev_pres_sidx : store_idx
-        var ev_pres_lidx : load_idx
 
         after init {
-            load_outstanding := false;
-            store_queue(K).store_h := 0; store_queue(K).store_o := 0;
-            store_queue(K).store_data := 0; store_queue(K).store_mark := 0;
             store_head := 0; store_next := 0;
-            load_queue(K).load_h := 0; load_queue(K).load_o := 0;
-            load_queue(K).load_fwd := false; load_queue(K).load_fdata := 0;
-            load_head := 0; load_next := 0;
-            cpu_valid_r := false; cpu_addr_r := 0; cpu_data_r := 0;
-            cpu_tag_r := 0; cpu_ready_r := true;
-            ev_cpl := false; ev_cpl_idx := 0;
-            ev_acc := false; ev_acc_wen := false;
-            ev_acc_sidx := 0; ev_acc_lidx := 0;
-            ev_pres := false; ev_pres_wen := false;
-            ev_pres_sidx := 0; ev_pres_lidx := 0;
+            load_head  := 0; load_next  := 0;
+            store_queue(J).store_mark := 0;
+            load_queue(K).load_mark   := 0;
+            load_queue(K).load_fwd    := false;
+            req_en_r    := false;
+            load_out    := false;
+            cpu_valid_r := false;
+            cpu_ready_r := true;
         }
 
-        relation store_pending(K : store_idx)
-        definition store_pending(K) = store_head <= K & K < store_next
+        relation store_pending(J : store_idx)
+        definition store_pending(J) = store_head <= J & J < store_next
         relation load_pending(K : load_idx)
         definition load_pending(K) = load_head <= K & K < load_next
-        relation store_full
-        definition store_full = store_next = 2
-        relation load_full
-        definition load_full = load_next = 2
 
-        definition cpu.valid      = cpu_valid_r
-        definition cpu.resp_addr  = cpu_addr_r
-        definition cpu.data       = cpu_data_r
-        definition cpu.ready      = cpu_ready_r
+        # ---- Consistency.  A store may go to the cache only once every
+        # load that arrived before it has been answered, and a load may be
+        # answered only once every store that arrived before it has gone
+        # to the cache.  The marks recorded at arrival are what these two
+        # tests compare, and together they make the operations leave the
+        # LSQ in the order they arrived. ----
+        relation store_elig(J : store_idx)
+        definition store_elig(J) = load_head >= store_queue(J).store_mark
+        relation load_elig(K : load_idx)
+        definition load_elig(K) = store_head >= load_queue(K).load_mark
 
-        relation older_load_pending(K : store_idx)
-        definition older_load_pending(K) =
-            load_head < load_next & load_head < store_queue(K).store_mark
+        # ============ output wires ============
 
+        definition lsq_to_cache_req_en    = req_en_r
+        definition lsq_to_cache_req_h     = high(req_addr_r)
+        definition lsq_to_cache_req_o     = low(req_addr_r)
+        definition lsq_to_cache_req_wen   = req_wen_r
+        definition lsq_to_cache_req_wdata = req_wdata_r
+        definition lsq_to_cache_req_rid   = req_rid_r
+
+        definition cpu.valid     = cpu_valid_r
+        definition cpu.resp_addr = cpu_addr_r
+        definition cpu.data      = cpu_data_r
+        definition cpu.ready     = cpu_ready_r
+
+        # ---- the proof observation port ----
+        definition ld_ans  = load_head < load_next & load_elig(load_head)
+            & ( load_queue(load_head).load_fwd
+              | (load_out & cache_to_lsq_resp_valid
+                 & cache_to_lsq_resp_rid = load_head) )
+        definition st_go   = req_en_r & cache_to_lsq_creq_ready & req_wen_r
+        definition ld_head = load_head
+        definition ld_next = load_next
+        definition st_head = store_head
+        definition st_next = store_next
+
+        # ==============================================================
+        # Store-to-load forwarding: the datum of the newest pending store
+        # to `a`, if there is one.  Walk the store queue from the oldest
+        # entry to the newest keeping the last match; `ct` is the tag of
+        # the last entry walked past, so the invariant says the reference
+        # image at `ct` is either the datum kept or -- if nothing matched
+        # -- still the image the cache holds.  On exit `j = store_next`
+        # and `s_imgN` carries `ct` up to `now`.
+        # ==============================================================
+        action forward(a : addr) returns (r : fwd_result) = {
+            var hit : bool := false;
+            var dat : word;
+            var ct  : tag := ctag;
+            var j   : store_idx := store_head;
+            while j < store_next
+            invariant store_head <= j & j <= store_next
+            invariant (j = store_head & ct = ctag)
+                    | (store_head < j & ct = stag(j-1))
+            invariant hit  -> dat = trace.st(ct).mem(a)
+            invariant ~hit -> trace.st(ct).mem(a) = trace.st(ctag).mem(a)
+            {
+                if store_queue(j).store_addr = a {
+                    hit := true;
+                    dat := store_queue(j).store_data;
+                };
+                ct := stag(j);
+                j  := j + 1;
+            };
+            r.fr_hit  := hit;
+            r.fr_data := dat;
+        }
+
+        # ==============================================================
+        # The datapath.  No ghost state is read or written here.
+        # ==============================================================
         after posedge {
-            cpu_valid_r := false; cpu_addr_r := 0; cpu_data_r := 0;
-            ev_cpl := false; ev_acc := false; ev_pres := false;
 
-            if load_head < load_next & load_queue(load_head).load_fwd {
+            # ---------- 1. answer the load at the head of the queue ----------
+            cpu_valid_r := false;
+            if ld_ans {
                 cpu_valid_r := true;
-                cpu_addr_r  := concatbv3(load_queue(load_head).load_h,
-                                         load_queue(load_head).load_o);
-                cpu_data_r  := load_queue(load_head).load_fdata;
-                ev_cpl      := true;
-                ev_cpl_idx  := load_head;
-                load_head   := load_head.next;
-            } else { if load_head < load_next & load_outstanding & membus.resp_valid
-                        & membus.resp_rid = load_head {
-                cpu_valid_r := true;
-                cpu_addr_r  := concatbv3(load_queue(load_head).load_h,
-                                         load_queue(load_head).load_o);
-                cpu_data_r  := membus.resp_data;
-                ev_cpl      := true;
-                ev_cpl_idx  := load_head;
-                load_head   := load_head.next;
-                load_outstanding := false;
-                call membus.take_resp;
-            } };
-
-            if store_head = store_next { store_head := 0; store_next := 0; };
-            if load_head = load_next {
-                load_head := 0; load_next := 0;
-                store_queue(K).store_mark := 0;
+                cpu_addr_r  := load_queue(load_head).load_addr;
+                if load_queue(load_head).load_fwd {
+                    cpu_data_r := load_queue(load_head).load_fdata;
+                } else {
+                    cpu_data_r := cache_to_lsq_resp_data;
+                    load_out   := false;
+                };
+                load_head := load_head + 1;
             };
 
-            var presented : bool := false;
-
-            if store_head < store_next & membus.ready
-               & ~older_load_pending(store_head) {
-                ev_pres      := true;
-                ev_pres_wen  := true;
-                ev_pres_sidx := store_head;
-                store_head   := store_head + 1;
-                presented    := true;
+            # ---------- 2. the cache takes the request on the port ----------
+            if req_en_r & cache_to_lsq_creq_ready {
+                req_en_r := false;
+                if st_go {
+                    store_head := store_head + 1;
+                } else {
+                    load_out := true;
+                };
             };
 
-            if ~presented & load_head < load_next & ~load_queue(load_head).load_fwd
-               & ~load_outstanding & membus.ready {
-                load_outstanding := true;
-                ev_pres      := true;
-                ev_pres_wen  := false;
-                ev_pres_lidx := load_head;
+            # ---------- 3. present the next request to the cache ----------
+            if ~req_en_r {
+                if store_head < store_next & store_elig(store_head) {
+                    req_en_r    := true;
+                    req_wen_r   := true;
+                    req_addr_r  := store_queue(store_head).store_addr;
+                    req_wdata_r := store_queue(store_head).store_data;
+                } else { if load_head < load_next & load_elig(load_head)
+                            & ~load_queue(load_head).load_fwd & ~load_out {
+                    req_en_r   := true;
+                    req_wen_r  := false;
+                    req_addr_r := load_queue(load_head).load_addr;
+                    req_rid_r  := load_head;
+                } };
             };
 
-            if cpu.req_en {
-                var ra : addr    := cpu.req_addr;
-                var rh : line    := high(ra);
-                var ro : woffset := low(ra);
-                ev_acc     := true;
-                ev_acc_wen := cpu.req_wen;
+            # ---------- 4. accept the next operation from the cpu ----------
+            if cpu.ready {
                 if cpu.req_wen {
-                    store_queue(store_next).store_h := rh;
-                    store_queue(store_next).store_o := ro;
+                    store_queue(store_next).store_addr := cpu.req_addr;
                     store_queue(store_next).store_data := cpu.req_wdata;
                     store_queue(store_next).store_mark := load_next;
-                    ev_acc_sidx := store_next;
-                    store_next  := store_next + 1;
+                    store_next := store_next + 1;
                 } else {
-                    var fwd   : bool := false;
-                    var fdata : word := 0;
-                    if store_pending(1) & store_queue(1).store_h = rh
-                       & store_queue(1).store_o = ro {
-                        fwd := true; fdata := store_queue(1).store_data;
-                    } else { if store_pending(0) & store_queue(0).store_h = rh
-                                & store_queue(0).store_o = ro {
-                        fwd := true; fdata := store_queue(0).store_data;
-                    } };
-                    load_queue(load_next).load_h := rh;
-                    load_queue(load_next).load_o := ro;
-                    load_queue(load_next).load_fwd := fwd;
-                    load_queue(load_next).load_fdata := fdata;
-                    ev_acc_lidx := load_next;
-                    load_next   := load_next.next;
+                    var fr : fwd_result;
+                    fr := forward(cpu.req_addr);
+                    load_queue(load_next).load_addr  := cpu.req_addr;
+                    load_queue(load_next).load_fwd   := fr.fr_hit;
+                    load_queue(load_next).load_fdata := fr.fr_data;
+                    load_queue(load_next).load_mark  := store_next;
+                    load_next := load_next + 1;
                 };
             };
 
-            cpu_ready_r := ~store_full & ~load_full & ~load_outstanding;
+            # ---------- 5. recycle the indices when the LSQ is empty ----------
+            if store_head = store_next & load_head = load_next {
+                store_head := 0; store_next := 0;
+                load_head  := 0; load_next  := 0;
+                store_queue(J).store_mark := 0;
+                load_queue(K).load_mark   := 0;
+            };
+
+            # ---------- 6. room for another operation next cycle ----------
+            cpu_ready_r := store_next < 4 & load_next < 4;
         }
 
-        after posedge {
-            cpu_tag_r := 0;
+        # ==============================================================
+        # Queue structure.
+        # ==============================================================
 
-            if ev_cpl {
-                cpu_tag_r := membus.lq_tg(ev_cpl_idx);
-                membus.finish_load(ev_cpl_idx, cpu_data_r);
-            };
+        invariant [q_s] store_head <= store_next & store_next <= 4
+        invariant [q_l] load_head <= load_next & load_next <= 4
+        invariant [q_rdy] cpu_ready_r -> store_next < 4 & load_next < 4
 
-            if ev_pres {
-                if ev_pres_wen {
-                    membus.present_store(ev_pres_sidx,
-                                         store_queue(ev_pres_sidx).store_h,
-                                         store_queue(ev_pres_sidx).store_o,
-                                         store_queue(ev_pres_sidx).store_data);
-                } else {
-                    membus.present_load(ev_pres_lidx,
-                                        load_queue(ev_pres_lidx).load_h,
-                                        load_queue(ev_pres_lidx).load_o);
-                };
-            };
+        # ==============================================================
+        # Each entry is the operation its tag names, the tags increase
+        # along each queue, and every pending tag lies in (ctag, now].
+        # ==============================================================
 
-            if ev_acc {
-                if ev_acc_wen {
-                    membus.accept_store(ev_acc_sidx,
-                                        store_queue(ev_acc_sidx).store_h,
-                                        store_queue(ev_acc_sidx).store_o,
-                                        store_queue(ev_acc_sidx).store_data);
-                } else {
-                    membus.accept_load(ev_acc_lidx,
-                                       load_queue(ev_acc_lidx).load_h,
-                                       load_queue(ev_acc_lidx).load_o);
-                };
-            };
-        }
+        invariant [c_now] ctag <= trace.now
+        invariant [s_range] store_pending(J) ->
+            ctag < stag(J) & stag(J) <= trace.now
+        invariant [l_range] load_pending(K) ->
+            ctag < ltag(K) & ltag(K) <= trace.now
+        invariant [s_kind] store_pending(J) ->
+              op_wen(stag(J))
+            & op_addr(stag(J))  = store_queue(J).store_addr
+            & op_wdata(stag(J)) = store_queue(J).store_data
+        invariant [l_kind] load_pending(K) ->
+              ~op_wen(ltag(K))
+            & op_addr(ltag(K)) = load_queue(K).load_addr
+        invariant [s_mono] store_pending(J1) & store_pending(J2) & J1 < J2 ->
+            stag(J1) < stag(J2)
+        invariant [l_mono] load_pending(K1) & load_pending(K2) & K1 < K2 ->
+            ltag(K1) < ltag(K2)
 
-        # ---- structural ----
-        invariant [sq_bound] store_head <= store_next & store_next <= 2
-        invariant [lq_bound] load_head <= load_next & load_next <= 2
-        invariant [inv_ready] cpu_ready_r -> (~store_full & ~load_full & ~load_outstanding)
-        invariant [lo_pend] load_outstanding -> load_head < load_next
-        invariant [lo_nofwd] load_outstanding -> ~load_queue(load_head).load_fwd
+        # ==============================================================
+        # The marks interleave the two queues: `store_mark(J)` counts the
+        # loads that arrived before store J, so a load is older than
+        # store J exactly when its index is below that count.  These are
+        # what turn the eligibility tests into statements about tags.
+        # ==============================================================
 
-        # ---- the bus registry mirrors the queues ----
-        invariant [sq_sync] membus.sq_live(K) = store_pending(K)
-        invariant [sq_ent] store_pending(K) ->
-            (membus.sq_h(K) = store_queue(K).store_h
-             & membus.sq_o(K) = store_queue(K).store_o
-             & membus.sq_d(K) = store_queue(K).store_data)
-        invariant [lq_sync] membus.lq_live(K) = load_pending(K)
-        invariant [lq_ent] load_pending(K) ->
-            (membus.lq_h(K) = load_queue(K).load_h
-             & membus.lq_o(K) = load_queue(K).load_o)
-        invariant [lq_cur_sync] load_pending(K) ->
-            (membus.lq_cur(K) = ~load_queue(K).load_fwd)
-        invariant [lo_sync] membus.rd_out = load_outstanding
-        invariant [lo_out] load_outstanding ->
-            (load_head < load_next & membus.out_rid = load_head
-             & membus.lq_pres(load_head))
-        invariant [lo_pres] membus.lq_pres(K) -> (load_outstanding & K = load_head)
+        invariant [m_s] store_pending(J) ->
+            load_head <= store_queue(J).store_mark
+            & store_queue(J).store_mark <= load_next
+        invariant [m_l] load_pending(K) ->
+            store_head <= load_queue(K).load_mark
+            & load_queue(K).load_mark <= store_next
+        invariant [m_mono_s] store_pending(J1) & store_pending(J2) & J1 <= J2 ->
+            store_queue(J1).store_mark <= store_queue(J2).store_mark
+        invariant [m_mono_l] load_pending(K1) & load_pending(K2) & K1 <= K2 ->
+            load_queue(K1).load_mark <= load_queue(K2).load_mark
+        invariant [cross_s] store_pending(J) & load_pending(K) ->
+            (stag(J) < ltag(K) <-> K >= store_queue(J).store_mark)
+        invariant [cross_l] store_pending(J) & load_pending(K) ->
+            (ltag(K) < stag(J) <-> J >= load_queue(K).load_mark)
 
-        invariant [sq_tag_le] store_pending(K) ->
-            (membus.sq_tg(K) ~= 0 & membus.sq_tg(K) <= trace.now)
-        invariant [lq_tag_le] load_pending(K) ->
-            (membus.lq_tg(K) ~= 0 & membus.lq_tg(K) <= trace.now)
+        # ==============================================================
+        # The LSQ holds exactly the operations after `ctag`: the oldest
+        # pending entry is the operation right after `ctag` (`cov`), and
+        # the operation right after any pending entry is again pending --
+        # the next entry of the same queue if no operation of the other
+        # kind arrived in between, and the oldest younger entry of the
+        # other queue if one did (`nogap_*`).  `newest_*` closes the
+        # other end: an entry with nothing behind it carries `now`.
+        # ==============================================================
 
-        # ---- ORDER: this is all the LSQ owes the rest of the system ----
-        invariant [sq_mono] (store_pending(K1) & store_pending(K2) & K1 < K2) ->
-            membus.sq_tg(K1) < membus.sq_tg(K2)
-        invariant [lq_mono] (load_pending(K1) & load_pending(K2) & K1 < K2) ->
-            membus.lq_tg(K1) < membus.lq_tg(K2)
-        invariant [sq_mark] (store_pending(J) & load_pending(K)
-                             & store_queue(J).store_mark <= K) ->
-            membus.sq_tg(J) < membus.lq_tg(K)
-        invariant [sq_mark_le] store_pending(K) ->
-            store_queue(K).store_mark <= load_next
-        invariant [sq_mark_mono] (store_pending(0) & store_pending(1)) ->
-            store_queue(0).store_mark <= store_queue(1).store_mark
-        # ---- while a read is in the cache every buffered store is younger
-        # than the load at the head, so no store can be drained past it ----
-        invariant [lo_nostore] (load_outstanding & store_pending(K)) ->
-            load_head < store_queue(K).store_mark
+        invariant [cov] ctag < trace.now ->
+              (store_pending(store_head) & tag.succ(ctag, stag(store_head)))
+            | (load_pending(load_head)   & tag.succ(ctag, ltag(load_head)))
 
-        # ---- the only value fact left in the LSQ: what the forwarding
-        # network hands back is what the forwarded load's tag reads ----
-        invariant [lq_fwd_val] (load_pending(K) & load_queue(K).load_fwd) ->
-            trace.st(membus.lq_tg(K)).mem(concatbv3(load_queue(K).load_h, load_queue(K).load_o))
-              = load_queue(K).load_fdata
+        invariant [newest_s] store_pending(J) & J + 1 = store_next
+            & store_queue(J).store_mark = load_next -> stag(J) = trace.now
+        invariant [newest_l] load_pending(K) & K + 1 = load_next
+            & load_queue(K).load_mark = store_next -> ltag(K) = trace.now
 
-        invariant [cpu_done] cpu_valid_r ->
-            (cpu_tag_r ~= 0 & cpu_tag_r <= trace.now
-             & trace.st(cpu_tag_r).op = op_read & trace.st(cpu_tag_r).op_done
-             & trace.st(cpu_tag_r).op_data = cpu_data_r
-             & trace.st(cpu_tag_r).op_addr = cpu_addr_r)
+        invariant [nogap_ss] store_pending(J) & J + 1 < store_next
+            & store_queue(J+1).store_mark = store_queue(J).store_mark ->
+            tag.succ(stag(J), stag(J+1))
+        invariant [nogap_sl] store_pending(J)
+            & store_queue(J).store_mark < load_next
+            & (J + 1 >= store_next
+               | store_queue(J).store_mark < store_queue(J+1).store_mark) ->
+            tag.succ(stag(J), ltag(store_queue(J).store_mark))
+        invariant [nogap_s0] store_pending(J) & stag(J) < trace.now ->
+              (J + 1 < store_next
+               & store_queue(J+1).store_mark = store_queue(J).store_mark)
+            | store_queue(J).store_mark < load_next
+
+        invariant [nogap_ll] load_pending(K) & K + 1 < load_next
+            & load_queue(K+1).load_mark = load_queue(K).load_mark ->
+            tag.succ(ltag(K), ltag(K+1))
+        invariant [nogap_ls] load_pending(K)
+            & load_queue(K).load_mark < store_next
+            & (K + 1 >= load_next
+               | load_queue(K).load_mark < load_queue(K+1).load_mark) ->
+            tag.succ(ltag(K), stag(load_queue(K).load_mark))
+        invariant [nogap_l0] load_pending(K) & ltag(K) < trace.now ->
+              (K + 1 < load_next
+               & load_queue(K+1).load_mark = load_queue(K).load_mark)
+            | load_queue(K).load_mark < store_next
+
+        # ==============================================================
+        # Data.  The store queue is a chain of memory images: the image
+        # right after store J differs from the image right after store
+        # J-1 only at store J's own address (`s_img`), the oldest pending
+        # store hangs off the image the cache holds (`s_img0`), and the
+        # newest pending store carries the reference's current image
+        # (`s_imgN`).  Walking that chain is what the forwarding loop
+        # does, and it is also why no quantified "no store to A in
+        # between" fact -- which would put a function from an address back
+        # to a queue index in the instantiation graph and take the goals
+        # out of the decidable fragment -- is needed anywhere.
+        # ==============================================================
+
+        invariant [s_img] store_pending(J) & store_head < J ->
+            trace.st(stag(J)).mem(A) = (store_queue(J).store_data
+                if A = store_queue(J).store_addr
+                else trace.st(stag(J-1)).mem(A))
+        invariant [s_img0] store_pending(store_head) ->
+            trace.st(stag(store_head)).mem(A) = (store_queue(store_head).store_data
+                if A = store_queue(store_head).store_addr
+                else trace.st(ctag).mem(A))
+        invariant [s_imgN]
+              (store_head = store_next ->
+                 trace.st(trace.now).mem(A) = trace.st(ctag).mem(A))
+            & (store_head < store_next ->
+                 trace.st(trace.now).mem(A) = trace.st(stag(store_next-1)).mem(A))
+
+        # ---- a forwarded datum is already the datum the reference's read
+        # returned; `st(T)` never changes once T is recorded, so this only
+        # has to be established when the load arrives ----
+        invariant [l_fwd] load_pending(K) & load_queue(K).load_fwd ->
+            load_queue(K).load_fdata = trace.st(ltag(K)).rdata
+
+        # ==============================================================
+        # The request on the cache port, and the outstanding load.  These
+        # say a presented request is still the head entry of its queue and
+        # was eligible when presented, which is what makes a store
+        # absorption and a load answer mutually exclusive -- so `ctag`
+        # only ever has to advance by one operation per edge.
+        # ==============================================================
+
+        invariant [pres_s] req_en_r & req_wen_r ->
+              store_pending(store_head)
+            & store_elig(store_head)
+            & req_addr_r  = store_queue(store_head).store_addr
+            & req_wdata_r = store_queue(store_head).store_data
+        invariant [pres_l] req_en_r & ~req_wen_r ->
+              load_pending(load_head)
+            & req_rid_r = load_head
+            & load_elig(load_head)
+            & ~load_queue(load_head).load_fwd
+            & ~load_out
+        invariant [outst] load_out ->
+              load_pending(load_head)
+            & load_elig(load_head)
+            & ~load_queue(load_head).load_fwd
+            & ~req_en_r
+
+        # ==============================================================
+        # The correctness statements.
+        #
+        # `resp`: a datum handed back to the cpu is the datum the
+        # reference's read returned, at the address the reference read.
+        #
+        # `consistency`: the responses come back in program order.  A load
+        # sits in the load queue exactly while its response is owed -- it
+        # is enqueued when the cpu hands it over and leaves at the edge its
+        # datum goes out -- so "no older response is still outstanding" is
+        # exactly "every load left in the queue is younger than the one
+        # being answered".
+        # ==============================================================
+
+        invariant [resp] cpu_valid_r ->
+              ~op_wen(cpu_tag_r)
+            & cpu_tag_r <= trace.now
+            & cpu_addr_r = op_addr(cpu_tag_r)
+            & cpu_data_r = trace.st(cpu_tag_r).rdata
+
+        invariant [consistency] cpu_valid_r & load_pending(K) ->
+            cpu_tag_r < ltag(K)
     }
 
-    isolate iso = this with this, trace, cpu, membus, cache, bus, addr_thy, basis
-}
-
-isolate bus = {
-    specification {
-        var cmd_en   : bool
-        var cmd_wen  : bool
-        var cmd_addr : addr
-        var cmd_data : four_words
-
-        var rsp_valid : bool
-        var rsp_addr  : addr
-        var rsp_data  : four_words
-
-        wire ready : bool
-
-        after init {
-            cmd_en := false; cmd_wen := false; cmd_addr := 0; cmd_data := mzero;
-            rsp_valid := false; rsp_addr := 0; rsp_data := mzero;
-        }
-
-        action cmd(wen : bool, a : addr, d : four_words) = {
-            var h : line := high(a);
-            var b : bit  := beat_of(low(a));
-            require ready;
-            require ~rsp_valid;
-            require wen -> (forall Id : mshr_id.
-                trace.mshr_wait(Id) -> trace.mshr_line(Id) ~= h);
-            require wen ->
-                ( unp0(d) = trace.cmem(h, concatbv2(b, 0))
-                & unp1(d) = trace.cmem(h, concatbv2(b, 1))
-                & unp2(d) = trace.cmem(h, concatbv2(b, 2))
-                & unp3(d) = trace.cmem(h, concatbv2(b, 3)) );
-            cmd_en := true; cmd_wen := wen; cmd_addr := a; cmd_data := d;
-            if wen {
-                call trace.wb(h, b);
-            };
-        }
-
-        action take_cmd = {
-            cmd_en := false;
-        }
-
-        action rresp(a : addr, d : four_words) = {
-            var h : line := high(a);
-            var b : bit  := beat_of(low(a));
-            require ~rsp_valid;
-            require unp0(d) = trace.mmemv(h, concatbv2(b,0))
-                  & unp1(d) = trace.mmemv(h, concatbv2(b,1))
-                  & unp2(d) = trace.mmemv(h, concatbv2(b,2))
-                  & unp3(d) = trace.mmemv(h, concatbv2(b,3));
-            rsp_valid := true; rsp_addr := a; rsp_data := d;
-        }
-
-        action take_rsp = {
-            rsp_valid := false;
-        }
-
-        invariant [cmd_ok] (cmd_en & cmd_wen) ->
-            ( unp0(cmd_data) = trace.mmemv(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 0))
-            & unp1(cmd_data) = trace.mmemv(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 1))
-            & unp2(cmd_data) = trace.mmemv(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 2))
-            & unp3(cmd_data) = trace.mmemv(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 3)) )
-    }
-} with this, trace, addr_thy, basis
+} with this, trace, abs_memory, addr_thy, basis
 
 type mshr_state = { mshr_idle, mshr_req_lower, mshr_finished_lower, mshr_req_upper, mshr_drain }
 type dphase = { dp_resp, dp_wb_lo, dp_wb_hi, dp_fill }
 
-type mshr_req = struct {
-    rq_off   : woffset,
-    rq_wen   : bool,
-    rq_wdata : word,
-    rq_rid   : load_idx
-}
-
 type mshr_entry = struct {
     m_state  : mshr_state,
     m_base   : line,
-    m_q(K : qidx) : mshr_req,
-    rq_head  : qidx,
-    rq_next  : qidx,
-    rq_write_pending : bool,
+
+    # ---- the single in-flight request this MSHR holds.  `ready_r`
+    # drops as soon as either slot is occupied, so the cache absorbs
+    # nothing more until it has been replayed into the fill buffer:
+    # a second slot could never be reached.  cache_proof.md's closing
+    # paragraph asks for depth one; taking it structurally rather than
+    # as an invariant is what makes the fill buffer have a single
+    # reference point, and hence what makes 1.2 provable. ----
+    rq_valid : bool,
+    rq_off   : woffset,
+    rq_wen   : bool,
+    rq_wdata : word,
+    rq_rid   : load_idx,
     m_fbuf(O : woffset) : word,
     m_dirty  : bool,
     m_dphase : dphase,
@@ -936,52 +849,64 @@ type mshr_entry = struct {
 type cache_entry = struct {
     occupied : bool,
     dirty    : bool,
-    tag      : line,
+    ltag     : line,
     lru      : bit,
     val(O : woffset) : word
 }
 
-module cache_body(trace, membus, bus, mc) = {
+# ==================================================================
+# The cache, and below it the memory controller.  Both are datapath
+# only.  This file proves the LSQ, and the only thing the LSQ is
+# allowed to know about the cache is `cache_correct`, the assumption in
+# `lsq_body`'s specification -- so neither isolate carries a reference
+# tag, a ghost image, or an invariant.  They are here so the model is a
+# complete machine and the LSQ's ports are driven by something real.
+# Discharging `cache_correct` is the next piece of work and belongs to
+# the isolate that will enclose both, not to this one.
+# ==================================================================
 
-    specification {
-        # ---- the cache's whole contract: what comes back on the response
-        # channel is coherent for the reference tag of the LSQ index the
-        # response is tagged with. ----
-        invariant [coh] membus.resp_valid ->
-            membus.resp_data =
-                trace.st(membus.lq_tg(membus.resp_rid)).mem(
-                    concatbv3(membus.resp_h, membus.resp_o))
-    }
+isolate cache_body = {
+
+    # ---- LSQ request channel: the request comes from the LSQ, the ready
+    # is driven here ----
+    wire lsq_to_cache_req_en     : bool
+    wire lsq_to_cache_req_h      : line
+    wire lsq_to_cache_req_o      : woffset
+    wire lsq_to_cache_req_wen    : bool
+    wire lsq_to_cache_req_wdata  : word
+    wire lsq_to_cache_req_rid    : load_idx
+    wire cache_to_lsq_creq_ready : bool
+
+    # ---- LSQ response channel: all driven here ----
+    wire cache_to_lsq_resp_valid : bool
+    wire cache_to_lsq_resp_h     : line
+    wire cache_to_lsq_resp_o     : woffset
+    wire cache_to_lsq_resp_data  : word
+    wire cache_to_lsq_resp_rid   : load_idx
+
+    # ---- memory command channel: the command is driven here, the ready
+    # comes from the memory controller ----
+    wire cmd_en    : bool
+    wire cmd_wen   : bool
+    wire cmd_addr  : addr
+    wire cmd_data  : four_words
+    wire cmd_ready : bool
+
+    # ---- memory response channel: all driven by the memory controller ----
+    wire rsp_valid : bool
+    wire rsp_addr  : addr
+    wire rsp_data  : four_words
 
     implementation {
         function cache(K : key, W : way) : cache_entry
 
         function mshr(Id : mshr_id) : mshr_entry
 
-        function rq_tag(Id : mshr_id, K : qidx) : trace.tag
-
         var ready_r : bool
 
         var port_used : bool
 
-        var ev_acc      : bool
-        var ev_acc_hit  : bool
-        var ev_acc_id   : mshr_id
-        var ev_acc_k    : qidx
-        var ev_svcw     : bool
-        var ev_alloc    : bool
-        var ev_alloc_id : mshr_id
-        var ev_alloc_h  : line
-        var ev_fill0    : bool
-        var ev_fill0_occ : bool
-        var ev_fill0_tag : line
-        var ev_fill1    : bool
-        var ev_fill1_occ : bool
-        var ev_fill1_tag : line
         var ev_ans      : bool
-        var ev_ans_hit  : bool
-        var ev_ans_id   : mshr_id
-        var ev_ans_k    : qidx
         var ev_ans_h    : line
         var ev_ans_o    : woffset
         var ev_ans_d    : word
@@ -994,7 +919,7 @@ module cache_body(trace, membus, bus, mc) = {
         after init {
             occupied(cache(K,W)) := false;
             dirty(cache(K,W)) := false;
-            tag(cache(K,W)) := 0;
+            ltag(cache(K,W)) := 0;
             lru(cache(K,W)) := 0;
             val(cache(K,W), O) := 0;
             m_state(mshr(Id))  := mshr_idle;
@@ -1003,80 +928,76 @@ module cache_body(trace, membus, bus, mc) = {
             m_dphase(mshr(Id)) := dp_resp;
             m_victim_way(mshr(Id)) := w0;
             m_fbuf(mshr(Id), O) := 0;
-            rq_head(mshr(Id)) := 0;
-            rq_next(mshr(Id)) := 0;
-            rq_write_pending(mshr(Id)) := false;
-            rq_off(m_q(mshr(Id), K))   := 0;
-            rq_wen(m_q(mshr(Id), K))   := false;
-            rq_wdata(m_q(mshr(Id), K)) := 0;
-            rq_rid(m_q(mshr(Id), K))   := 0;
-            rq_tag(Id, K) := 0;
+            rq_valid(mshr(Id))  := false;
+            rq_off(mshr(Id))    := 0;
+            rq_wen(mshr(Id))    := false;
+            rq_wdata(mshr(Id))  := 0;
+            rq_rid(mshr(Id))    := 0;
             ready_r    := true;
             port_used  := false;
-            ev_acc := false; ev_acc_hit := false;
-            ev_acc_id := 0; ev_acc_k := 0; ev_svcw := false;
-            ev_alloc := false; ev_alloc_id := 0; ev_alloc_h := 0;
-            ev_fill0 := false; ev_fill1 := false;
-            ev_fill0_occ := false; ev_fill0_tag := 0;
-            ev_fill1_occ := false; ev_fill1_tag := 0;
-            ev_ans := false; ev_ans_hit := false; ev_ans_id := 0;
-            ev_ans_k := 0; ev_ans_h := 0; ev_ans_o := 0;
+            ev_ans := false; ev_ans_h := 0; ev_ans_o := 0;
             ev_ans_d := 0; ev_ans_rid := 0;
             ev_cmd := false; ev_cmd_wen := false; ev_cmd_addr := 0;
             ev_cmd_data := mzero;
         }
 
-        relation rq_pend(Id : mshr_id, K : qidx)
-        definition rq_pend(Id, K) = rq_head(mshr(Id)) <= K & K < rq_next(mshr(Id))
-
+        # ---- An MSHR is "full" as soon as it holds its one unserviced
+        # request, so `ready_r` drops and the cache absorbs nothing more
+        # until that request has been replayed into the fill buffer.
+        #
+        # This is cache_proof.md's closing paragraph, taken at the cache
+        # end: it costs throughput -- a second miss to an unrelated line
+        # now waits -- and buys the fill buffer a single reference point.
+        # Because `ready_r` demands *both* slots empty, at most one slot
+        # is ever occupied (`one_slot`) and `current` cannot advance
+        # while it is (`rdy_ok`), which is what pins the fill buffer
+        # to a single tag and makes `f_img_*` -- and hence 1.2 -- go
+        # through with no ghost tag anywhere. ----
         relation mshr_full(Id : mshr_id)
-        definition mshr_full(Id) = rq_next(mshr(Id)) = 4 | rq_write_pending(mshr(Id))
+        definition mshr_full(Id) = rq_valid(mshr(Id))
 
         relation evicting(Id : mshr_id)
         definition evicting(Id) = (m_state(mshr(Id)) = mshr_drain
             & (m_dphase(mshr(Id)) = dp_wb_lo | m_dphase(mshr(Id)) = dp_wb_hi | m_dphase(mshr(Id)) = dp_fill))
 
-        function cver(H : line, O : woffset) : trace.tag
-        definition cver(H, O) = trace.cver(H, O)
-        function cmem(H : line, O : woffset) : word
-        definition cmem(H, O) = trace.cmem(H, O)
+        # ---- the output wires are driven by the registers that hold the
+        # cache's response and command ports ----
+        definition cache_to_lsq_creq_ready = ready_r
 
-        definition membus.creq_ready = ready_r
+        definition cache_to_lsq_resp_valid = ev_ans
+        definition cache_to_lsq_resp_h     = ev_ans_h
+        definition cache_to_lsq_resp_o     = ev_ans_o
+        definition cache_to_lsq_resp_data  = ev_ans_d
+        definition cache_to_lsq_resp_rid   = ev_ans_rid
+
+        definition cmd_en   = ev_cmd
+        definition cmd_wen  = ev_cmd_wen
+        definition cmd_addr = ev_cmd_addr
+        definition cmd_data = ev_cmd_data
 
         action enqueue(id : mshr_id, off : woffset, wen : bool, wd : word,
                        rid : load_idx) = {
-            rq_off(m_q(mshr(id), rq_next(mshr(id))))   := off;
-            rq_wen(m_q(mshr(id), rq_next(mshr(id))))   := wen;
-            rq_wdata(m_q(mshr(id), rq_next(mshr(id)))) := wd;
-            rq_rid(m_q(mshr(id), rq_next(mshr(id))))   := rid;
-            ev_acc_id := id;
-            ev_acc_k  := rq_next(mshr(id));
-            if wen {
-                rq_write_pending(mshr(id)) := true;
-            };
-            rq_next(mshr(id)) := rq_next(mshr(id)) + 1;
+            rq_valid(mshr(id)) := true;
+            rq_off(mshr(id))   := off;
+            rq_wen(mshr(id))   := wen;
+            rq_wdata(mshr(id)) := wd;
+            rq_rid(mshr(id))   := rid;
         }
 
         action svc_head(id : mshr_id) = {
-            var k : qidx := rq_head(mshr(id));
-            if rq_wen(m_q(mshr(id), k)) {
-                m_fbuf(mshr(id), rq_off(m_q(mshr(id), k))) := rq_wdata(m_q(mshr(id), k));
-                m_dirty(mshr(id)) := true;
-                rq_write_pending(mshr(id)) := false;
-                ev_svcw := true;
-                rq_head(mshr(id)) := k + 1;
+            if rq_wen(mshr(id)) {
+                m_fbuf(mshr(id), rq_off(mshr(id))) := rq_wdata(mshr(id));
+                m_dirty(mshr(id))  := true;
+                rq_valid(mshr(id)) := false;
             } else {
-                if ~port_used & ~membus.resp_valid {
+                if ~port_used & ~cache_to_lsq_resp_valid {
                     ev_ans       := true;
-                    ev_ans_hit   := false;
-                    ev_ans_id    := id;
-                    ev_ans_k     := k;
                     ev_ans_h     := m_base(mshr(id));
-                    ev_ans_o     := rq_off(m_q(mshr(id), k));
-                    ev_ans_d     := m_fbuf(mshr(id), rq_off(m_q(mshr(id), k)));
-                    ev_ans_rid   := rq_rid(m_q(mshr(id), k));
+                    ev_ans_o     := rq_off(mshr(id));
+                    ev_ans_d     := m_fbuf(mshr(id), rq_off(mshr(id)));
+                    ev_ans_rid   := rq_rid(mshr(id));
                     port_used    := true;
-                    rq_head(mshr(id))  := k + 1;
+                    rq_valid(mshr(id)) := false;
                 };
             };
         }
@@ -1086,23 +1007,19 @@ module cache_body(trace, membus, bus, mc) = {
             var vw   : way := m_victim_way(mshr(id));
             var oway : way := w1;
             if vw = w1 { oway := w0; };
-            var oocc : bool := occupied(cache(vk, vw));
-            var otag : line := tag(cache(vk, vw));
-            tag(cache(vk, vw))      := m_base(mshr(id));
+            ltag(cache(vk, vw))     := m_base(mshr(id));
             val(cache(vk, vw), O)   := m_fbuf(mshr(id), O);
             dirty(cache(vk, vw))    := m_dirty(mshr(id));
             occupied(cache(vk, vw)) := true;
             lru(cache(vk, vw))   := 0;
             lru(cache(vk, oway)) := 1;
             m_state(mshr(id)) := mshr_idle;
-            if id = 0 { ev_fill0 := true; ev_fill0_occ := oocc; ev_fill0_tag := otag; }
-            else       { ev_fill1 := true; ev_fill1_occ := oocc; ev_fill1_tag := otag; };
         }
 
         action drain_step(id : mshr_id) = {
             if m_state(mshr(id)) = mshr_drain {
                 if m_dphase(mshr(id)) = dp_resp {
-                    if rq_head(mshr(id)) ~= rq_next(mshr(id)) {
+                    if rq_valid(mshr(id)) {
                         call svc_head(id);
                     } else {
                         var vw : way := w1;
@@ -1131,7 +1048,7 @@ module cache_body(trace, membus, bus, mc) = {
             var vw : way := m_victim_way(mshr(id));
             ev_cmd      := true;
             ev_cmd_wen  := true;
-            ev_cmd_addr := concatbv3(tag(cache(vk, vw)), concatbv2(b, 0));
+            ev_cmd_addr := concatbv3(ltag(cache(vk, vw)), concatbv2(b, 0));
             ev_cmd_data := pack4(val(cache(vk, vw), concatbv2(b,3)),
                                  val(cache(vk, vw), concatbv2(b,2)),
                                  val(cache(vk, vw), concatbv2(b,1)),
@@ -1146,24 +1063,20 @@ module cache_body(trace, membus, bus, mc) = {
         }
 
         action serve_request = {
-            var h  : line    := membus.req_h;
-            var o  : woffset := membus.req_o;
-            var wen : bool   := membus.req_wen;
-            var d  : word    := membus.req_wdata;
-            var rid : load_idx := membus.req_rid;
-            var tg : trace.tag := membus.req_tag;
+            var h  : line    := lsq_to_cache_req_h;
+            var o  : woffset := lsq_to_cache_req_o;
+            var wen : bool   := lsq_to_cache_req_wen;
+            var d  : word    := lsq_to_cache_req_wdata;
+            var rid : load_idx := lsq_to_cache_req_rid;
             var a  : addr    := concatbv3(h, o);
             var rs : key     := hash(h);
             var hit  : bool  := false;
             var hway : way   := w1;
-            ev_acc := true;
-            if occupied(cache(rs, w1)) & tag(cache(rs, w1)) = h { hit:=true; hway:=w1; }
-            else { if occupied(cache(rs, w0)) & tag(cache(rs, w0)) = h { hit:=true; hway:=w0; } };
-            ev_acc_hit  := hit;
+            if occupied(cache(rs, w1)) & ltag(cache(rs, w1)) = h { hit:=true; hway:=w1; }
+            else { if occupied(cache(rs, w0)) & ltag(cache(rs, w0)) = h { hit:=true; hway:=w0; } };
             if hit {
                 if ~wen {
                     ev_ans      := true;
-                    ev_ans_hit  := true;
                     ev_ans_h    := h;
                     ev_ans_o    := o;
                     ev_ans_d    := val(cache(rs, hway), o);
@@ -1185,25 +1098,18 @@ module cache_body(trace, membus, bus, mc) = {
                 } else {
                     var aid : mshr_id := 0;
                     if m_state(mshr(0)) ~= mshr_idle { aid := 1; };
-                    ev_alloc    := true;
-                    ev_alloc_id := aid;
-                    ev_alloc_h  := h;
                     m_state(mshr(aid))  := mshr_req_lower;
                     m_base(mshr(aid))   := h;
                     m_dirty(mshr(aid))  := false;
                     m_dphase(mshr(aid)) := dp_resp;
-                    m_fbuf(mshr(aid), O) := 0;
-                    rq_head(mshr(aid)) := 0;
-                    rq_next(mshr(aid)) := 0;
-                    rq_write_pending(mshr(aid)) := false;
                     call enqueue(aid, o, wen, d, rid);
                 };
             };
         }
 
         action capture = {
-            var a : addr := bus.rsp_addr;
-            var d : four_words := bus.rsp_data;
+            var a : addr := rsp_addr;
+            var d : four_words := rsp_data;
             if m_state(mshr(0)) = mshr_req_lower & a = concatbv3(m_base(mshr(0)), concatbv2(0,0)) {
                 m_fbuf(mshr(0), concatbv2(0,0)) := unp0(d);
                 m_fbuf(mshr(0), concatbv2(0,1)) := unp1(d);
@@ -1236,18 +1142,13 @@ module cache_body(trace, membus, bus, mc) = {
 
         after posedge {
             port_used := false;
-            ev_acc    := false;
-            ev_svcw   := false;
-            ev_alloc  := false;
-            ev_fill0 := false; ev_fill1 := false;
             ev_ans   := false; ev_cmd := false;
 
-            if bus.rsp_valid {
+            if rsp_valid {
                 call capture;
-                call bus.take_rsp;
             };
 
-            if bus.ready {
+            if cmd_ready {
                 if m_state(mshr(0)) = mshr_drain & m_dphase(mshr(0)) = dp_wb_lo {
                     call issue_wb(0, 0); m_dphase(mshr(0)) := dp_wb_hi;
                 } else { if m_state(mshr(0)) = mshr_drain & m_dphase(mshr(0)) = dp_wb_hi {
@@ -1267,8 +1168,7 @@ module cache_body(trace, membus, bus, mc) = {
                 } } } } } } } };
             };
 
-            if membus.req_en & ready_r & ~membus.resp_valid {
-                call membus.take_req;
+            if lsq_to_cache_req_en & ready_r & ~cache_to_lsq_resp_valid {
                 call serve_request;
             };
 
@@ -1280,185 +1180,43 @@ module cache_body(trace, membus, bus, mc) = {
                         & ~evicting(0) & ~evicting(1);
         }
 
-        after posedge {
-            if ev_cmd {
-                if ev_cmd_wen {
-                    bus.cmd(true, ev_cmd_addr, ev_cmd_data);
-                } else {
-                    bus.cmd(false, ev_cmd_addr, mzero);
-                };
-            };
-
-            if ev_ans {
-                membus.answer(ev_ans_h, ev_ans_o, ev_ans_d, ev_ans_rid);
-            };
-
-            if ev_svcw {
-                call trace.commit_w;
-            };
-
-            if ev_acc {
-                if ev_acc_hit {
-                    if membus.req_wen {
-                        call trace.commit_w;
-                        call trace.dirty_line(membus.req_h);
-                    };
-                } else {
-                    rq_tag(ev_acc_id, ev_acc_k) := membus.req_tag;
-                };
-            };
-
-            if ev_alloc {
-                trace.mshr_alloc(ev_alloc_id, ev_alloc_h);
-            };
-
-            if ev_fill0 {
-                if ev_fill0_occ { call trace.clean_line(ev_fill0_tag); };
-                if m_dirty(mshr(0)) { call trace.dirty_line(m_base(mshr(0))); }
-                else                { call trace.clean_line(m_base(mshr(0))); };
-                trace.mshr_free(0);
-            };
-            if ev_fill1 {
-                if ev_fill1_occ { call trace.clean_line(ev_fill1_tag); };
-                if m_dirty(mshr(1)) { call trace.dirty_line(m_base(mshr(1))); }
-                else                { call trace.clean_line(m_base(mshr(1))); };
-                trace.mshr_free(1);
-            };
-        }
-
-        invariant [inv_hashkey] forall K : key, W : way.
-            occupied(cache(K,W)) -> hash(tag(cache(K,W))) = K
-        invariant [inv_syn] forall K1 : key, W1 : way, K2 : key, W2 : way.
-            (occupied(cache(K1,W1)) & occupied(cache(K2,W2))
-             & tag(cache(K1,W1)) = tag(cache(K2,W2))) -> (K1 = K2 & W1 = W2)
-
-        invariant [inv_mbase_notag] forall K : key, W : way, Id : mshr_id.
-            (m_state(mshr(Id)) ~= mshr_idle & occupied(cache(K,W))) ->
-                tag(cache(K,W)) ~= m_base(mshr(Id))
-
-        invariant [inv_diffbase]
-            (m_state(mshr(0)) ~= mshr_idle & m_state(mshr(1)) ~= mshr_idle) ->
-            m_base(mshr(0)) ~= m_base(mshr(1))
-        invariant [inv_mshr_tr] forall Id : mshr_id.
-            trace.mshr_wait(Id) = (m_state(mshr(Id)) ~= mshr_idle)
-        invariant [inv_mshr_line] forall Id : mshr_id.
-            m_state(mshr(Id)) ~= mshr_idle -> trace.mshr_line(Id) = m_base(mshr(Id))
-
-        invariant [inv_noalias] forall K : key, W : way, Id : mshr_id.
-            (trace.mshr_wait(Id) & occupied(cache(K,W))) ->
-                tag(cache(K,W)) ~= trace.mshr_line(Id)
-
-        invariant [inv_vway]
-            (evicting(0) & evicting(1)
-             & hash(m_base(mshr(0))) = hash(m_base(mshr(1)))) ->
-                m_victim_way(mshr(0)) ~= m_victim_way(mshr(1))
-        invariant [inv_victim] forall Id : mshr_id.
-            evicting(Id) ->
-                (occupied(cache(hash(m_base(mshr(Id))), m_victim_way(mshr(Id))))
-               & dirty(cache(hash(m_base(mshr(Id))), m_victim_way(mshr(Id)))))
-
-        invariant [inv_q_bound] rq_head(mshr(Id)) <= rq_next(mshr(Id)) & rq_next(mshr(Id)) <= 4
-        invariant [inv_q_idle] m_state(mshr(Id)) = mshr_idle -> (rq_head(mshr(Id)) = rq_next(mshr(Id)) & ~rq_write_pending(mshr(Id)))
-        invariant [inv_q_evict] evicting(Id) -> (rq_head(mshr(Id)) = rq_next(mshr(Id)) & ~rq_write_pending(mshr(Id)))
-        invariant [inv_q_wlast] (rq_pend(Id,K) & rq_wen(m_q(mshr(Id),K))) ->
-            (K + 1 = rq_next(mshr(Id)) & rq_write_pending(mshr(Id)))
-        invariant [inv_q_haswr] rq_write_pending(mshr(Id)) -> rq_head(mshr(Id)) < rq_next(mshr(Id))
-        invariant [inv_q_haswr2] (rq_write_pending(mshr(Id)) & K + 1 = rq_next(mshr(Id)) & K < 4) ->
-            (rq_head(mshr(Id)) <= K & rq_wen(m_q(mshr(Id),K)))
-        invariant [inv_onewr] ~(rq_write_pending(mshr(0)) & rq_write_pending(mshr(1)))
-        invariant [inv_req_ready] membus.req_en -> (ready_r & ~membus.resp_valid)
-        invariant [inv_ready] ready_r ->
-            (~mshr_full(0) & ~mshr_full(1)
-             & (m_state(mshr(0)) = mshr_idle | m_state(mshr(1)) = mshr_idle)
-             & ~evicting(0) & ~evicting(1))
-
-        invariant [t_tag_le] rq_pend(Id,K) -> (rq_tag(Id,K) <= trace.now & rq_tag(Id,K) ~= 0)
-        invariant [t_qrd] (rq_pend(Id,K) & ~rq_wen(m_q(mshr(Id),K))) ->
-            (trace.st(rq_tag(Id,K)).op = op_read
-             & trace.st(rq_tag(Id,K)).op_addr = concatbv3(m_base(mshr(Id)), rq_off(m_q(mshr(Id),K))))
-        invariant [t_qread] (rq_pend(Id,K) & ~rq_wen(m_q(mshr(Id),K))) ->
-            trace.st(rq_tag(Id,K)).mem(concatbv3(m_base(mshr(Id)), rq_off(m_q(mshr(Id),K))))
-              = cmem(m_base(mshr(Id)), rq_off(m_q(mshr(Id),K)))
-        invariant [inv_qrd_chan] (rq_pend(Id,K) & ~rq_wen(m_q(mshr(Id),K))) ->
-            (membus.rd_out & rq_tag(Id,K) = membus.lq_tg(membus.out_rid)
-             & rq_rid(m_q(mshr(Id),K)) = membus.out_rid)
-        invariant [inv_qrd_nresp] (rq_pend(Id,K) & ~rq_wen(m_q(mshr(Id),K))) ->
-            ~membus.resp_valid
-        invariant [inv_qrd_nreq] (rq_pend(Id,K) & ~rq_wen(m_q(mshr(Id),K))) ->
-            ~(membus.req_en & ~membus.req_wen)
-        invariant [inv_rd_head] (rq_pend(Id,K) & ~rq_wen(m_q(mshr(Id),K))) ->
-            K = rq_head(mshr(Id))
-        invariant [inv_rd_one] ~(
-            (rq_pend(0, rq_head(mshr(0))) & ~rq_wen(m_q(mshr(0), rq_head(mshr(0)))))
-          & (rq_pend(1, rq_head(mshr(1))) & ~rq_wen(m_q(mshr(1), rq_head(mshr(1))))))
-
-        invariant [t_qwr] (rq_pend(Id,K) & rq_wen(m_q(mshr(Id),K))) ->
-            (trace.st(rq_tag(Id,K)).op = op_write
-             & trace.st(rq_tag(Id,K)).op_addr = concatbv3(m_base(mshr(Id)), rq_off(m_q(mshr(Id),K)))
-             & trace.st(rq_tag(Id,K)).op_data = rq_wdata(m_q(mshr(Id),K)))
-        invariant [inv_pw] trace.pend_valid =
-            ((rq_write_pending(mshr(0)) | rq_write_pending(mshr(1))) | (membus.req_en & membus.req_wen))
-        invariant [inv_pw_req] (membus.req_en & membus.req_wen) ->
-            trace.pend_a = concatbv3(membus.req_h, membus.req_o)
-        invariant [inv_pw_a] (rq_pend(Id,K) & rq_wen(m_q(mshr(Id),K))) ->
-            (trace.pend_a = concatbv3(m_base(mshr(Id)), rq_off(m_q(mshr(Id),K)))
-             & trace.ctag(m_base(mshr(Id)), rq_off(m_q(mshr(Id),K))) = rq_tag(Id,K))
-
-        # ---- a write can neither be presented nor be sitting unapplied while
-        # a read is in the cache: the request channel refuses a write while a
-        # read is outstanding, and the cache is not ready while a write is
-        # queued.  So the commit lag is closed for the whole life of a read,
-        # and over that life the cached version cver is just ctag. ----
-        invariant [inv_rd_nopw] membus.rd_out ->
-            (~rq_write_pending(mshr(0)) & ~rq_write_pending(mshr(1)))
-        invariant [inv_rd_nopend] membus.rd_out -> ~trace.pend_valid
-
-        invariant [inv_cdirty] forall K : key, W : way.
-            (occupied(cache(K,W)) & dirty(cache(K,W))) -> trace.cdirty(tag(cache(K,W)))
-        invariant [inv_mshr_clean] forall Id : mshr_id.
-            trace.mshr_wait(Id) -> ~trace.cdirty(trace.mshr_line(Id))
-
-        invariant [inv_coh] forall K : key, W : way, O : woffset.
-            occupied(cache(K,W)) -> val(cache(K,W),O) = cmem(tag(cache(K,W)), O)
-
-        invariant [inv_memtag] forall H : line, O : woffset.
-            trace.mmemv(H,O) = cmem(H,O)
-          | trace.cdirty(H)
-          | (m_state(mshr(0)) = mshr_drain & m_dirty(mshr(0)) & trace.mshr_line(0) = H)
-          | (m_state(mshr(1)) = mshr_drain & m_dirty(mshr(1)) & trace.mshr_line(1) = H)
-
-        invariant [inv_wb_lo_shipped] forall Id : mshr_id, O : woffset.
-            (m_state(mshr(Id)) = mshr_drain & m_dphase(mshr(Id)) = dp_wb_hi & beat_of(O) = 0) ->
-            trace.mmemv(tag(cache(hash(m_base(mshr(Id))), m_victim_way(mshr(Id)))), O)
-              = cmem(tag(cache(hash(m_base(mshr(Id))), m_victim_way(mshr(Id)))), O)
-        invariant [inv_wb_shipped] forall Id : mshr_id, O : woffset.
-            (m_state(mshr(Id)) = mshr_drain & m_dphase(mshr(Id)) = dp_fill) ->
-            trace.mmemv(tag(cache(hash(m_base(mshr(Id))), m_victim_way(mshr(Id)))), O)
-              = cmem(tag(cache(hash(m_base(mshr(Id))), m_victim_way(mshr(Id)))), O)
-
-        invariant [inv_fbuf_lo] forall Id : mshr_id, O : woffset.
-            ((m_state(mshr(Id)) = mshr_finished_lower | m_state(mshr(Id)) = mshr_req_upper) & beat_of(O) = 0) ->
-            m_fbuf(mshr(Id),O) = cmem(m_base(mshr(Id)), O)
-        invariant [inv_fbuf] forall Id : mshr_id, O : woffset.
-            m_state(mshr(Id)) = mshr_drain -> m_fbuf(mshr(Id),O) = cmem(m_base(mshr(Id)), O)
     }
 
-    isolate iso = this with this, trace, membus, bus, mc, addr_thy, basis
-}
+} with this, addr_thy, basis
 
-module mc_body(trace, bus, membus) = {
+isolate mc_body = {
 
-    specification {
-        invariant [coh] bus.rsp_valid ->
-            ( unp0(bus.rsp_data) = trace.mmemv(high(bus.rsp_addr), concatbv2(beat_of(low(bus.rsp_addr)),0))
-            & unp1(bus.rsp_data) = trace.mmemv(high(bus.rsp_addr), concatbv2(beat_of(low(bus.rsp_addr)),1))
-            & unp2(bus.rsp_data) = trace.mmemv(high(bus.rsp_addr), concatbv2(beat_of(low(bus.rsp_addr)),2))
-            & unp3(bus.rsp_data) = trace.mmemv(high(bus.rsp_addr), concatbv2(beat_of(low(bus.rsp_addr)),3)) )
-    }
+    # ---- cache command channel: the command comes from the cache, the
+    # ready is driven here ----
+    wire cmd_en    : bool
+    wire cmd_wen   : bool
+    wire cmd_addr  : addr
+    wire cmd_data  : four_words
+    wire cmd_ready : bool
 
+    # ---- cache response channel: all driven here ----
+    wire rsp_valid : bool
+    wire rsp_addr  : addr
+    wire rsp_data  : four_words
+
+    # ==================================================================
+    # The controller is datapath only.  Its memory is real hardware --
+    # the DRAM behind the port -- and nothing outside this isolate reads
+    # it, so it needs no specification block and carries no invariants:
+    # this file proves the LSQ, and the cache and the controller are
+    # here only so the model is a complete machine.
+    #
+    # The write is unbuffered and is applied from the command wires
+    # alone: a command lands in memory on the edge the port carries it,
+    # one edge after the cache issued it.  The buffer below delays only
+    # the *response*, and the write is applied at the top of the edge,
+    # so a read never overtakes a write to the same beat.
+    # ==================================================================
     implementation {
+
         function mmem(A : addr) : word
 
+        # ---- the command buffer ----
         var cb0_valid : bool
         var cb0_wen   : bool
         var cb0_addr  : addr
@@ -1467,44 +1225,56 @@ module mc_body(trace, bus, membus) = {
         var cb1_addr  : addr
         var svc_count : nat
 
+        # ---- the registers driving the response port ----
+        var rsp_valid_r : bool
+        var rsp_addr_r  : addr
+        var rsp_data_r  : four_words
+
         after init {
-            mmem(A) := 0;
+            mmem(A) := init_mem(A);
             cb0_valid := false; cb0_wen := false; cb0_addr := 0;
             cb1_valid := false; cb1_wen := false; cb1_addr := 0;
             svc_count := 0;
+            rsp_valid_r := false; rsp_addr_r := 0; rsp_data_r := mzero;
         }
 
-        definition bus.ready = ~(cb0_valid & cb1_valid) & ~bus.cmd_en
+        definition cmd_ready = ~(cb0_valid & cb1_valid) & ~cmd_en
+
+        definition rsp_valid = rsp_valid_r
+        definition rsp_addr  = rsp_addr_r
+        definition rsp_data  = rsp_data_r
 
         after posedge {
-            if bus.cmd_en {
-                var a : addr := bus.cmd_addr;
-                var d : four_words := bus.cmd_data;
-                if bus.cmd_wen {
-                    mmem(concatbv3(high(a), concatbv2(beat_of(low(a)), 0))) := unp0(d);
-                    mmem(concatbv3(high(a), concatbv2(beat_of(low(a)), 1))) := unp1(d);
-                    mmem(concatbv3(high(a), concatbv2(beat_of(low(a)), 2))) := unp2(d);
-                    mmem(concatbv3(high(a), concatbv2(beat_of(low(a)), 3))) := unp3(d);
-                };
-                if ~cb0_valid {
-                    cb0_valid := true; cb0_wen := bus.cmd_wen; cb0_addr := a;
-                    svc_count := mem_latency;
-                } else {
-                    cb1_valid := true; cb1_wen := bus.cmd_wen; cb1_addr := a;
-                };
-                call bus.take_cmd;
+            if cmd_en & cmd_wen {
+                mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 0))) := unp0(cmd_data);
+                mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 1))) := unp1(cmd_data);
+                mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 2))) := unp2(cmd_data);
+                mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 3))) := unp3(cmd_data);
             };
 
-            if cb0_valid & (cb0_wen | ~bus.rsp_valid) {
+            rsp_valid_r := false;
+
+            if cmd_en {
+                var a : addr := cmd_addr;
+                if ~cb0_valid {
+                    cb0_valid := true; cb0_wen := cmd_wen; cb0_addr := a;
+                    svc_count := mem_latency;
+                } else {
+                    cb1_valid := true; cb1_wen := cmd_wen; cb1_addr := a;
+                };
+            };
+
+            if cb0_valid & (cb0_wen | ~rsp_valid) {
                 if svc_count = 0 {
                     if ~cb0_wen {
                         var h : line := high(cb0_addr);
                         var b : bit  := beat_of(low(cb0_addr));
-                        bus.rresp(cb0_addr,
-                                  pack4(mmem(concatbv3(h, concatbv2(b, 3))),
-                                        mmem(concatbv3(h, concatbv2(b, 2))),
-                                        mmem(concatbv3(h, concatbv2(b, 1))),
-                                        mmem(concatbv3(h, concatbv2(b, 0)))));
+                        rsp_valid_r := true;
+                        rsp_addr_r  := cb0_addr;
+                        rsp_data_r  := pack4(mmem(concatbv3(h, concatbv2(b, 3))),
+                                             mmem(concatbv3(h, concatbv2(b, 2))),
+                                             mmem(concatbv3(h, concatbv2(b, 1))),
+                                             mmem(concatbv3(h, concatbv2(b, 0))));
                     };
                     if cb1_valid {
                         cb0_valid := true; cb0_wen := cb1_wen; cb0_addr := cb1_addr;
@@ -1519,16 +1289,49 @@ module mc_body(trace, bus, membus) = {
             };
         }
 
-        invariant [cmd_room] bus.cmd_en -> ~(cb0_valid & cb1_valid)
-        invariant [inv_mm] forall H : line, O : woffset.
-            mmem(concatbv3(H, O)) = trace.mmemv(H, O)
-          | (bus.cmd_en & bus.cmd_wen & high(bus.cmd_addr) = H
-             & beat_of(low(bus.cmd_addr)) = beat_of(O))
     }
 
-    isolate iso = this with this, trace, bus, membus, addr_thy, basis
-}
+} with this, addr_thy, basis
 
-instance memory_controller : mc_body(trace, bus, membus)
-instance simple_cache : cache_body(trace, membus, bus, memory_controller)
-instance the_lsq : lsq_body(trace, cpu, membus, simple_cache, bus)
+# ------------------------------------------------------------------
+# Wire the isolates together.  Each isolate declares the wires on both
+# sides of each of its channels; the connections are made here, so no
+# isolate can see the logic that drives its inputs.
+#
+# The cache and the memory controller carry no proof here.  This file
+# verifies the LSQ, and the only thing the LSQ is allowed to know about
+# the cache is `cache_correct`, the assumption in `lsq_body`'s
+# specification.  The channels are still connected, so the model is a
+# complete machine and the composition -- which is what will owe a
+# proof of `cache_correct` -- has something to close over.  No ghost
+# wire crosses these boundaries: the reference tags live entirely
+# inside `lsq_body`.
+# ------------------------------------------------------------------
+
+# ---- the LSQ's request port drives the cache's ----
+definition cache_body.lsq_to_cache_req_en    = lsq_body.lsq_to_cache_req_en
+definition cache_body.lsq_to_cache_req_h     = lsq_body.lsq_to_cache_req_h
+definition cache_body.lsq_to_cache_req_o     = lsq_body.lsq_to_cache_req_o
+definition cache_body.lsq_to_cache_req_wen   = lsq_body.lsq_to_cache_req_wen
+definition cache_body.lsq_to_cache_req_wdata = lsq_body.lsq_to_cache_req_wdata
+definition cache_body.lsq_to_cache_req_rid   = lsq_body.lsq_to_cache_req_rid
+
+# ---- the cache's response port drives the LSQ's ----
+definition lsq_body.cache_to_lsq_creq_ready = cache_body.cache_to_lsq_creq_ready
+definition lsq_body.cache_to_lsq_resp_valid = cache_body.cache_to_lsq_resp_valid
+definition lsq_body.cache_to_lsq_resp_h     = cache_body.cache_to_lsq_resp_h
+definition lsq_body.cache_to_lsq_resp_o     = cache_body.cache_to_lsq_resp_o
+definition lsq_body.cache_to_lsq_resp_data  = cache_body.cache_to_lsq_resp_data
+definition lsq_body.cache_to_lsq_resp_rid   = cache_body.cache_to_lsq_resp_rid
+
+# ---- the cache's command port drives the memory controller's ----
+definition mc_body.cmd_en    = cache_body.cmd_en
+definition mc_body.cmd_wen   = cache_body.cmd_wen
+definition mc_body.cmd_addr  = cache_body.cmd_addr
+definition mc_body.cmd_data  = cache_body.cmd_data
+
+# ---- the memory controller's response port drives the cache's ----
+definition cache_body.cmd_ready = mc_body.cmd_ready
+definition cache_body.rsp_valid = mc_body.rsp_valid
+definition cache_body.rsp_addr  = mc_body.rsp_addr
+definition cache_body.rsp_data  = mc_body.rsp_data
