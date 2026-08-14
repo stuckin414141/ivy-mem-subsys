@@ -11,7 +11,7 @@ type bv2
 type mshr_id
 
 # ---- LSQ indices are small bit vectors: the queues hold at most four
-# entries each, and `store_next`/`load_next` equal to 4 means full. ----
+# entries each, and `store_tail`/`load_tail` equal to 4 means full. ----
 type store_idx
 type load_idx
 
@@ -517,51 +517,12 @@ object mem_subsys = {
     definition cpu_req_wen   = op_wen(trace.nxt)
     definition cpu_req_wdata = op_wdata(trace.nxt)
 
-    # ==============================================================
-    # `current`: the last STORE whose datum has landed in the cache.
-    #
-    # A store leaves the LSQ at the port handshake, but it now parks in
-    # the cache's input stage before its datum touches anything, so its
-    # tag parks too: `pending` is latched at the handshake and committed
-    # into `current` at `stage_go`, the edge the staged store drains into
-    # the cache -- the same edge `img` moves.  Only a write has an arm
-    # here: a load moves neither the image nor these tags.
-    #
-    # The drain arm runs FIRST, so a drain-and-refill edge commits the
-    # old `pending` before latching the new one.  When nothing is staged,
-    # `current = pending` and the machine looks like the unstaged one.
-    #
-    # `ctag` in `lsq_body` still advances over every retired operation, so
-    # `(current, ctag]` holds the loads that have left the LSQ plus at
-    # most one staged store.  `gap_hi`/`gap_lo` are what say that gap
-    # carries no change of memory beyond the staged store's own word, and
-    # this block is declared first so every monitor reads the same
-    # pre-edge state.
-    #
-    # `current` lives HERE and not in `cachemem` below, because only the
-    # LSQ can say when it moves.  The image it names lives down there,
-    # because only the cache reads that.
-    # ==============================================================
-    specification {
-        var current : tag
-        var pending : tag
-
-        after init {
-            current := 0;
-            pending := 0;
-        }
-
-        after posedge {
-            # (no load arm: answering a load does not move memory)
-            if cachemem.cache_body.stage_go {
-                current := pending;
-            };
-            if lsq_body.lsq_to_cache_req_en & lsq_body.cache_to_lsq_creq_ready
-                    & lsq_body.lsq_to_cache_req_wen {
-                pending := lsq_body.stag(lsq_body.st_head);
-            };
-        }
-    }
+    # ---- (`current` -- the tag of the last store the cache has accepted,
+    # the point `img` stands at -- used to be declared here, from the days
+    # its update was keyed on the cache-side `stage_go`.  It is read and
+    # written by the LSQ alone, so it now lives in `lsq_body`'s
+    # specification with the rest of the reference tags; see the note
+    # there.) ----
 
     # ==================================================================
     # The load-store queue.
@@ -637,9 +598,9 @@ object mem_subsys = {
         wire ld_ans  : bool              # the head load is answered this edge
         wire st_go   : bool              # the cache takes the store on the port
         wire ld_head : load_idx          # the load queue's pointers, pre-edge
-        wire ld_next : load_idx
+        wire ld_tail : load_idx
         wire st_head : store_idx         # the store queue's pointers, pre-edge
-        wire st_next : store_idx
+        wire st_tail : store_idx
 
         # ==================================================================
         # Specification.  The reference tags and the ghost bookkeeping live
@@ -648,14 +609,64 @@ object mem_subsys = {
         # ==================================================================
         specification {
 
+            # ==============================================================
+            # `cache_correct`: the environmental assumption.  The cache's
+            # implementation is OUTSIDE this isolate's closure -- it must
+            # be, because a wire whose defining chain reaches an erased
+            # implementation is pinned false inside monitor guards (see
+            # probe_seam.ivy), which is precisely the vacuity that once
+            # swallowed the whole seam.  With `cache_body` dropped, the
+            # response channel, `creq_ready` and `stage_go_s` are genuinely
+            # free here, and these two assumptions are the ONLY thing the
+            # LSQ knows about the cache:
+            #
+            #   [a_rdy_drain]: an advertised ready empties the stage of any
+            #   staged store this very edge -- what lets a load handshake
+            #   conclude no store remains staged (`no_ld_st`'s second case).
+            #
+            #   [a_resp_img]: a datum on the response wire is `img` at the
+            #   address the response echoes -- what certifies a capture.
+            #
+            # They are stated over THIS side's wires (aliased to the
+            # cachemem-level nets, so the ghost monitors read the same free
+            # symbols).  `cache_body` discharges both in its own isolate as
+            # `rdy_drain` and `resp_img`, stated over its side of the same
+            # nets; the alias chain is what glues assumption to guarantee,
+            # and it is exact.
+            # ==============================================================
+            before posedge {
+                assume [a_rdy_drain] cache_to_lsq_creq_ready
+                    & cachemem.stage_store -> cachemem.stage_go_s;
+                assume [a_resp_img] cache_to_lsq_resp_valid ->
+                    cache_to_lsq_resp_data =
+                        cachemem.img(cache_to_lsq_resp_h, cache_to_lsq_resp_o);
+            }
+
             # ============ ghost state: the reference tags ============
 
-            var ctag : tag                      # last operation to leave the LSQ
+            # ---- `current`: the last STORE the cache has ACCEPTED on the
+            # port -- the point the cache's `img` stands at.  It moves at
+            # the handshake, the same edge the `st_go` arm below absorbs
+            # the store into `ctag` and `cachemem` latches its staged
+            # record, so the three updates are aligned on one event.  The
+            # accepted datum has NOT necessarily reached `img`: until the
+            # stage drains, `img` lags `st(current)` at exactly the staged
+            # word -- `img_ref`'s exception branch.  Declared HERE, not in
+            # `mem_subsys`: only the LSQ reads or writes it (the cache
+            # knows nothing of tags), and a spec monitor of an enclosing
+            # object never fires inside this isolate's check
+            # (probe_seam.ivy, canary c4), so anywhere else its updates
+            # would be provably frozen in the only isolate that checks the
+            # invariants stated over it. ----
+            var current : tag
+
+            var ctag : tag                      # frontier: youngest op to leave the LSQ
             function stag(J : store_idx) : tag  # tag of store-queue entry J
             function ltag(K : load_idx)  : tag  # tag of load-queue entry K
             var cpu_tag_r : tag                 # tag the response port answers
 
             after init {
+                current := 0;
                 ctag := 0;
             }
 
@@ -676,23 +687,52 @@ object mem_subsys = {
             after posedge {
 
                 # ---------- the head load is answered, so it leaves ----------
+                # `ctag` is the FRONTIER -- the youngest operation to have
+                # left the LSQ -- and a store may now depart past answered
+                # or outstanding older loads, so a retiring load may find
+                # `ctag` already beyond it.  Each arm is guarded so the
+                # frontier only moves forward; on an edge where a store
+                # departs and a load retires together, the max wins
+                # whichever arm runs first.
                 if ld_ans {
                     cpu_tag_r := ltag(ld_head);     # the tag the port answers
-                    ctag      := ltag(ld_head);
+                    if ctag < ltag(ld_head) {
+                        ctag := ltag(ld_head);
+                    };
                 };
 
                 # ---------- the cache takes the store on the port ----------
+                # `current` needs no monotonicity guard: stores are
+                # accepted in order.
                 if st_go {
+                    current := stag(st_head);
+                };
+                if st_go & ctag < stag(st_head) {
                     ctag := stag(st_head);
                 };
 
                 # ---------- the cpu hands over an operation ----------
+                # The wires carry the PRE-edge pointers, but step 0 of the
+                # datapath recycles the indices of an empty LSQ to zero
+                # BEFORE step 4 enqueues -- so on a recycle edge the entry
+                # lands in slot 0, not slot `st_tail`/`ld_tail`.  The ghost
+                # mirrors the recycle test (over the same pre-edge wires
+                # step 0's registers carry) or the tag lands in a slot the
+                # datapath never filled.
                 if lsq_to_cpu_ready {
                     call trace.step;                # the reference runs it
-                    if cpu_to_lsq_req_wen {
-                        stag(st_next) := trace.now;
+                    if st_head = st_tail & ld_head = ld_tail {
+                        if cpu_to_lsq_req_wen {
+                            stag(0) := trace.now;
+                        } else {
+                            ltag(0) := trace.now;
+                        };
                     } else {
-                        ltag(ld_next) := trace.now;
+                        if cpu_to_lsq_req_wen {
+                            stag(st_tail) := trace.now;
+                        } else {
+                            ltag(ld_tail) := trace.now;
+                        };
                     };
                 };
             }
@@ -700,54 +740,45 @@ object mem_subsys = {
 
         # ==============================================================
         # The bridge to `current`, the reference point the cache and the
-        # memory controller stand at.  `current` and `pending` are
-        # declared and advanced by the enclosing object; this is where
-        # the LSQ pays for them.
+        # memory controller stand at.
         #
-        # The gap `(current, ctag]` holds the operations that have left
-        # the LSQ but not yet touched the image: loads answered by
-        # forwarding or by the cache, and AT MOST ONE staged store -- a
-        # second store cannot leave the LSQ until the first drains,
-        # because intake requires the stage free or freeing
-        # (`rdy_drain`).  The gap is split at `pending`, the staged
-        # store's own tag:
+        # `current` moves at the ACCEPT: the edge the cache takes a
+        # store on the port -- the same edge this monitor's `st_go` arm
+        # absorbs it into `ctag`, and the same wires `cachemem` latches
+        # its staged-store record off.  So the gap `(current, ctag]`
+        # holds loads only, and `gap` says it carries no change of
+        # memory.  What `current` does NOT say is that the store's datum
+        # has reached `img`: until the stage drains, `img` lags
+        # `st(current)` at exactly the staged store's own word, and that
+        # lag is `img_ref`'s exception branch, read out of the ghost
+        # stage record.  The stage is one entry deep, so one exception
+        # is all there can be.
         #
-        #   `gap_hi`: above the staged store the gap is loads only, so
-        #   `(pending, ctag]` carries no change of memory -- the old
-        #   `gap_clean`, restated between `pending` and `ctag`.
-        #
-        #   `gap_lo`: across the staged store, the image at `pending`
-        #   differs from the image at `current` exactly at the staged
-        #   store's own word, read out of the ghost stage record.  When
-        #   nothing is staged the two tags carry the same memory.
-        #
-        # Both are stated as direct equalities of images rather than as
-        # "no write lies in between".  The latter is a universal over the
+        # `gap` is a direct equality of images rather than "no write
+        # lies in between".  The latter is a universal over the
         # operations in the gap, and chaining it to an image equality
         # would need induction along the trace, which the checker will
         # not do.  This form is one-step inductive: on a forwarding or
-        # answered retire `tr_rd`/`tr_step` carry `gap_hi` across the
-        # single operation and `gap_lo` mentions nothing that moved; on
-        # a store handshake `ctag` and `pending` land on the same value,
-        # so `gap_hi` is reflexive and `gap_lo` is established from
-        # `s_img0` -- the same query shape the old `port_img` closed by;
-        # on `stage_go`, `current := pending` collapses `gap_lo` to its
-        # trivial case, for ARBITRARY behavior of the free `stage_go`
-        # wire, because every ghost update -- `current`, `stage_store`,
-        # `img` -- keys off that same wire.
+        # answered retire `tr_rd`/`tr_step` carry it across the single
+        # operation; on a store handshake `ctag` and `current` land on
+        # the same value, so it is reflexive, and `img_ref`'s exception
+        # is established from `s_img0`; on `stage_go`, `img` gains the
+        # staged word and the record clears on the same wire, so the
+        # exception collapses -- for ARBITRARY behavior of the free
+        # `stage_go` wire, because `current` no longer moves there at
+        # all and the `img` arm is guarded by `stage_store`.
         #
-        # `gap_lo` is stated over a (line, offset) PAIR rather than over
-        # an address, and that is not cosmetic.  `img_ref` is a
-        # statement about `img(H, O)`, so if it were quantified over
+        # `img_ref` is stated over a (line, offset) PAIR rather than
+        # over an address, and that is not cosmetic.  Quantified over
         # `A : addr` its inductive step would have to match
         # `concatbv3(H, O)` against `concatbv3(stage_h_g, stage_o_g)`
         # through `p_full_inj` -- whose two-term trigger then fires on
         # every pair of addresses in a query that already carries the
         # trace's `tr_step`, itself quantified over two tags and an
         # address.  z3 does not come back from that.  Indexed by the
-        # pair, the `stage_go` step is a syntactic match: the enclosing
-        # object writes `img` by the very conditional `gap_lo` asserts
-        # about the trace.
+        # pair, the `stage_go` step is a syntactic match: `cachemem`
+        # writes `img` by the very conditional `img_ref` asserts about
+        # the trace.
         #
         # The whole block is `private`.  Every statement here mentions the
         # trace, and `img_ref` is a direct bridge from `img` to
@@ -761,34 +792,29 @@ object mem_subsys = {
         # in seven minutes; private, the same goal closes in seconds.
         # ==============================================================
         private {
-            invariant [cur_le]  current <= pending & pending <= ctag
+            invariant [cur_le]  current <= ctag
 
-            # ---- above the staged store: loads only ----
-            invariant [gap_hi]  trace.st(ctag).mem(A) = trace.st(pending).mem(A)
+            # ---- the gap is loads only: an accepted store moves `ctag`
+            # and `current` on the same edge ----
+            invariant [gap]  trace.st(ctag).mem(A) = trace.st(current).mem(A)
 
-            # ---- across the staged store ----
-            invariant [gap_lo]  trace.st(pending).mem(concatbv3(H, O)) =
+            # ---- the bridge: the array really is the reference image at
+            # `current`, except at the one staged store's word, where the
+            # datum has been accepted but has not yet reached `img`.
+            # Everything the cache proves about its own contents goes
+            # through this one statement.
+            #
+            # Everything here is the LSQ's own: `current` and the trace
+            # are its spec state, `img` and the stage record are the
+            # cache's exported ghosts, and the goal closes as a syntactic
+            # match on `s_img0`.  The LSQ -- the only component that can
+            # see where the reference stands -- is what pays for the
+            # image being right. ----
+            invariant [img_ref] trace.st(current).mem(concatbv3(H, O)) =
                 (cachemem.stage_d_g
                  if (cachemem.stage_store
                      & H = cachemem.stage_h_g & O = cachemem.stage_o_g)
-                 else trace.st(current).mem(concatbv3(H, O)))
-
-            # ---- the bridge: the array really is the reference image at
-            # `current`.  Everything the cache proves about its own
-            # contents goes through this one statement.
-            #
-            # It is proved HERE rather than in the enclosing object, even
-            # though `img` and `current` are the object's state.  The
-            # object sees only the components' specifications, so its
-            # query carries `gap_hi`'s raw address quantifier and the
-            # trace's `tr_step` with nothing to discharge them against,
-            # and z3 does not return.  Inside the LSQ the same goal is a
-            # syntactic match on `gap_lo`, and closes in seconds.  The
-            # object owns the ghost state and moves it; the LSQ -- the
-            # only component that can see where the reference stands --
-            # is what pays for it being right. ----
-            invariant [img_ref] cachemem.img(H, O) =
-                trace.st(current).mem(concatbv3(H, O))
+                 else cachemem.img(H, O))
         }
 
         implementation {
@@ -800,9 +826,9 @@ object mem_subsys = {
             # no bit width, so a queue of records is a record of queues. ----
             var store_addr(J : store_idx) : addr
             var store_data(J : store_idx) : word
-            var store_mark(J : store_idx) : load_idx   # load_next when it arrived
+            var store_mark(J : store_idx) : load_idx   # load_tail when it arrived
             var store_head : store_idx
-            var store_next : store_idx
+            var store_tail : store_idx
 
             # ---- the load queue.  `load_rdy(K)` means entry K already holds
             # its datum -- forwarded when the operation was accepted, or
@@ -813,9 +839,9 @@ object mem_subsys = {
             var load_addr(K : load_idx)  : addr
             var load_rdy(K : load_idx)   : bool    # datum captured
             var load_data(K : load_idx)  : word    # ... and this is it
-            var load_mark(K : load_idx)  : store_idx  # store_next when it arrived
+            var load_mark(K : load_idx)  : store_idx  # store_tail when it arrived
             var load_head : load_idx
-            var load_next : load_idx
+            var load_tail : load_idx
 
             # ---- the request held on the cache port until the cache takes it ----
             var req_en_r    : bool
@@ -839,8 +865,8 @@ object mem_subsys = {
             var cpu_ready_r : bool
 
             after init {
-                store_head := 0; store_next := 0;
-                load_head  := 0; load_next  := 0;
+                store_head := 0; store_tail := 0;
+                load_head  := 0; load_tail  := 0;
                 store_mark(J) := 0;
                 load_mark(K)  := 0;
                 load_rdy(K)   := false;
@@ -851,18 +877,32 @@ object mem_subsys = {
             }
 
             relation store_pending(J : store_idx)
-            definition store_pending(J) = store_head <= J & J < store_next
+            definition store_pending(J) = store_head <= J & J < store_tail
             relation load_pending(K : load_idx)
-            definition load_pending(K) = load_head <= K & K < load_next
+            definition load_pending(K) = load_head <= K & K < load_tail
 
-            # ---- Consistency.  A store may go to the cache only once every
-            # load that arrived before it has been answered, and a load may be
-            # answered only once every store that arrived before it has gone
-            # to the cache.  The marks recorded at arrival are what these two
-            # tests compare, and together they make the operations leave the
-            # LSQ in the order they arrived. ----
+            # ---- Consistency.  A load may be answered only once every store
+            # that arrived before it has gone to the cache, so loads still
+            # retire in program order against stores.  A store, however, no
+            # longer waits for its older loads to RETIRE -- it may depart
+            # past a load that is answered (`load_rdy`: the datum is pinned
+            # in the entry, so a younger write cannot disturb it) and past
+            # one that is sent-but-unanswered, PROVIDED their addresses
+            # differ -- the cache will answer that load out of `img`, so a
+            # same-address store absorbed first would hand it a value from
+            # the future.  Older UNSENT loads still block the store.  The
+            # disequality is only needed against outstanding loads the store
+            # is passing: an `~rdy` load aliases no OLDER pending store
+            # already (`l_gap` -- it would have forwarded), and a sent load
+            # is older than every pending store (`load_elig` via `cross_l`),
+            # so with this one test a departing store aliases no `~rdy` load
+            # at all. ----
             relation store_elig(J : store_idx)
-            definition store_elig(J) = load_head >= store_mark(J)
+            definition store_elig(J) =
+                forall K : load_idx.
+                    (load_head <= K & K < load_tail & K < store_mark(J))
+                    -> (load_rdy(K)
+                        | (load_sent(K) & load_addr(K) ~= store_addr(J)))
             relation load_elig(K : load_idx)
             definition load_elig(K) = store_head >= load_mark(K)
 
@@ -887,14 +927,14 @@ object mem_subsys = {
             # state it reads is updated, so it has no combinational
             # meaning.  The relations survive for the invariants below,
             # where nothing is translated. ----
-            definition ld_ans  = load_head < load_next
+            definition ld_ans  = load_head < load_tail
                 & store_head >= load_mark(load_head)
                 & load_rdy(load_head)
             definition st_go   = req_en_r & cache_to_lsq_creq_ready & req_wen_r
             definition ld_head = load_head
-            definition ld_next = load_next
+            definition ld_tail = load_tail
             definition st_head = store_head
-            definition st_next = store_next
+            definition st_tail = store_tail
 
             # ==============================================================
             # The datapath.  No ghost state is read or written here.
@@ -909,9 +949,9 @@ object mem_subsys = {
                 # entry arrives, and every statement that reads one is
                 # guarded by `store_pending`/`load_pending`, which this
                 # branch makes false everywhere.
-                if store_head = store_next & load_head = load_next {
-                    store_head := 0; store_next := 0;
-                    load_head  := 0; load_next  := 0;
+                if store_head = store_tail & load_head = load_tail {
+                    store_head := 0; store_tail := 0;
+                    load_head  := 0; load_tail  := 0;
                 };
 
                 # ---------- 1. retire the head load to the cpu ----------
@@ -939,14 +979,14 @@ object mem_subsys = {
                 # The echoed ADDRESS is tested beside the index, and that test
                 # is what carries the proof.  With `resp_img` it says the datum
                 # on the wire is `img` at THIS entry's own address, and then
-                # `img_ref`, `gap_lo` (in its `else` branch, supplied by
-                # `no_ld_st`), `gap_hi` and `l_rdata` turn it into
+                # `img_ref` (in its `else` branch, supplied by
+                # `no_ld_st`), `gap` and `l_rdata` turn it into
                 # `trace.st(ltag(K)).rdata` -- so the entry may be filled with
                 # no record of which load the cache is answering kept anywhere.
                 # The index routes; the address certifies.  That is the whole
                 # reason this design needs no per-slot outstanding-read ghost
                 # on the cache side.
-                if load_sent(0) & load_head <= 0 & 0 < load_next & ~load_rdy(0)
+                if load_sent(0) & load_head <= 0 & 0 < load_tail & ~load_rdy(0)
                         & cache_to_lsq_resp_valid & cache_to_lsq_resp_idx = 0
                         & cache_to_lsq_resp_h = hw_high(load_addr(0))
                         & cache_to_lsq_resp_o = hw_low(load_addr(0)) {
@@ -954,7 +994,7 @@ object mem_subsys = {
                     load_data(0) := cache_to_lsq_resp_data;
                     load_sent(0) := false;
                 };
-                if load_sent(1) & load_head <= 1 & 1 < load_next & ~load_rdy(1)
+                if load_sent(1) & load_head <= 1 & 1 < load_tail & ~load_rdy(1)
                         & cache_to_lsq_resp_valid & cache_to_lsq_resp_idx = 1
                         & cache_to_lsq_resp_h = hw_high(load_addr(1))
                         & cache_to_lsq_resp_o = hw_low(load_addr(1)) {
@@ -962,7 +1002,7 @@ object mem_subsys = {
                     load_data(1) := cache_to_lsq_resp_data;
                     load_sent(1) := false;
                 };
-                if load_sent(2) & load_head <= 2 & 2 < load_next & ~load_rdy(2)
+                if load_sent(2) & load_head <= 2 & 2 < load_tail & ~load_rdy(2)
                         & cache_to_lsq_resp_valid & cache_to_lsq_resp_idx = 2
                         & cache_to_lsq_resp_h = hw_high(load_addr(2))
                         & cache_to_lsq_resp_o = hw_low(load_addr(2)) {
@@ -970,7 +1010,7 @@ object mem_subsys = {
                     load_data(2) := cache_to_lsq_resp_data;
                     load_sent(2) := false;
                 };
-                if load_sent(3) & load_head <= 3 & 3 < load_next & ~load_rdy(3)
+                if load_sent(3) & load_head <= 3 & 3 < load_tail & ~load_rdy(3)
                         & cache_to_lsq_resp_valid & cache_to_lsq_resp_idx = 3
                         & cache_to_lsq_resp_h = hw_high(load_addr(3))
                         & cache_to_lsq_resp_o = hw_low(load_addr(3)) {
@@ -992,11 +1032,17 @@ object mem_subsys = {
                 # ---------- 3. present the next request to the cache ----------
                 # `lsq.md` rules 1 and 2: the oldest load that has not been
                 # sent goes first, and the head store goes only when no load
-                # wants the port.  The two guards are in fact mutually
-                # exclusive -- `no_young` says an eligible store is older than
-                # every pending load, and an eligible load is older than every
-                # pending store -- so the priority is a throughput choice with
-                # no proof content.
+                # wants the port.  The two guards are no longer mutually
+                # exclusive -- a store may now be eligible while unsent loads
+                # exist behind it -- so loads-first is a genuine arbitration
+                # choice: it keeps read latency down and it is what lets the
+                # older loads a store must pass become sent in the first
+                # place.
+                #
+                # The store guard is `store_elig(store_head)` written out per
+                # slot (a defined relation cannot be applied in the
+                # datapath): every older pending load is answered, or sent
+                # to a DIFFERENT address.  See the note at `store_elig`.
                 #
                 # The scan is written out over the four slots, highest index
                 # FIRST, so the lowest match survives and the oldest unsent
@@ -1009,19 +1055,19 @@ object mem_subsys = {
                     var lsel  : bool     := false;
                     var laddr : addr     := 0;
                     var lidx  : load_idx := 0;
-                    if load_head <= 3 & 3 < load_next & ~load_rdy(3)
+                    if load_head <= 3 & 3 < load_tail & ~load_rdy(3)
                             & ~load_sent(3) & store_head >= load_mark(3) {
                         lsel := true; laddr := load_addr(3); lidx := 3;
                     };
-                    if load_head <= 2 & 2 < load_next & ~load_rdy(2)
+                    if load_head <= 2 & 2 < load_tail & ~load_rdy(2)
                             & ~load_sent(2) & store_head >= load_mark(2) {
                         lsel := true; laddr := load_addr(2); lidx := 2;
                     };
-                    if load_head <= 1 & 1 < load_next & ~load_rdy(1)
+                    if load_head <= 1 & 1 < load_tail & ~load_rdy(1)
                             & ~load_sent(1) & store_head >= load_mark(1) {
                         lsel := true; laddr := load_addr(1); lidx := 1;
                     };
-                    if load_head <= 0 & 0 < load_next & ~load_rdy(0)
+                    if load_head <= 0 & 0 < load_tail & ~load_rdy(0)
                             & ~load_sent(0) & store_head >= load_mark(0) {
                         lsel := true; laddr := load_addr(0); lidx := 0;
                     };
@@ -1030,8 +1076,19 @@ object mem_subsys = {
                         req_wen_r  := false;
                         req_addr_r := laddr;
                         req_idx_r  := lidx;
-                    } else { if store_head < store_next
-                                & load_head >= store_mark(store_head) {
+                    } else { if store_head < store_tail
+                                & (~(load_head <= 0 & 0 < load_tail & 0 < store_mark(store_head))
+                                   | load_rdy(0)
+                                   | (load_sent(0) & load_addr(0) ~= store_addr(store_head)))
+                                & (~(load_head <= 1 & 1 < load_tail & 1 < store_mark(store_head))
+                                   | load_rdy(1)
+                                   | (load_sent(1) & load_addr(1) ~= store_addr(store_head)))
+                                & (~(load_head <= 2 & 2 < load_tail & 2 < store_mark(store_head))
+                                   | load_rdy(2)
+                                   | (load_sent(2) & load_addr(2) ~= store_addr(store_head)))
+                                & (~(load_head <= 3 & 3 < load_tail & 3 < store_mark(store_head))
+                                   | load_rdy(3)
+                                   | (load_sent(3) & load_addr(3) ~= store_addr(store_head))) {
                         req_en_r    := true;
                         req_wen_r   := true;
                         req_addr_r  := store_addr(store_head);
@@ -1054,51 +1111,51 @@ object mem_subsys = {
                 # same state the ghost monitor's `ctag` stands at.
                 if lsq_to_cpu_ready {
                     if cpu_to_lsq_req_wen {
-                        store_addr(store_next) := cpu_to_lsq_req_addr;
-                        store_data(store_next) := cpu_to_lsq_req_wdata;
-                        store_mark(store_next) := load_next;
-                        store_next := store_next + 1;
+                        store_addr(store_tail) := cpu_to_lsq_req_addr;
+                        store_data(store_tail) := cpu_to_lsq_req_wdata;
+                        store_mark(store_tail) := load_tail;
+                        store_tail := store_tail + 1;
                     } else {
                         var fhit : bool := false;
                         # ---- the datum is a don't-care when nothing
                         # matched (`l_val` is guarded by `load_rdy`), but an
                         # uninitialised local has no net to read in RTL. ----
                         var fdat : word := 0;
-                        if store_head <= 0 & 0 < store_next
+                        if store_head <= 0 & 0 < store_tail
                                 & store_addr(0) = cpu_to_lsq_req_addr {
                             fhit := true; fdat := store_data(0);
                         };
-                        if store_head <= 1 & 1 < store_next
+                        if store_head <= 1 & 1 < store_tail
                                 & store_addr(1) = cpu_to_lsq_req_addr {
                             fhit := true; fdat := store_data(1);
                         };
-                        if store_head <= 2 & 2 < store_next
+                        if store_head <= 2 & 2 < store_tail
                                 & store_addr(2) = cpu_to_lsq_req_addr {
                             fhit := true; fdat := store_data(2);
                         };
-                        if store_head <= 3 & 3 < store_next
+                        if store_head <= 3 & 3 < store_tail
                                 & store_addr(3) = cpu_to_lsq_req_addr {
                             fhit := true; fdat := store_data(3);
                         };
-                        load_addr(load_next)  := cpu_to_lsq_req_addr;
-                        load_rdy(load_next)   := fhit;
-                        load_data(load_next)  := fdat;
-                        load_mark(load_next)  := store_next;
-                        load_next := load_next + 1;
+                        load_addr(load_tail)  := cpu_to_lsq_req_addr;
+                        load_rdy(load_tail)   := fhit;
+                        load_data(load_tail)  := fdat;
+                        load_mark(load_tail)  := store_tail;
+                        load_tail := load_tail + 1;
                     };
                 };
 
                 # ---------- 6. room for another operation next cycle ----------
-                cpu_ready_r := store_next < 4 & load_next < 4;
+                cpu_ready_r := store_tail < 4 & load_tail < 4;
             }
 
             # ==============================================================
             # Queue structure.
             # ==============================================================
 
-            invariant [q_s] store_head <= store_next & store_next <= 4
-            invariant [q_l] load_head <= load_next & load_next <= 4
-            invariant [q_rdy] cpu_ready_r -> store_next < 4 & load_next < 4
+            invariant [q_s] store_head <= store_tail & store_tail <= 4
+            invariant [q_l] load_head <= load_tail & load_tail <= 4
+            invariant [q_rdy] cpu_ready_r -> store_tail < 4 & load_tail < 4
 
             # ==============================================================
             # Each entry is the operation its tag names, the tags increase
@@ -1108,8 +1165,13 @@ object mem_subsys = {
             invariant [c_now] ctag <= trace.now
             invariant [s_range] store_pending(J) ->
                 ctag < stag(J) & stag(J) <= trace.now
+            # ---- a pending load sits below the frontier only if a store has
+            # departed past it, which requires it answered or sent; an
+            # unsent, unanswered load is never passed. ----
             invariant [l_range] load_pending(K) ->
-                ctag < ltag(K) & ltag(K) <= trace.now
+                0 < ltag(K) & ltag(K) <= trace.now
+            invariant [l_front] load_pending(K) & ~load_rdy(K) & ~load_sent(K) ->
+                ctag < ltag(K)
             invariant [s_kind] store_pending(J) ->
                   op_wen(stag(J))
                 & op_addr(stag(J))  = store_addr(J)
@@ -1131,10 +1193,16 @@ object mem_subsys = {
 
             invariant [m_s] store_pending(J) ->
                 load_head <= store_mark(J)
-                & store_mark(J) <= load_next
+                & store_mark(J) <= load_tail
+            # ---- `m_l`'s old lower bound (`store_head <= load_mark(K)`)
+            # said no store younger than a pending load ever departs; a
+            # store may now depart past an answered or outstanding load,
+            # overtaking its mark, so the bound survives only for loads no
+            # store may pass. ----
             invariant [m_l] load_pending(K) ->
+                load_mark(K) <= store_tail
+            invariant [m_l0] load_pending(K) & ~load_rdy(K) & ~load_sent(K) ->
                 store_head <= load_mark(K)
-                & load_mark(K) <= store_next
             invariant [m_mono_s] store_pending(J1) & store_pending(J2) & J1 <= J2 ->
                 store_mark(J1) <= store_mark(J2)
             invariant [m_mono_l] load_pending(K1) & load_pending(K2) & K1 <= K2 ->
@@ -1154,40 +1222,53 @@ object mem_subsys = {
             # other end: an entry with nothing behind it carries `now`.
             # ==============================================================
 
+            # ---- the frontier property, stated over the retired/departed
+            # slots directly: everything below a head pointer has left the
+            # LSQ, and `ctag` -- the guarded max of both ghost arms -- has
+            # absorbed it.  Slots below the heads are exactly the entries
+            # retired or departed since the last recycle (the recycle only
+            # fires on an empty LSQ, where the claims are vacuous). ----
+            invariant [ret_le] K < load_head -> ltag(K) <= ctag
+            invariant [dep_le] J < store_head -> stag(J) <= ctag
+
+            # ---- the load witness is existential: the head load may itself
+            # have been passed by a departing store (it then sits at or
+            # below `ctag`), and the operation right after the frontier can
+            # be any later pending load. ----
             invariant [cov] ctag < trace.now ->
                   (store_pending(store_head) & tag.succ(ctag, stag(store_head)))
-                | (load_pending(load_head)   & tag.succ(ctag, ltag(load_head)))
+                | (exists K : load_idx. load_pending(K) & tag.succ(ctag, ltag(K)))
 
-            invariant [newest_s] store_pending(J) & J + 1 = store_next
-                & store_mark(J) = load_next -> stag(J) = trace.now
-            invariant [newest_l] load_pending(K) & K + 1 = load_next
-                & load_mark(K) = store_next -> ltag(K) = trace.now
+            invariant [newest_s] store_pending(J) & J + 1 = store_tail
+                & store_mark(J) = load_tail -> stag(J) = trace.now
+            invariant [newest_l] load_pending(K) & K + 1 = load_tail
+                & load_mark(K) = store_tail -> ltag(K) = trace.now
 
-            invariant [nogap_ss] store_pending(J) & J + 1 < store_next
+            invariant [nogap_ss] store_pending(J) & J + 1 < store_tail
                 & store_mark(J+1) = store_mark(J) ->
                 tag.succ(stag(J), stag(J+1))
             invariant [nogap_sl] store_pending(J)
-                & store_mark(J) < load_next
-                & (J + 1 >= store_next
+                & store_mark(J) < load_tail
+                & (J + 1 >= store_tail
                    | store_mark(J) < store_mark(J+1)) ->
                 tag.succ(stag(J), ltag(store_mark(J)))
             invariant [nogap_s0] store_pending(J) & stag(J) < trace.now ->
-                  (J + 1 < store_next
+                  (J + 1 < store_tail
                    & store_mark(J+1) = store_mark(J))
-                | store_mark(J) < load_next
+                | store_mark(J) < load_tail
 
-            invariant [nogap_ll] load_pending(K) & K + 1 < load_next
+            invariant [nogap_ll] load_pending(K) & K + 1 < load_tail
                 & load_mark(K+1) = load_mark(K) ->
                 tag.succ(ltag(K), ltag(K+1))
             invariant [nogap_ls] load_pending(K)
-                & load_mark(K) < store_next
-                & (K + 1 >= load_next
+                & load_mark(K) < store_tail
+                & (K + 1 >= load_tail
                    | load_mark(K) < load_mark(K+1)) ->
                 tag.succ(ltag(K), stag(load_mark(K)))
             invariant [nogap_l0] load_pending(K) & ltag(K) < trace.now ->
-                  (K + 1 < load_next
+                  (K + 1 < load_tail
                    & load_mark(K+1) = load_mark(K))
-                | load_mark(K) < store_next
+                | load_mark(K) < store_tail
 
             # ==============================================================
             # Data.  The store queue is a chain of memory images: the image
@@ -1211,10 +1292,10 @@ object mem_subsys = {
                     if A = store_addr(store_head)
                     else trace.st(ctag).mem(A))
             invariant [s_imgN]
-                  (store_head = store_next ->
+                  (store_head = store_tail ->
                      trace.st(trace.now).mem(A) = trace.st(ctag).mem(A))
-                & (store_head < store_next ->
-                     trace.st(trace.now).mem(A) = trace.st(stag(store_next-1)).mem(A))
+                & (store_head < store_tail ->
+                     trace.st(trace.now).mem(A) = trace.st(stag(store_tail-1)).mem(A))
 
             # ---- The datum in a ready entry is the datum the reference's read
             # returned.  This is `lsq.md`'s `Stmt`, and it is one-step
@@ -1264,16 +1345,12 @@ object mem_subsys = {
             invariant [l_rdata] load_pending(K) & ~load_rdy(K) ->
                 trace.st(ltag(K)).rdata = trace.st(ctag).mem(load_addr(K))
 
-            # ---- The marks already give the anti-aliasing gate for free: a
-            # store that is eligible to go to the cache is older than every
-            # load still in the queue, so absorbing it can never move the
-            # image out from under an outstanding load.  No new gate is
-            # needed, and this is also what makes a store absorption and a
-            # load retire mutually exclusive on one edge. ----
-            invariant [no_young] store_pending(J) & store_elig(J)
-                & load_pending(K) -> stag(J) < ltag(K)
-
-            invariant [cur_lt] load_pending(K) -> current < ltag(K)
+            # ---- (`no_young` is gone: an eligible store may now be younger
+            # than pending loads it departs past.  The anti-aliasing it
+            # provided is carried by `store_elig`'s own disequality term,
+            # `l_gap`, and `no_ld_st` below.) ----
+            invariant [cur_lt] load_pending(K) & ~load_rdy(K) & ~load_sent(K) ->
+                current < ltag(K)
 
             # ==============================================================
             # The request on the cache port, and the outstanding loads.
@@ -1286,14 +1363,12 @@ object mem_subsys = {
             # request ever: several entries may be sent at once, and the port
             # may hold a further one while they are owed.
             #
-            # What that conjunct was protecting -- a store absorption and a
-            # load retire never landing on the same edge, so `ctag` advances
-            # by one operation per edge -- does not depend on it.  It follows
-            # from `pres_s` and the marks: an eligible head store is older
-            # than every pending load (`no_young`, via `cross_s`), while
-            # `ld_ans`'s own `store_head >= load_mark(load_head)` makes the
-            # retiring load older than every pending store (`cross_l`).  Both
-            # at once is a contradiction, with no reference to the port.
+            # A store absorption and a load retire MAY now land on the same
+            # edge -- a store departs past answered loads, and one of them
+            # can be retiring that very cycle.  The ghost monitor's two
+            # `ctag` arms are each guarded to move the frontier only
+            # forward, so whichever of the two operations is younger wins
+            # and the order the arms run in does not matter.
             # ==============================================================
 
             invariant [pres_s] req_en_r & req_wen_r ->
@@ -1321,24 +1396,33 @@ object mem_subsys = {
                   load_elig(K)
                 & ~load_rdy(K)
 
-            # ---- while a store is staged in the cache there are no
-            # outstanding loads at all, so the staged-store branch of
-            # `gap_lo` is never consulted by a capture -- no per-address
-            # argument is needed.  Its two inductive cases:
+            # ---- a store may now be staged WHILE loads are outstanding, so
+            # this is no longer "no loads out during a stage" but the
+            # per-entry address form -- which is all a capture ever needed:
+            # the captured word must not be the staged word, so `img_ref`'s
+            # `else` branch applies.  Its inductive cases:
             #
-            #   * a store is staged (store handshake): an eligible store
-            #     on the port contradicts any `load_sent(K)` -- `pres_s`
-            #     gives `store_elig(store_head)`, so `stag(store_head) <
-            #     ltag(K)` by `cross_s`, so `~load_elig(K)` by `cross_l`,
-            #     so `~load_sent(K)` by `outst`;
+            #   * the stage latch (store handshake): `pres_s` gives
+            #     `store_elig(store_head)`; a sent load is older than every
+            #     pending store (`outst` gives `load_elig`, then `cross_l`
+            #     and `cross_s` place it below `store_mark(store_head)`), so
+            #     the eligibility term supplies `load_addr(K) ~=
+            #     store_addr(store_head)` -- `~load_rdy` by `outst` rules
+            #     out the `load_rdy` disjunct -- and `l_kind`/`s_kind` turn
+            #     the address disequality into a (line, offset) pair
+            #     disequality against the latched record;
             #
             #   * a load is sent (the load handshake): the handshake edge
             #     had `creq_ready`, so if a store was staged it drained
             #     that same edge (`rdy_drain`, the cache's one exported
             #     contract clause about its stage) and `stage_store` is
-            #     clear after. ----
-            invariant [no_ld_st] load_pending(K) & load_sent(K) ->
-                ~cachemem.stage_store
+            #     clear after;
+            #
+            #   * a capture clears `load_sent(K)`, shrinking the claim. ----
+            invariant [no_ld_st] load_pending(K) & load_sent(K)
+                & cachemem.stage_store ->
+                ~(cachemem.stage_h_g = high(load_addr(K))
+                  & cachemem.stage_o_g = low(load_addr(K)))
 
             # ==============================================================
             # The correctness statements.
@@ -1348,13 +1432,13 @@ object mem_subsys = {
             # For a forwarded load that is `l_fwd`.  For one the cache
             # answered it is the whole seam, drawn at capture time out of
             # pre-edge facts: the cache's datum is `img` at the address it
-            # echoes (`cachemem.cache_body.resp_img`), the capture guard
+            # echoes (the `a_resp_img` assumption), the capture guard
             # accepts only when that address is entry K's own, `img` is
-            # the reference image at `current` (`img_ref`), and `current`
-            # and `ctag` carry the same memory at that address (`gap_lo`'s
-            # `else` branch -- supplied by `no_ld_st` -- chained into
-            # `gap_hi`), so `l_rdata` turns the captured datum into the
-            # one the reference's read returned.
+            # the reference image at `current` (`img_ref`'s `else` branch
+            # -- supplied by `no_ld_st`), and `current` and `ctag` carry
+            # the same memory at that address (`gap`), so `l_rdata` turns
+            # the captured datum into the one the reference's read
+            # returned.
             #
             # `consistency`: the responses come back in program order.  A load
             # sits in the load queue exactly while its response is owed -- it
@@ -1374,16 +1458,18 @@ object mem_subsys = {
                 cpu_tag_r < ltag(K)
         }
 
-    # ---- `cachemem.cache_body` is named explicitly.  `with cachemem` alone
-    # brings in the object's own specification -- `img`, the staged-store
-    # record and their monitors -- but NOT the invariants of the isolates
-    # nested inside it, so the response channel would still be a free input
-    # here.  Naming the isolate is what turns `resp_img` and `rdy_drain` into
-    # facts this proof may use, and it is the whole of the dependency: the
-    # cache's datapath stays hidden.  In particular `creq_ready` and
-    # `stage_go` remain free values here, so the LSQ invariants hold
-    # against arbitrary ready patterns, including back-to-back accepts.
-    } with this, cachemem, cachemem.cache_body, trace, abs_memory, tag,
+    # ---- `cachemem.cache_body` is deliberately ABSENT from the `with`.
+    # Naming it would put its erased implementation inside this isolate's
+    # closure, and then every wire whose defining chain reaches it --
+    # `creq_ready`, the whole response channel, `stage_go_s` -- is pinned
+    # false inside monitor guards (probe_seam.ivy): the handshake, the
+    # captures and every ghost update keyed on them silently never fire,
+    # and the seam invariants pass vacuously.  With `cachemem` alone, the
+    # alias definitions into `cache_body` are dropped, those wires are
+    # genuinely free, and the only knowledge of the cache is the
+    # `a_rdy_drain`/`a_resp_img` assumptions in the specification above,
+    # discharged by `cache_body`'s own `rdy_drain`/`resp_img`.
+    } with this, cachemem, trace, abs_memory, tag,
           addr_thy, basis, data_impl
 
     # ==================================================================
@@ -1400,7 +1486,7 @@ object mem_subsys = {
     # nothing else, so the cache is verified against an array of words
     # with no tag, no address and no trace anywhere in sight.
     #
-    # `img` is the reference image at `mem_subsys.current`, carried as a
+    # `img` is the reference image at `lsq_body.current`, carried as a
     # (line, offset) array.  It is written from the cache's OWN request
     # wires, so the cache can see that its image moves exactly when it
     # absorbs a write and exactly where it writes.  `lsq_body.img_ref` --
@@ -1431,7 +1517,7 @@ object mem_subsys = {
     # invariant.
     #
     # Everything the data half would attach to is already in place and
-    # verified: `img`, `img_ref`, `current`, `gap_hi`/`gap_lo`, 1.1, and
+    # verified: `img`, `img_ref`, `current`, `gap`, 1.1, and
     # the response port's `mc_resp`.
     # ==================================================================
     object cachemem = {
@@ -1461,11 +1547,43 @@ object mem_subsys = {
         wire mem_wr_data : four_words
         wire mem_rdata   : four_words
 
+        # ---- PARALLEL SPECIFICATION WIRE.  `cache_body.stage_go` cannot be
+        # read by anything the LSQ's isolate checks: a wire whose defining
+        # chain bottoms out in an ERASED implementation is pinned false
+        # inside monitor guards (see probe_seam.ivy), which silently killed
+        # every ghost update keyed on it.  `stage_go_s` is the same value --
+        # the definition below, an alias, is visible wherever `cache_body`
+        # is -- but in `lsq_body`'s isolate, where `cache_body` is OUT of
+        # the closure, the alias is dropped and the wire is genuinely free,
+        # which is exactly the "arbitrary stage_go" the seam invariants
+        # were always written for.  Everything ghost reads THIS wire; the
+        # datapath keeps the real one. ----
+        wire stage_go_s : bool
+
         specification {
             function img(H : line, O : woffset) : word
 
+            # ---- `cache_owns(H, O)`: the cache side holds data newer than
+            # the DRAM at this word -- dirty in the array or in an MSHR;
+            # `cache_body.owns_bound` is that accounting.  SET when a store
+            # DRAINS into `img` -- not at the accept: a staged, undrained
+            # store has not yet moved `img`, so DRAM still agrees with the
+            # image, and setting early would falsely own the fetching
+            # line's words when a store to it is accepted mid-fetch
+            # (`fetch_unowned` would break).  CLEARED when a command beat
+            # lands in `mmem`.  It is the seam that splits the old
+            # `mem_img` obligation: the controller proves
+            # `~cache_owns -> mmem = img` against its own transition
+            # (`mc_body.mc_owns_img`), the cache owes only the accounting
+            # and the wire guarantees.  Stated over
+            # the (line, offset) PAIR like `img` and `mmem`: the address
+            # form would feed `p_full_inj`/`p_recon`, which is the measured
+            # blowup that killed the monolithic `mem_img`. ----
+            function cache_owns(H : line, O : woffset) : bool
+
             after init {
                 img(H, O)        := init_img(H, O);
+                cache_owns(H, O) := false;
             }
 
             # ==============================================================
@@ -1480,7 +1598,7 @@ object mem_subsys = {
             # off wires both sides can see, is trackable state -- a fact
             # BOTH sides can prove things about.  `cache_body` keeps it
             # synced with its stage (`stage_sync`) and exports `rdy_drain`;
-            # the LSQ states `gap_lo` and `no_ld_st` against it.
+            # the LSQ states `img_ref` and `no_ld_st` against it.
             #
             # One record is enough because a second store cannot leave the
             # LSQ until the first drains: intake requires the stage free or
@@ -1501,17 +1619,38 @@ object mem_subsys = {
                 stage_h_g := 0; stage_o_g := 0; stage_d_g := 0;
             }
 
+            # ---- every guard here reads CACHEMEM-LEVEL wires (or the
+            # parallel `stage_go_s`), never `cache_body.*`: in `lsq_body`'s
+            # isolate the cache_body-side wires are erased-dead and a guard
+            # on one never fires, which made this whole monitor -- and every
+            # seam invariant resting on it -- vacuous there.  The cachemem
+            # wires are the same nets (aliased at the bare level below), so
+            # nothing changes for `cache_body`'s own isolate. ----
             after posedge {
 
-                if cache_body.stage_go {
+                # ---- CLEAR ownership at a command-beat landing, BEFORE
+                # the drain arm below: on the one edge where a store to a
+                # just-evicted line drains while that line's last beat
+                # lands, the set must win, so the freshly-drained word
+                # stays owned and `mc_owns_img` has nothing to prove
+                # there.  Keyed on the controller-side command wires --
+                # the same nets `mc_body`'s `mmem` write is keyed on. ----
+                if mc_body.cmd_en & mc_body.cmd_wen {
+                    cache_owns(H, O) := (false
+                                         if (H = high(mc_body.cmd_addr)
+                                             & beat_of(O) = beat_of(low(mc_body.cmd_addr)))
+                                         else cache_owns(H, O));
+                };
+
+                if stage_go_s {
 
                     # ---- the `img` arm is guarded by `stage_store`, and
                     # that guard is load-bearing for the SEAM, not for the
                     # cache: to `lsq_body` the `stage_go` wire is a free
                     # value, and on a spurious `stage_go` with nothing
-                    # staged, `gap_lo`'s else branch says the trace image
-                    # did not move -- so `img` must not move either, or
-                    # `img_ref` is not inductive.  For the real cache the
+                    # staged, `img_ref` has no exception to collapse -- so
+                    # `img` must not move either, or `img_ref` is not
+                    # inductive.  For the real cache the
                     # guard changes nothing: `stage_go` implies
                     # `p_valid & p_wen`, which is `stage_store` by
                     # `stage_sync`.
@@ -1526,17 +1665,23 @@ object mem_subsys = {
                         img(H, O) := (stage_d_g
                                       if (H = stage_h_g & O = stage_o_g)
                                       else img(H, O));
+                        # ownership begins HERE, the edge the datum enters
+                        # `img` and DRAM stops agreeing with the image
+                        cache_owns(H, O) := (true
+                                             if (H = stage_h_g
+                                                 & O = stage_o_g)
+                                             else cache_owns(H, O));
                     };
                     stage_store := false;
                 };
 
-                if cache_body.lsq_to_cache_req_en
-                        & cache_body.cache_to_lsq_creq_ready
-                        & cache_body.lsq_to_cache_req_wen {
+                if lsq_to_cache_req_en
+                        & cache_to_lsq_creq_ready
+                        & lsq_to_cache_req_wen {
                     stage_store := true;
-                    stage_h_g := cache_body.lsq_to_cache_req_h;
-                    stage_o_g := cache_body.lsq_to_cache_req_o;
-                    stage_d_g := cache_body.lsq_to_cache_req_wdata;
+                    stage_h_g := lsq_to_cache_req_h;
+                    stage_o_g := lsq_to_cache_req_o;
+                    stage_d_g := lsq_to_cache_req_wdata;
                 };
             }
         }
@@ -1623,6 +1768,30 @@ object mem_subsys = {
 
                 invariant [rdy_drain] cache_to_lsq_creq_ready & stage_store ->
                     stage_go
+
+                # ---- the guarantee half of the memory seam: anything the
+                # cache puts on the command wire is accurate to `img`.
+                # Stated over the WIRES (like `resp_img`/`rdy_drain`), so
+                # it is the exported contract the controller's `a_wb_img`
+                # assumption pairs with -- the same nets, the same
+                # formula. ----
+                invariant [wb_img] cmd_en & cmd_wen ->
+                    wsel4(cmd_data, J) =
+                        img(high(cmd_addr),
+                            concatbv2(beat_of(low(cmd_addr)), J))
+
+                # ---- the assumption half of the seam: anything arriving
+                # from the controller at a word the cache does not own is
+                # accurate to `img`.  Discharged by `mc_body.mc_resp`
+                # chained with `mc_body.mc_owns_img` over the same nets. ----
+                before posedge {
+                    assume [a_rsp_unowned] rsp_valid
+                        & ~cache_owns(high(rsp_addr),
+                                      concatbv2(beat_of(low(rsp_addr)), J))
+                        -> wsel4(rsp_data, J) =
+                           img(high(rsp_addr),
+                               concatbv2(beat_of(low(rsp_addr)), J));
+                }
             }
 
             implementation {
@@ -1914,6 +2083,18 @@ object mem_subsys = {
                 definition cache_to_lsq_resp_o     = ev_ans_o
                 definition cache_to_lsq_resp_data  = ev_ans_d
                 definition cache_to_lsq_resp_idx   = ev_ans_idx
+
+                # ---- the cachemem-level side of the channel, aliased HERE
+                # (in the implementation) so the tie is visible exactly when
+                # this implementation is -- see the note at the interconnect
+                # section below. ----
+                definition cachemem.cache_to_lsq_creq_ready = cache_to_lsq_creq_ready
+                definition cachemem.stage_go_s = stage_go
+                definition cachemem.cache_to_lsq_resp_valid = cache_to_lsq_resp_valid
+                definition cachemem.cache_to_lsq_resp_h     = cache_to_lsq_resp_h
+                definition cachemem.cache_to_lsq_resp_o     = cache_to_lsq_resp_o
+                definition cachemem.cache_to_lsq_resp_data  = cache_to_lsq_resp_data
+                definition cachemem.cache_to_lsq_resp_idx   = cache_to_lsq_resp_idx
 
                 definition cmd_en   = ev_cmd
                 definition cmd_wen  = ev_cmd_wen
@@ -2297,6 +2478,69 @@ object mem_subsys = {
                 # leaves a branch nothing else here says anything about.
                 # `dphase` needs no such invariant: it is two bits wide and
                 # all four of its values are named. ----
+                # ---- split by the beat bit: each consecution query then
+                # carries a ground beat, halving the writeback-wire case
+                # product that made the single-goal form intractable once
+                # the full transition went live. ----
+                # ==========================================================
+                # The un-ownership bound, contrapositive form.  Together
+                # with `no_alias_*`/`mshr_distinct` ("a fetched line is
+                # resident nowhere and in no other MSHR") it gives the
+                # capture chain `~cache_owns` at a clean fetch's words
+                # directly -- no separate fetch invariant.  Three points of
+                # precision:
+                #   * "resident" is DIRTY-resident: a clean resident
+                #     line's words are already un-owned, and stay so when
+                #     a fill silently drops the line;
+                #   * "in the MSHR" means the MSHR holds NEWER data -- a
+                #     serviced write (`m_dirty`) or the pending write
+                #     word; a clean fetch does not own its line, which is
+                #     the point of the decomposition;
+                #   * the wire conjunct covers the one edge between a
+                #     victim's fill and its last beat landing
+                #     (`fill_wb0_*`/`ev_unowned_*` below carry the low
+                #     beat).
+                # The controller's `mc_owns_img` supplies
+                # `~cache_owns -> mmem = img`.
+                # ==========================================================
+                invariant [unowned]
+                      (forall K : key, W : way. ~(occupied(K, W)
+                            & dirty(K, W) & ltag(K, W) = H))
+                    & (m_state(0) = mshr_idle | m_base(0) ~= H
+                       | (~m_dirty(0)
+                          & ~(rq_valid(0) & rq_wen(0) & rq_off(0) = O)))
+                    & (m_state(1) = mshr_idle | m_base(1) ~= H
+                       | (~m_dirty(1)
+                          & ~(rq_valid(1) & rq_wen(1) & rq_off(1) = O)))
+                    & ~(ev_cmd & ev_cmd_wen & high(ev_cmd_addr) = H
+                        & beat_of(low(ev_cmd_addr)) = beat_of(O))
+                    -> ~cache_owns(H, O)
+
+                # ---- the fill phase is only reached on the writeback path
+                # with the low beat already landed: entering `dp_fill`
+                # required `cmd_ready` for the high beat, and `rdy_idle`
+                # says the wire was empty -- the low beat was gone because
+                # it landed (`wb_wire_0`'s contrapositive). ----
+                invariant [fill_wb0_0] m_state(0) = mshr_drain
+                    & m_dphase(0) = dp_fill -> m_wb0(0)
+                invariant [fill_wb0_1] m_state(1) = mshr_drain
+                    & m_dphase(1) = dp_fill -> m_wb0(1)
+
+                # ---- once the victim's low beat has landed, its words are
+                # un-owned (the landing cleared them, and no store to the
+                # victim line can drain while the eviction is in flight) --
+                # the fact `owns_bound` needs at the fill edge, where the
+                # victim leaves the array while its high beat rides the
+                # wire. ----
+                invariant [ev_unowned_0] evicting(0) & m_wb0(0)
+                    & beat_of(O) = 0 -> ~cache_owns(mvline(0), O)
+                invariant [ev_unowned_1] evicting(1) & m_wb0(1)
+                    & beat_of(O) = 0 -> ~cache_owns(mvline(1), O)
+
+                # (no separate fetch-unownedness invariant: the capture
+                # chain derives `~cache_owns(m_base, O)` from `no_alias_*`,
+                # `mshr_distinct`, `fetch_clean_*` and `unowned` above.)
+
                 invariant [st_enum_0]
                       m_state(0) = mshr_idle
                     | m_state(0) = mshr_req_lower
@@ -2395,7 +2639,7 @@ object mem_subsys = {
                 # The DATA half: `new_proof.md` 1.2 and 1.4-1.6.
                 #
                 # Everything below is stated against `img`, the reference
-                # image at `mem_subsys.current`, and `mc_body.mmem`, the
+                # image at `lsq_body.current`, and `mc_body.mmem`, the
                 # controller's memory.  The cache never sees a tag or the
                 # trace: `lsq_body.img_ref` -- one level up, where the trace
                 # is in scope -- is what says `img` really is the reference
@@ -2476,16 +2720,9 @@ object mem_subsys = {
                 # one edge the victim is in neither the array nor an MSHR and
                 # memory is still a beat behind.
                 # ==========================================================
-                invariant [mem_img]
-                      (forall K : key, W : way. ~(occupied(K, W)
-                            & dirty(K, W)
-                            & ltag(K, W) = high(A)))
-                    & (m_state(0) = mshr_idle | m_base(0) ~= high(A))
-                    & (m_state(1) = mshr_idle | m_base(1) ~= high(A))
-                    & ~(ev_cmd & ev_cmd_wen
-                        & high(ev_cmd_addr) = high(A)
-                        & beat_of(low(ev_cmd_addr)) = beat_of(low(A)))
-                    -> mc_body.mmem(A) = img(high(A), low(A))
+                # (mem_img is declared at the head of the invariant
+                # section, so its consecution check -- by far the heaviest
+                # -- runs first.)
 
                 # ---- 1.5  the converse, for the line an MSHR is working on:
                 # nothing the cache holds is newer than memory there, so what
@@ -2497,29 +2734,20 @@ object mem_subsys = {
                 # that no way holds the line and no MSHR owns it. ----
                 invariant [mshr_mem_0] m_state(0) ~= mshr_idle
                     & ~m_dirty(0)
-                    & high(A) = m_base(0)
-                    & ~fb_hole(0, low(A))
-                    -> mc_body.mmem(A) = img(high(A), low(A))
+                    & ~fb_hole(0, O)
+                    -> mc_body.mmem(m_base(0), O) = img(m_base(0), O)
                 invariant [mshr_mem_1] m_state(1) ~= mshr_idle
                     & ~m_dirty(1)
-                    & high(A) = m_base(1)
-                    & ~fb_hole(1, low(A))
-                    -> mc_body.mmem(A) = img(high(A), low(A))
+                    & ~fb_hole(1, O)
+                    -> mc_body.mmem(m_base(1), O) = img(m_base(1), O)
 
                 # ==========================================================
                 # 1.6  An eviction ships the image.
                 # ==========================================================
 
                 # ---- what is on the command wire is the image ----
-                invariant [wb_cmd] ev_cmd & ev_cmd_wen ->
-                      unp0(ev_cmd_data) = img(high(ev_cmd_addr),
-                            concatbv2(beat_of(low(ev_cmd_addr)), 0))
-                    & unp1(ev_cmd_data) = img(high(ev_cmd_addr),
-                            concatbv2(beat_of(low(ev_cmd_addr)), 1))
-                    & unp2(ev_cmd_data) = img(high(ev_cmd_addr),
-                            concatbv2(beat_of(low(ev_cmd_addr)), 2))
-                    & unp3(ev_cmd_data) = img(high(ev_cmd_addr),
-                            concatbv2(beat_of(low(ev_cmd_addr)), 3))
+                # (`wb_cmd` moved to the specification as `wb_img`, stated
+                # over the command wires.)
 
                 # ---- the victim's low beat is either still on the wire or
                 # already in memory, and `m_wb0` says which.  A writeback is
@@ -2538,23 +2766,35 @@ object mem_subsys = {
                     & high(ev_cmd_addr) = mvline(1)
                     & beat_of(low(ev_cmd_addr)) = 0
 
+                # ---- in `dp_fill`, the victim's high beat is either still
+                # riding the wire or it has landed and its words are
+                # already un-owned.  The unconditional "it is riding" form
+                # was FALSE: the arbiter prefers `drain0`, so an MSHR can
+                # sit in `dp_fill` for edges while the OTHER victim's
+                # writeback occupies the wire -- its own beat long since
+                # landed (this was never checked before: `mem_img` sat
+                # ahead of it in goal order and hung every run). ----
                 invariant [wb_wire_hi_0] evicting(0)
-                    & m_dphase(0) = dp_fill ->
-                      ev_cmd & ev_cmd_wen
-                    & high(ev_cmd_addr) = mvline(0)
-                    & beat_of(low(ev_cmd_addr)) = 1
+                    & m_dphase(0) = dp_fill
+                    & ~(ev_cmd & ev_cmd_wen
+                        & high(ev_cmd_addr) = mvline(0)
+                        & beat_of(low(ev_cmd_addr)) = 1)
+                    & beat_of(O) = 1
+                    -> ~cache_owns(mvline(0), O)
                 invariant [wb_wire_hi_1] evicting(1)
-                    & m_dphase(1) = dp_fill ->
-                      ev_cmd & ev_cmd_wen
-                    & high(ev_cmd_addr) = mvline(1)
-                    & beat_of(low(ev_cmd_addr)) = 1
+                    & m_dphase(1) = dp_fill
+                    & ~(ev_cmd & ev_cmd_wen
+                        & high(ev_cmd_addr) = mvline(1)
+                        & beat_of(low(ev_cmd_addr)) = 1)
+                    & beat_of(O) = 1
+                    -> ~cache_owns(mvline(1), O)
 
                 invariant [wb_lo_0] evicting(0) & m_wb0(0)
-                    & high(A) = mvline(0) & beat_of(low(A)) = 0
-                    -> mc_body.mmem(A) = img(high(A), low(A))
+                    & beat_of(O) = 0
+                    -> mc_body.mmem(mvline(0), O) = img(mvline(0), O)
                 invariant [wb_lo_1] evicting(1) & m_wb0(1)
-                    & high(A) = mvline(1) & beat_of(low(A)) = 0
-                    -> mc_body.mmem(A) = img(high(A), low(A))
+                    & beat_of(O) = 0
+                    -> mc_body.mmem(mvline(1), O) = img(mvline(1), O)
 
                 # ---- the victim is a real, dirty, resident line and
                 # `mvline` names it ----
@@ -2615,27 +2855,62 @@ object mem_subsys = {
             # head of `cachemem`.
             # ==================================================================
             specification {
-                function mmem(A : addr) : word
+                # ---- `mmem` is (line, offset)-INDEXED, like `img` and
+                # `init_img`, not addr-indexed.  Indexed by `addr`, every
+                # invariant relating it to `img` mentions
+                # `concatbv3(H, O)` terms, and `p_full_inj`'s two-term
+                # trigger fires on every pair of them -- a measured 2M
+                # instantiations on `mem_img`'s consecution.  Over the
+                # pair, no concat term appears and the axiom stays
+                # dormant. ----
+                function mmem(H : line, O : woffset) : word
 
                 after init {
-                    mmem(A) := init_img(high(A), low(A));
+                    mmem(H, O) := init_img(H, O);
                 }
 
+                # ---- ONE conditional whole-array write: four sequential
+                # writes each spawn a quantified frame axiom and they
+                # chain, which measured as the dominant instantiation cost
+                # in `mem_img`'s consecution.  `wsel4` bridges to the
+                # `unp0..3` forms by `p_wsel0..3` under `p_cover`. ----
                 after posedge {
                     if cmd_en & cmd_wen {
-                        mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 0))) := unp0(cmd_data);
-                        mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 1))) := unp1(cmd_data);
-                        mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 2))) := unp2(cmd_data);
-                        mmem(concatbv3(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), 3))) := unp3(cmd_data);
+                        mmem(H, O) := (wsel4(cmd_data, boff2(O))
+                                       if (H = high(cmd_addr)
+                                           & beat_of(O) = beat_of(low(cmd_addr)))
+                                       else mmem(H, O));
+                        # (the matching `cache_owns` CLEAR lives in
+                        # `cachemem`'s monitor, ahead of the drain arm, so
+                        # a same-edge drain-set wins)
                     };
                 }
 
+                # ==========================================================
+                # The controller's half of the old `mem_img`: wherever the
+                # cache does not own the word, the DRAM is the reference
+                # image.  Proven HERE, against the controller's own small
+                # transition.  What it needs of the cache arrives as the
+                # assumption below, over this side of the nets: `a_wb_img`
+                # (what is sent out is accurate to `img`) is discharged by
+                # `cache_body.wb_img`, the same formula over the same nets.
+                # ==========================================================
+                before posedge {
+                    assume [a_wb_img] cmd_en & cmd_wen ->
+                        wsel4(cmd_data, J) =
+                            img(high(cmd_addr),
+                                concatbv2(beat_of(low(cmd_addr)), J));
+                }
+
+                invariant [mc_owns_img] ~cache_owns(H, O) ->
+                    mmem(H, O) = img(H, O)
+
                 before posedge {
                     assume [dram_read] mem_rd_en ->
-                          unp0(mem_rdata) = mmem(concatbv3(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 0)))
-                        & unp1(mem_rdata) = mmem(concatbv3(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 1)))
-                        & unp2(mem_rdata) = mmem(concatbv3(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 2)))
-                        & unp3(mem_rdata) = mmem(concatbv3(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 3)));
+                          unp0(mem_rdata) = mmem(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 0))
+                        & unp1(mem_rdata) = mmem(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 1))
+                        & unp2(mem_rdata) = mmem(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 2))
+                        & unp3(mem_rdata) = mmem(high(mem_rd_addr), concatbv2(beat_of(low(mem_rd_addr)), 3));
                 }
 
                 # ---- when the controller raises a response it carries the
@@ -2644,10 +2919,10 @@ object mem_subsys = {
                 # the top of every edge and refilled after that edge's write
                 # has landed. ----
                 invariant [mc_resp] rsp_valid ->
-                      unp0(rsp_data) = mmem(concatbv3(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 0)))
-                    & unp1(rsp_data) = mmem(concatbv3(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 1)))
-                    & unp2(rsp_data) = mmem(concatbv3(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 2)))
-                    & unp3(rsp_data) = mmem(concatbv3(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 3)))
+                      unp0(rsp_data) = mmem(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 0))
+                    & unp1(rsp_data) = mmem(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 1))
+                    & unp2(rsp_data) = mmem(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 2))
+                    & unp3(rsp_data) = mmem(high(rsp_addr), concatbv2(beat_of(low(rsp_addr)), 3))
 
                 # ---- the port never accepts a command on the edge one is
                 # already travelling: `cmd_ready` implies the wire is idle.
@@ -2747,12 +3022,16 @@ object mem_subsys = {
         definition cache_body.lsq_to_cache_req_wdata = lsq_to_cache_req_wdata
         definition cache_body.lsq_to_cache_req_idx   = lsq_to_cache_req_idx
 
-        definition cache_to_lsq_creq_ready = cache_body.cache_to_lsq_creq_ready
-        definition cache_to_lsq_resp_valid = cache_body.cache_to_lsq_resp_valid
-        definition cache_to_lsq_resp_h     = cache_body.cache_to_lsq_resp_h
-        definition cache_to_lsq_resp_o     = cache_body.cache_to_lsq_resp_o
-        definition cache_to_lsq_resp_data  = cache_body.cache_to_lsq_resp_data
-        definition cache_to_lsq_resp_idx   = cache_body.cache_to_lsq_resp_idx
+        # ---- the cache-to-LSQ direction of the channel is aliased inside
+        # `cache_body`'s IMPLEMENTATION, not here.  A bare-level alias
+        # survives into `lsq_body`'s isolate, where its right-hand side is
+        # an erased-implementation wire -- and a wire whose defining chain
+        # reaches an erased implementation never fires a monitor guard
+        # (probe_seam.ivy).  Placed in the implementation, the aliases are
+        # hidden from the LSQ -- these wires are genuinely free there,
+        # constrained only by `a_rdy_drain`/`a_resp_img` -- and visible in
+        # `cache_body`'s own isolate, which is the only place the tie is
+        # needed. ----
 
         # ---- the cache's command port drives the memory controller's ----
         definition mc_body.cmd_en    = cache_body.cmd_en
