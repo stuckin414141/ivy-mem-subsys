@@ -509,31 +509,34 @@ object mem_subsys = {
             # ---- the "what arrived in between?" ghosts.  All three are
             # written only at a bare wire index (`st_tail`/`ld_tail`) or
             # are 0-ary: an array write at a COMPUTED index (the obvious
-            # `nxs(ld_tail - 1)`) is the wire-indexed-write shape that
-            # neutralises the transition (see the note on `img` at the
-            # cache's monitor), and it costs every query in the isolate.
+            # `store_after_load(ld_tail - 1)`) is the wire-indexed-write
+            # shape that neutralises the transition (see the note on `img`
+            # at the cache's monitor), and it costs every query in the
+            # isolate.
             #
             # `st_after_nl`: a store has arrived since the last load
             # arrival.  Reset when a load arrives, set when a store does.
             #
-            # `pxs(K)`: a store arrived between load K and the load before
-            # it -- `st_after_nl` sampled the edge K arrived and frozen.
-            # `~pxs(K+1)` is the drift-free residue of the old
-            # `load_mark(K+1) = load_mark(K)` (loads adjacent in program
-            # order); `~st_after_nl` plays `load_mark(K) = store_tail` (no
-            # store after the newest load).  Both count DEPARTED stores
-            # too, which a mark comparison in a circular queue cannot.
+            # `store_since_prev_load(K)`: a store arrived between load K
+            # and the load before it -- `st_after_nl` sampled the edge K
+            # arrived and frozen.  `~store_since_prev_load(K+1)` is the
+            # drift-free residue of the old `load_mark(K+1) = load_mark(K)`
+            # (loads adjacent in program order); `~st_after_nl` plays
+            # `load_mark(K) = store_tail` (no store after the newest
+            # load).  Both count DEPARTED stores too, which a mark
+            # comparison in a circular queue cannot.
             #
-            # `dxs(K)`: some store YOUNGER than load K has already
-            # departed past it.  This is the slot-free residue of the old
-            # `dep_le`: a departing store's tag is absorbed into `ctag` on
-            # its departure edge, so `dxs(K)` comes with `ltag(K) < ctag`
-            # (`dep_ctag` below), and `~dxs(K)` certifies that every store
-            # after K is still PENDING -- which is what lets the nogap
-            # guards over pending slots speak for the whole trace. ----
+            # `store_departed_past(K)`: some store YOUNGER than load K has
+            # already departed past it.  This is the slot-free residue of
+            # the old `dep_le`: a departing store's tag is absorbed into
+            # `ctag` on its departure edge, so `store_departed_past(K)`
+            # comes with `ltag(K) < ctag` (`dep_ctag` below), and
+            # `~store_departed_past(K)` certifies that every store after K
+            # is still PENDING -- which is what lets the nogap guards over
+            # pending slots speak for the whole trace. ----
             #
-            # `mko(J)`: store J's mark, measured as an OFFSET from the
-            # CURRENT `load_head` -- the ghost twin of `store_mark(J) -
+            # `mark_offset(J)`: store J's mark, measured as an OFFSET from
+            # the CURRENT `load_head` -- the ghost twin of `store_mark(J) -
             # load_head`.  The subtraction itself is what the invariants
             # must not say: an arithmetic term over a FUNCTION value mints
             # a fresh term for every quantifier instantiation, and any
@@ -542,12 +545,12 @@ object mem_subsys = {
             # `cross_l` restated that way diverges).  So the ghost keeps
             # the offset as a plain function value -- written at enqueue,
             # shifted down one when the load head retires past an entry --
-            # and `mko_def` below is the one arithmetic-only bridge to the
-            # datapath's registers. ----
+            # and `mark_offset_def` below is the one arithmetic-only
+            # bridge to the datapath's registers. ----
             var st_after_nl : bool
-            function pxs(K : load_idx) : bool
-            function dxs(K : load_idx) : bool
-            function mko(J : store_idx) : load_idx
+            function store_since_prev_load(K : load_idx) : bool
+            function store_departed_past(K : load_idx) : bool
+            function mark_offset(J : store_idx) : load_idx
             # ---- `cw`: the slot of `cov`'s load-side witness.  `cov`'s
             # old conclusion was an EXISTENTIAL over the slots, and z3
             # diverges synthesising the witness under the updated arrays
@@ -590,12 +593,12 @@ object mem_subsys = {
                     cachemem.ctag := stag(st_head);
                     cw := store_mark(st_head);
                     # ---- the departing store passes every pending load
-                    # younger than itself; mark them.  `mko` is the tag
-                    # order (`cross_l`): K is younger exactly when its
-                    # offset sits below the store's mark offset. ----
-                    dxs(X) := dxs(X)
+                    # younger than itself; mark them.  `mark_offset` is
+                    # the tag order (`cross_l`): K is younger exactly when
+                    # its offset sits below the store's mark offset. ----
+                    store_departed_past(X) := store_departed_past(X)
                         | ((X - ld_head) < (ld_tail - ld_head)
-                           & (X - ld_head) < mko(st_head));
+                           & (X - ld_head) < mark_offset(st_head));
                 };
 
                 # ---------- the cpu hands over an operation ----------
@@ -612,11 +615,11 @@ object mem_subsys = {
                     if cpu_to_lsq_req_wen {
                         stag(st_tail) := trace.now;
                         st_after_nl := true;
-                        mko(st_tail) := ld_tail - ld_head;
+                        mark_offset(st_tail) := ld_tail - ld_head;
                     } else {
                         ltag(ld_tail) := trace.now;
-                        pxs(ld_tail) := st_after_nl;
-                        dxs(ld_tail) := false;
+                        store_since_prev_load(ld_tail) := st_after_nl;
+                        store_departed_past(ld_tail) := false;
                         st_after_nl := false;
                         if tag.succ(cachemem.ctag, trace.now) {
                             cw := ld_tail;
@@ -626,10 +629,10 @@ object mem_subsys = {
 
                 # ---- the retire arm shifted `load_head` up one, so every
                 # mark sits one closer to it.  Runs AFTER the accept block:
-                # a store enqueued this same edge wrote `mko` off the
+                # a store enqueued this same edge wrote `mark_offset` off the
                 # PRE-edge wires, and its mark needs the same shift. ----
                 if ld_ans {
-                    mko(X) := mko(X) - 1;
+                    mark_offset(X) := mark_offset(X) - 1;
                 };
             }
         }
@@ -772,13 +775,13 @@ object mem_subsys = {
             definition store_elig(J) =
                 forall K : load_idx.
                     ((K - load_head) < (load_tail - load_head)
-                     & (K - load_head) < mko(J))
+                     & (K - load_head) < mark_offset(J))
                     -> (load_rdy(K)
                         | (load_sent(K) & load_addr(K) ~= store_addr(J)))
             relation load_elig(K : load_idx)
             definition load_elig(K) =
                 store_head = store_tail
-                | (K - load_head) < mko(store_head)
+                | (K - load_head) < mark_offset(store_head)
 
             # ============ output wires ============
 
@@ -1096,48 +1099,38 @@ object mem_subsys = {
             # and every former use is restated over `store_mark`.
             # ==============================================================
 
-            invariant [mko_def] store_pending(J) ->
-                mko(J) = store_mark(J) - load_head
+            invariant [mark_offset_def] store_pending(J) ->
+                mark_offset(J) = store_mark(J) - load_head
             invariant [m_s] store_pending(J) ->
-                mko(J) <= (load_tail - load_head)
+                mark_offset(J) <= (load_tail - load_head)
             invariant [m_mono] store_pending(J1) & store_pending(J2)
                 & (J1 - store_head) <= (J2 - store_head) ->
-                mko(J1) <= mko(J2)
+                mark_offset(J1) <= mark_offset(J2)
             invariant [cross_s] store_pending(J) & load_pending(K) ->
-                (stag(J) < ltag(K) <-> (K - load_head) >= mko(J))
+                (stag(J) < ltag(K) <-> (K - load_head) >= mark_offset(J))
             invariant [cross_l] store_pending(J) & load_pending(K) ->
-                (ltag(K) < stag(J) <-> (K - load_head) < mko(J))
+                (ltag(K) < stag(J) <-> (K - load_head) < mark_offset(J))
 
-            # ---- (`dep_le` is gone with the recycle: slots behind the
-            # head are REUSED in a circular queue, so nothing can be said
-            # about them.  What the departed stores still owe the proof --
-            # "did anything arrive between these two queue entries?" --
-            # is answered by the ghost bits `pxs`/`dxs`/`st_after_nl`
-            # instead: they are
-            # written at the ARRIVAL of the in-between store, so unlike a
-            # slot they cannot be recycled from under the claim, and unlike
-            # a `ctag` comparison they keep the nogap guards inside the
-            # eight-value index sort.) ----
-
-            # ---- `dxs` comes with the absorbed tag, and the arrival bits
-            # come with witnesses: a bare ghost bit says nothing on its
-            # own, so each one is tied to the queue entry (or the `ctag`
-            # fact) that justifies it.  `snl_wit`: if a store arrived
-            # after the newest load, then the newest STORE is such a store
-            # -- still pending with its mark at the load tail, or already
-            # departed past the newest load.  `pxs_wit`: a store between
-            # loads K-1 and K is pending with its mark at K, or departed
-            # past K-1. ----
-            invariant [dep_ctag] load_pending(K) & dxs(K) ->
+            # ---- `store_departed_past` comes with the absorbed tag, and
+            # the arrival bits come with witnesses: a bare ghost bit says
+            # nothing on its own, so each one is tied to the queue entry
+            # (or the `ctag` fact) that justifies it.  `snl_wit`: if a
+            # store arrived after the newest load, then the newest STORE
+            # is such a store -- still pending with its mark at the load
+            # tail, or already departed past the newest load.
+            # `since_prev_wit`: a store between loads K-1 and K is pending
+            # with its mark at K, or departed past K-1. ----
+            invariant [dep_ctag] load_pending(K) & store_departed_past(K) ->
                 ltag(K) < cachemem.ctag
             invariant [snl_wit] st_after_nl & load_head ~= load_tail ->
-                  dxs(load_tail - 1)
+                  store_departed_past(load_tail - 1)
                 | (store_pending(store_tail - 1)
-                   & mko(store_tail - 1) = (load_tail - load_head))
-            invariant [pxs_wit] load_pending(K) & 0 < (K - load_head) & pxs(K) ->
-                  dxs(K - 1)
+                   & mark_offset(store_tail - 1) = (load_tail - load_head))
+            invariant [since_prev_wit] load_pending(K)
+                & 0 < (K - load_head) & store_since_prev_load(K) ->
+                  store_departed_past(K - 1)
                 | (exists J : store_idx. store_pending(J)
-                   & mko(J) = (K - load_head))
+                   & mark_offset(J) = (K - load_head))
 
             # ---- the load witness is named by the ghost (`cw`) rather
             # than bound by an existential: the head load may itself have
@@ -1173,22 +1166,22 @@ object mem_subsys = {
                 & store_mark(J + 1) = store_mark(J) ->
                 tag.succ(stag(J), stag(J + 1))
             invariant [nogap_sl] store_pending(J)
-                & mko(J) < (load_tail - load_head)
+                & mark_offset(J) < (load_tail - load_head)
                 & ((J - store_head) + 1 >= (store_tail - store_head)
-                   | mko(J) < mko(J + 1)) ->
+                   | mark_offset(J) < mark_offset(J + 1)) ->
                 tag.succ(stag(J), ltag(store_mark(J)))
             invariant [nogap_s0] store_pending(J) & stag(J) < trace.now ->
                   ((J - store_head) + 1 < (store_tail - store_head)
                    & store_mark(J + 1) = store_mark(J))
-                | mko(J) < (load_tail - load_head)
+                | mark_offset(J) < (load_tail - load_head)
 
             invariant [nogap_ll] load_pending(K)
                 & (K - load_head) + 1 < (load_tail - load_head)
-                & ~pxs(K + 1) ->
+                & ~store_since_prev_load(K + 1) ->
                 tag.succ(ltag(K), ltag(K + 1))
-            invariant [nogap_ls] load_pending(K) & ~dxs(K)
-                & store_pending(J) & mko(J) = (K - load_head) + 1
-                & (J = store_head | mko(J - 1) <= (K - load_head)) ->
+            invariant [nogap_ls] load_pending(K) & ~store_departed_past(K)
+                & store_pending(J) & mark_offset(J) = (K - load_head) + 1
+                & (J = store_head | mark_offset(J - 1) <= (K - load_head)) ->
                 tag.succ(ltag(K), stag(J))
 
             # ---- The datum in a ready entry is the datum the reference's read
@@ -1230,7 +1223,7 @@ object mem_subsys = {
 
             invariant [l_gap] load_pending(K) & ~load_rdy(K)
                 & store_pending(J)
-                & mko(J) <= (K - load_head) ->
+                & mark_offset(J) <= (K - load_head) ->
                 store_addr(J) ~= load_addr(K)
 
             invariant [l_rdata] load_pending(K) & ~load_rdy(K) ->
