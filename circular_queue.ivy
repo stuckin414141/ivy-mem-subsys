@@ -10,24 +10,11 @@ type bit
 type bv2
 type mshr_id
 
-# ---- LSQ indices are small bit vectors: the queues are circular rings
-# over the full eight-slot index space, holding at most four entries
-# each.  `store_head`/`store_tail` (and the load pair) free-run modulo
-# 8, so a slot is reused as soon as the window moves past it; occupancy
-# is `tail - head`, and 4 means full. ----
 type store_idx
 type load_idx
 
 type four_words
 
-# ---- A beat is four words.  `pack4`/`unp0..3` build one and take it
-# apart at STATIC positions; `wsel4`/`wins4` do the same at a DYNAMIC
-# one, which is what a word access into a cached line needs.  All of
-# them are `wire`s: their bodies are combinational and get inlined at
-# every use, which is the only form `ivy_to_rtl` can translate -- an
-# ordinary `function` applied in an action is rejected outright,
-# because its value would track state updates made earlier in the same
-# action and so has no combinational meaning. ----
 function pack4(W3 : word, W2 : word, W1 : word, W0 : word) : four_words
 function unp0(M : four_words) : word
 function unp1(M : four_words) : word
@@ -40,11 +27,7 @@ type addr
 type woffset
 type way
 
-# ---- a cache way of a cache set, packed into one index.  RTLIL
-# memories are one-dimensional, so the array cannot be indexed by the
-# pair; `cidx` is the packing and `p_cidx_inj` is all the proof ever
-# needs of it. ----
-type cslot
+type cache_slot
 
 # ---- the memory controller's service counter.  `nat` has no bit
 # width, so it cannot appear in a hardware description. ----
@@ -56,13 +39,8 @@ type latency
 type mstate
 type dphase
 
-# ---- the hardware twins.  `ivy_to_rtl` inlines a `wire` function at its
-# uses and rejects an ordinary one, so the datapath has to apply a wire --
-# but a wire is snapshotted at the clock edge, and a snapshot of `high`,
-# `beat_of` or `hash` puts a second copy of the address theory into every
-# query that mentions the memory index, which the cache's `mem_img` does
-# not survive.  The proof keeps the plain functions; the datapath applies
-# these; `p_hw_*` is the one equation that ties the two together. ----
+# Copies of the above functions that can be synthesized to RTL. Kept separate
+# so that use does not pull in the adddress theory
 wire hw_pack4(W3 : word, W2 : word, W1 : word, W0 : word) : four_words
 wire hw_unp0(M : four_words) : word
 wire hw_unp1(M : four_words) : word
@@ -77,7 +55,7 @@ wire hw_concatbv2(B : bit, J : bv2) : woffset
 wire hw_beat_of(O : woffset) : bit
 wire hw_boff2(O : woffset) : bv2
 wire hw_hash(H : line) : key
-wire hw_cidx(K : key, W : way) : cslot
+wire hw_cidx(K : key, W : way) : cache_slot
 
 # ---- the narrow index types.  These are interpreted where every
 # isolate can see them: they are three and four bit wide, so a
@@ -91,7 +69,7 @@ isolate basis = {
     interpret mshr_id -> bv[1]
     interpret store_idx -> bv[3]
     interpret load_idx -> bv[3]
-    interpret cslot -> bv[4]
+    interpret cache_slot -> bv[4]
     interpret latency -> bv[4]
     interpret mstate -> bv[3]
     interpret dphase -> bv[2]
@@ -173,7 +151,7 @@ function concatbv2(B : bit, J : bv2) : woffset
 function beat_of(O : woffset) : bit
 function boff2(O : woffset) : bv2
 function hash(H : line) : key
-function cidx(K : key, W : way) : cslot
+function cidx(K : key, W : way) : cache_slot
 
 # ------------------------------------------------------------------
 # The operation trace.
@@ -265,7 +243,7 @@ isolate addr_thy = {
     implementation {
         interpret addr -> bv[64]
         interpret line -> bv[61]
-        # (`cslot` is interpreted in `basis`, beside `key` and `way`)
+        # (`cache_slot` is interpreted in `basis`, beside `key` and `way`)
         definition high(A) = bfe[3][63](A)
         definition low(A) = bfe[0][2](A)
         definition concatbv3(H, O) = H :: O
@@ -1083,22 +1061,8 @@ object mem_subsys = {
                   ~op_wen(ltag(K))
                 & op_addr(ltag(K)) = load_addr(K)
 
-            # ==============================================================
-            # The marks interleave the two queues: `store_mark(J)` is the
-            # load-queue tail at store J's arrival, so a load is older than
-            # store J exactly when its offset from `load_head` is below the
-            # mark's.  Only the STORE-side marks survive the move to a
-            # circular queue: a pending store's mark can never leave the
-            # load window (loads younger than a pending store cannot
-            # retire, so `load_head` never passes it, and they pin the
-            # window so `load_tail` never laps it) -- `m_s` states exactly
-            # that, and `m_mono` the arrival-order monotonicity that used
-            # to be free in the linear index order.  A pending LOAD's mark
-            # has no such anchor -- stores DO depart past pending loads,
-            # arbitrarily many of them -- which is why `load_mark` is gone
-            # and every former use is restated over `store_mark`.
-            # ==============================================================
-
+            # Basic invariants for `mark_offset`. `mark_offset` is the same
+            # as `store_mark` except stated relative to `load_head`
             invariant [mark_offset_def] store_pending(J) ->
                 mark_offset(J) = store_mark(J) - load_head
             invariant [m_s] store_pending(J) ->
@@ -1161,6 +1125,8 @@ object mem_subsys = {
                 & ~st_after_nl ->
                 ltag(K) = trace.now
 
+            # Entries across the load and store queues form a consecutive
+            # chain in the trace
             invariant [nogap_ss] store_pending(J)
                 & (J - store_head) + 1 < (store_tail - store_head)
                 & store_mark(J + 1) = store_mark(J) ->
@@ -1223,6 +1189,7 @@ object mem_subsys = {
 
             invariant [l_gap] load_pending(K) & ~load_rdy(K)
                 & store_pending(J)
+                # Exclude the case where the load came before the store
                 & mark_offset(J) <= (K - load_head) ->
                 store_addr(J) ~= load_addr(K)
 
@@ -1735,12 +1702,12 @@ object mem_subsys = {
                 # whichever came last.  With two ways the two bits were
                 # always complements, and only the way-1 bit was ever read.
                 # ==========================================================
-                var tag_occ(S : cslot) : bool
-                var tag_dty(S : cslot) : bool
-                var tag_ln(S : cslot)  : line
+                var tag_occ(S : cache_slot) : bool
+                var tag_dty(S : cache_slot) : bool
+                var tag_ln(S : cache_slot)  : line
                 var set_lru(K : key)   : bit
-                var dat0(S : cslot)    : four_words
-                var dat1(S : cslot)    : four_words
+                var dat0(S : cache_slot)    : four_words
+                var dat1(S : cache_slot)    : four_words
 
                 # ---- the (set, way) view the invariants are written in.
                 # Plain defined functions, so `ivy_to_rtl` never sees them:
