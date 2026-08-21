@@ -529,16 +529,8 @@ object mem_subsys = {
             function store_since_prev_load(K : load_idx) : bool
             function store_departed_past(K : load_idx) : bool
             function mark_offset(J : store_idx) : load_idx
-            # ---- `cw`: the slot of `cov`'s load-side witness.  `cov`'s
-            # old conclusion was an EXISTENTIAL over the slots, and z3
-            # diverges synthesising the witness under the updated arrays
-            # every edge; the ghost knows exactly who the witness is, so
-            # it names it and the conclusion is ground.  Set wherever the
-            # frontier moves: past a retiring load, the next operation can
-            # only be the load behind it; past a departing store, the
-            # first load after that store sits at the slot its mark names;
-            # and when a load arrives right at the frontier, it is its own
-            # witness. ----
+
+            # Oldest load after `ctag`
             var cw : load_idx
             var cpu_tag_r : tag                 # tag the response port answers
 
@@ -615,46 +607,7 @@ object mem_subsys = {
             }
         }
 
-        # ==============================================================
-        # The bridge to the trace, anchored at the frontier
-        # `cachemem.ctag`.
-        #
-        # `img_ctag` is the old `cimg_ctag`/`img_cimg` pair with
-        # `current_img` -- their shared middle term -- substituted out:
-        # the reference image at the frontier is `img` everywhere except
-        # the one staged, undrained store's word, where the frontier
-        # image already carries the staged datum and `img` still holds
-        # the old one.  It is one-step inductive the same way the pair
-        # was: a store accept advances `ctag` and latches the stage
-        # record on the same edge (`tr_step` at the absorbed store walks
-        # the image across it), a drain moves the staged word into `img` and
-        # clears the record, and a load retire moves `ctag` across a
-        # memory-preserving operation (`tr_rd`/`tr_step`).  `no_ld_st`
-        # supplies the `else` branch at a sent load's word, exactly as
-        # before.
-        #
-        # Stated over a (line, offset) PAIR rather than an address, for
-        # the same reason the pair it replaces was: quantified over
-        # `A : addr` the inductive step would match `concatbv3(H, O)`
-        # against the staged record through `p_full_inj`, whose two-term
-        # trigger then fires on every pair of addresses in a query
-        # already carrying the trace's `tr_step`.  z3 does not come back
-        # from that.
-        #
-        # The block stays `private`.  It is a direct bridge from `img`
-        # to `trace.st`; exported, it would let any query that names the
-        # image chain into the trace's `tr_step` and the address
-        # theory's `p_full_inj` -- and, now that `ctag` sits in
-        # `cachemem`, it would arrive in `cache_body`'s own queries
-        # through `with this`.
-        # ==============================================================
-        # ---- (split in two for the circular queue: the pointers roam the
-        # whole eight-value index space, so every quantified goal here
-        # carries far more case structure than the linear queue's did.
-        # The staged word's claim is GROUND -- no (H, O) quantifier at
-        # all -- and the else branch keeps a guard that kills the stage
-        # case outright.  Together they say exactly what the single
-        # ite-form invariant said.) ----
+        # The logical view of memory presented by the cache + memory controller corresponds to the trace.
         private {
             invariant [img_ctag_s] cachemem.stage_store ->
                 trace.st(cachemem.ctag).mem(
@@ -1075,15 +1028,7 @@ object mem_subsys = {
             invariant [cross_l] store_pending(J) & load_pending(K) ->
                 (ltag(K) < stag(J) <-> (K - load_head) < mark_offset(J))
 
-            # ---- `store_departed_past` comes with the absorbed tag, and
-            # the arrival bits come with witnesses: a bare ghost bit says
-            # nothing on its own, so each one is tied to the queue entry
-            # (or the `ctag` fact) that justifies it.  `snl_wit`: if a
-            # store arrived after the newest load, then the newest STORE
-            # is such a store -- still pending with its mark at the load
-            # tail, or already departed past the newest load.
-            # `since_prev_wit`: a store between loads K-1 and K is pending
-            # with its mark at K, or departed past K-1. ----
+            # `store_departed_past` means what it says it means
             invariant [dep_ctag] load_pending(K) & store_departed_past(K) ->
                 ltag(K) < cachemem.ctag
             invariant [snl_wit] st_after_nl & load_head ~= load_tail ->
@@ -1096,25 +1041,10 @@ object mem_subsys = {
                 | (exists J : store_idx. store_pending(J)
                    & mark_offset(J) = (K - load_head))
 
-            # ---- the load witness is named by the ghost (`cw`) rather
-            # than bound by an existential: the head load may itself have
-            # been passed by a departing store (it then sits at or below
-            # `ctag`), and the operation right after the frontier can be
-            # any later pending load -- but the ghost always knows which,
-            # so the conclusion stays ground. ----
+            # There is nothing between `ctag` and what's in the LSQ
             invariant [cov] cachemem.ctag < trace.now ->
                   (store_pending(store_head) & tag.succ(cachemem.ctag, stag(store_head)))
                 | (load_pending(cw) & tag.succ(cachemem.ctag, ltag(cw)))
-
-            # ---- the retire arm's witness, stated as a GROUND fact so the
-            # queries that watch `ctag` move (`img_ctag*`, `c_now`, `cov`
-            # itself) take it in one step instead of re-deriving it through
-            # `cov`+`l_mono`+`cross_l`: when the head load is answered and
-            # its turn has come (the `ld_ans` test, spelled out) and the
-            # frontier still sits below it, the head load is the very next
-            # operation.  Everything older is absorbed: older loads retired
-            # (head is the oldest pending), and the eligibility conjunct
-            # says every older store departed. ----
             invariant [hd_succ] load_head ~= load_tail & load_rdy(load_head)
                 & (store_head = store_tail | store_mark(store_head) ~= load_head)
                 & cachemem.ctag < ltag(load_head) ->
@@ -1140,7 +1070,6 @@ object mem_subsys = {
                   ((J - store_head) + 1 < (store_tail - store_head)
                    & store_mark(J + 1) = store_mark(J))
                 | mark_offset(J) < (load_tail - load_head)
-
             invariant [nogap_ll] load_pending(K)
                 & (K - load_head) + 1 < (load_tail - load_head)
                 & ~store_since_prev_load(K + 1) ->
@@ -1150,56 +1079,22 @@ object mem_subsys = {
                 & (J = store_head | mark_offset(J - 1) <= (K - load_head)) ->
                 tag.succ(ltag(K), stag(J))
 
-            # ---- The datum in a ready entry is the datum the reference's read
-            # returned.  This is `lsq.md`'s `Stmt`, and it is one-step
-            # inductive in both of the ways an entry becomes ready:
-            #
-            #   * forwarded at accept -- the store chain is walked through
-            #     `tr_step` at the queue's own tags, down to the newest
-            #     pending store at the address, and `st(T)` never changes
-            #     once T is recorded, so nothing has to be re-established
-            #     afterwards;
-            #   * captured off the cache -- `l_rdata` below is what the
-            #     response has to match, and it is maintained while the entry
-            #     is NOT ready, which is exactly when a response can arrive.
-            #
-            # `l_gap` is the anti-aliasing side condition, and it is the one
-            # place the "no store to this address" fact appears.  Note the
-            # direction: it quantifies over QUEUE INDICES, with the address
-            # only ever under `store_addr(J)`/`load_addr(K)`.  There is no
-            # function from an address back to an index, so no Skolem cycle
-            # and no matching loop -- both queues are `bv[3]`-indexed and the
-            # quantifier costs an expansion over eight slots.  `store_mark(J)
-            # - load_head <= K - load_head` is "older than K" in pure offset
-            # arithmetic, by `cross_l`; it needs no tag comparison.
-            #
-            # `l_gap` exists only to carry `l_rdata` across a single store
-            # absorption: `tr_step` at `stag(store_head)` gives
-            # `st(stag(store_head)).mem(a) = st(ctag).mem(a)` whenever
-            # `store_addr(store_head) ~= a`, and `l_gap` at `J = store_head`
-            # supplies exactly that side condition.
-            #
-            # `l_rdata` is stated in the `.rdata` form rather than as
-            # `.mem(addr)` because `.rdata` is a syntactic match for `resp`
-            # below, so the top-level goal closes without re-deriving the
-            # predecessor tag.  The `.mem(addr)` form is not carried beside
-            # it: `l_rdata` alone is what the capture needs. ----
+            # If a load has data, then the data is accurate.
             invariant [l_val] load_pending(K) & load_rdy(K) ->
                 load_data(K) = trace.st(ltag(K)).rdata
 
+            # Younger stores do not alias pending loads. This is necessary for 
+            # load-to-store forwarding
             invariant [l_gap] load_pending(K) & ~load_rdy(K)
                 & store_pending(J)
-                # Exclude the case where the load came before the store
                 & mark_offset(J) <= (K - load_head) ->
                 store_addr(J) ~= load_addr(K)
 
+            # If the load is in the queue and doesn't have data, then we could
+            # not forward a prior store. Thus, the load's data must be in 
+            # cache or memory
             invariant [l_rdata] load_pending(K) & ~load_rdy(K) ->
                 trace.st(ltag(K)).rdata = trace.st(cachemem.ctag).mem(load_addr(K))
-
-            # ---- (`no_young` is gone: an eligible store may now be younger
-            # than pending loads it departs past.  The anti-aliasing it
-            # provided is carried by `store_elig`'s own disequality term,
-            # `l_gap`, and `no_ld_st` below.) ----
 
             # ==============================================================
             # The request on the cache port, and the outstanding loads.
@@ -1318,25 +1213,7 @@ object mem_subsys = {
                 cpu_tag_r < ltag(K)
         }
 
-        # ==============================================================
-        # THE THEOREM, at the module boundary.
-        #
-        # Whenever the LSQ hands a datum back to the cpu, the address and
-        # the datum are those of the corresponding operation in the trace.
-        # This is what the file proves, so it is stated in `specification`
-        # and over the OUTPUT WIRES rather than over the registers behind
-        # them: an exported guarantee of the LSQ that any enclosing isolate
-        # can import, the same way this isolate imports the cache's
-        # `resp_img`/`rdy_drain`.  Stated over `cpu_valid_r`/`cpu_addr_r`/
-        # `cpu_data_r` it could not leave `implementation`, because those
-        # registers are hidden and an exported invariant may not mention
-        # them.  Inside this isolate the two forms are the same statement --
-        # the wire definitions (912-914) are visible here.
-        #
-        # `consistency` stays private above: it quantifies over
-        # `load_pending`, a defined relation over the queue pointers, which
-        # are implementation state and cannot appear in an exported formula.
-        # ==============================================================
+        # The ultimate theorem tying memory subsystem to the trace.
         specification {
             invariant [resp] lsq_to_cpu_valid ->
                   ~op_wen(cpu_tag_r)
@@ -1428,26 +1305,6 @@ object mem_subsys = {
 
             function img(H : line, O : woffset) : word
 
-            # ---- `current_img(H, O)`: the reference image at the
-            # frontier `ctag`, updated at the ACCEPT rather than at the
-            # drain, so -- unlike `img` -- it never lags a staged store.
-            #
-            # `img` is the array-consistent image the cache's data
-            # invariants rest on: it gains a store only when the datum
-            # reaches the array, which is the drain (`stage_go`).
-            # `current_img` gains the store the edge the port accepts it --
-            # the same edge `ctag` absorbs it -- so it is the reference
-            # image at the frontier with no exception.  The two agree
-            # everywhere except at a staged, undrained store's own word,
-            # where `current_img` already carries the new datum and `img`
-            # still holds the old one.
-            #
-            # Local to `cachemem`: the cache never reads it (it reasons
-            # about `img` alone), and the LSQ's bridge to the trace --
-            # `img_ctag` -- no longer names it; it is kept as the
-            # reference image the accept arm below maintains. ----
-            function current_img(H : line, O : woffset) : word
-
             # ---- the frontier: the tag of the youngest operation to
             # have left the LSQ.  Declared HERE, beside the images it
             # indexes, but ADVANCED by `lsq_body`'s ghost monitor, off
@@ -1462,7 +1319,6 @@ object mem_subsys = {
 
             after init {
                 img(H, O)         := init_img(H, O);
-                current_img(H, O) := init_img(H, O);
                 cache_owns(H, O)  := false;
                 ctag := 0;
             }
@@ -1560,15 +1416,6 @@ object mem_subsys = {
                 if lsq_to_cache_req_en
                         & cache_to_lsq_creq_ready
                         & lsq_to_cache_req_wen {
-                    # ---- `current_img` gains the accepted store HERE, at
-                    # the accept -- the edge `ctag` absorbs the store --
-                    # written in the same conditional whole-array form as
-                    # `img`'s drain arm above (a non-literal index
-                    # neutralises the transition on this Ivy build). ----
-                    current_img(H, O) := (lsq_to_cache_req_wdata
-                                          if (H = lsq_to_cache_req_h
-                                              & O = lsq_to_cache_req_o)
-                                          else current_img(H, O));
                     stage_store := true;
                     stage_h_g := lsq_to_cache_req_h;
                     stage_o_g := lsq_to_cache_req_o;
