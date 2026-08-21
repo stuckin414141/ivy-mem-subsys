@@ -1,0 +1,341 @@
+# Smoke trace for mem_subsys (circular_queue.ivy).  See testbench.sv for the
+# grammar.  All numbers are hex; addresses are word addresses 00..ff.
+#
+# Geometry (from circular_queue.ivy): woffset = addr[2:0] (8 words/line),
+# set = hash(line) = line[2:0] = addr[5:3] (8 sets), way = bv[1] (2 ways) =>
+# 16 resident lines over a 32-line pool, so tags 0..3 (addr[7:6]) collide
+# 4-deep in every set and eviction is reachable.
+
+# ---- A. cold miss, then hits inside the same line ----
+r 00
+r 01
+r 07
+
+# ---- B. store then load the same word (LSQ ordering / forwarding) ----
+w 02 aaaa_1111_bbbb_2222
+r 02
+
+# ---- C. back-to-back misses to distinct sets (both MSHRs busy) ----
+r 08
+r 10
+r 18
+r 20
+
+# ---- D. dirty line evicted by tag conflict in set 0, then re-read ----
+w 00 dead_0000_dead_0000
+r 40
+r 80
+r c0
+r 00                 // must come back from DRAM as dead_0000_dead_0000
+
+# ---- E. bubbles around a read-modify-read ----
+n 3
+r 41
+n
+w 41 1234_5678_9abc_def0
+r 41
+
+# ---- F. LSQ pressure: 8 back-to-back stores, then 8 loads, no bubbles ----
+w 30 305_0f0f_305
+w 31 315_0f0f_315
+w 32 325_0f0f_325
+w 33 335_0f0f_335
+w 34 345_0f0f_345
+w 35 355_0f0f_355
+w 36 365_0f0f_365
+w 37 375_0f0f_375
+r 30
+r 31
+r 32
+r 33
+r 34
+r 35
+r 36
+r 37
+
+# ---- G. two dirty words in one line, evicted as a full 2-beat writeback ----
+w 88 5a5a_5a5a_5a5a_5a5a
+w 8f a5a5_a5a5_a5a5_a5a5
+r c8                 // set 1, tag 3
+r 08                 // set 1, tag 0
+r 48                 // set 1, tag 1 -- 88's line is now the LRU victim
+r 88
+r 8f
+
+# ---- H. stress: every set x every tag, store+load, rounds of rotating
+#         word offsets; keeps both ways thrashing and dirties evictions ----
+w 00 000_cafe_000
+r 00
+w 41 410_cafe_410
+r 41
+w 82 820_cafe_820
+r 82
+w c3 c30_cafe_c30
+r c3
+w 08 080_cafe_080
+r 08
+w 49 490_cafe_490
+r 49
+w 8a 8a0_cafe_8a0
+r 8a
+w cb cb0_cafe_cb0
+r cb
+n 2
+w 10 100_cafe_100
+r 10
+w 51 510_cafe_510
+r 51
+w 92 920_cafe_920
+r 92
+w d3 d30_cafe_d30
+r d3
+w 18 180_cafe_180
+r 18
+w 59 590_cafe_590
+r 59
+w 9a 9a0_cafe_9a0
+r 9a
+w db db0_cafe_db0
+r db
+n 2
+w 20 200_cafe_200
+r 20
+w 61 610_cafe_610
+r 61
+w a2 a20_cafe_a20
+r a2
+w e3 e30_cafe_e30
+r e3
+w 28 280_cafe_280
+r 28
+w 69 690_cafe_690
+r 69
+w aa aa0_cafe_aa0
+r aa
+w eb eb0_cafe_eb0
+r eb
+n 2
+w 30 300_cafe_300
+r 30
+w 71 710_cafe_710
+r 71
+w b2 b20_cafe_b20
+r b2
+w f3 f30_cafe_f30
+r f3
+w 38 380_cafe_380
+r 38
+w 79 790_cafe_790
+r 79
+w ba ba0_cafe_ba0
+r ba
+w fb fb0_cafe_fb0
+r fb
+n 2
+w 03 031_cafe_031
+r 03
+w 44 441_cafe_441
+r 44
+w 85 851_cafe_851
+r 85
+w c6 c61_cafe_c61
+r c6
+w 0b 0b1_cafe_0b1
+r 0b
+w 4c 4c1_cafe_4c1
+r 4c
+w 8d 8d1_cafe_8d1
+r 8d
+w ce ce1_cafe_ce1
+r ce
+n 2
+w 13 131_cafe_131
+r 13
+w 54 541_cafe_541
+r 54
+w 95 951_cafe_951
+r 95
+w d6 d61_cafe_d61
+r d6
+w 1b 1b1_cafe_1b1
+r 1b
+w 5c 5c1_cafe_5c1
+r 5c
+w 9d 9d1_cafe_9d1
+r 9d
+w de de1_cafe_de1
+r de
+n 2
+w 23 231_cafe_231
+r 23
+w 64 641_cafe_641
+r 64
+w a5 a51_cafe_a51
+r a5
+w e6 e61_cafe_e61
+r e6
+w 2b 2b1_cafe_2b1
+r 2b
+w 6c 6c1_cafe_6c1
+r 6c
+w ad ad1_cafe_ad1
+r ad
+w ee ee1_cafe_ee1
+r ee
+n 2
+w 33 331_cafe_331
+r 33
+w 74 741_cafe_741
+r 74
+w b5 b51_cafe_b51
+r b5
+w f6 f61_cafe_f61
+r f6
+w 3b 3b1_cafe_3b1
+r 3b
+w 7c 7c1_cafe_7c1
+r 7c
+w bd bd1_cafe_bd1
+r bd
+w fe fe1_cafe_fe1
+r fe
+n 2
+w 06 062_cafe_062
+r 06
+w 47 472_cafe_472
+r 47
+w 80 802_cafe_802
+r 80
+w c1 c12_cafe_c12
+r c1
+w 0e 0e2_cafe_0e2
+r 0e
+w 4f 4f2_cafe_4f2
+r 4f
+w 88 882_cafe_882
+r 88
+w c9 c92_cafe_c92
+r c9
+n 2
+w 16 162_cafe_162
+r 16
+w 57 572_cafe_572
+r 57
+w 90 902_cafe_902
+r 90
+w d1 d12_cafe_d12
+r d1
+w 1e 1e2_cafe_1e2
+r 1e
+w 5f 5f2_cafe_5f2
+r 5f
+w 98 982_cafe_982
+r 98
+w d9 d92_cafe_d92
+r d9
+n 2
+w 26 262_cafe_262
+r 26
+w 67 672_cafe_672
+r 67
+w a0 a02_cafe_a02
+r a0
+w e1 e12_cafe_e12
+r e1
+w 2e 2e2_cafe_2e2
+r 2e
+w 6f 6f2_cafe_6f2
+r 6f
+w a8 a82_cafe_a82
+r a8
+w e9 e92_cafe_e92
+r e9
+n 2
+w 36 362_cafe_362
+r 36
+w 77 772_cafe_772
+r 77
+w b0 b02_cafe_b02
+r b0
+w f1 f12_cafe_f12
+r f1
+w 3e 3e2_cafe_3e2
+r 3e
+w 7f 7f2_cafe_7f2
+r 7f
+w b8 b82_cafe_b82
+r b8
+w f9 f92_cafe_f92
+r f9
+n 2
+w 01 013_cafe_013
+r 01
+w 42 423_cafe_423
+r 42
+w 83 833_cafe_833
+r 83
+w c4 c43_cafe_c43
+r c4
+w 09 093_cafe_093
+r 09
+w 4a 4a3_cafe_4a3
+r 4a
+w 8b 8b3_cafe_8b3
+r 8b
+w cc cc3_cafe_cc3
+r cc
+n 2
+w 11 113_cafe_113
+r 11
+w 52 523_cafe_523
+r 52
+w 93 933_cafe_933
+r 93
+w d4 d43_cafe_d43
+r d4
+w 19 193_cafe_193
+r 19
+w 5a 5a3_cafe_5a3
+r 5a
+w 9b 9b3_cafe_9b3
+r 9b
+w dc dc3_cafe_dc3
+r dc
+n 2
+w 21 213_cafe_213
+r 21
+w 62 623_cafe_623
+r 62
+w a3 a33_cafe_a33
+r a3
+w e4 e43_cafe_e43
+r e4
+w 29 293_cafe_293
+r 29
+w 6a 6a3_cafe_6a3
+r 6a
+w ab ab3_cafe_ab3
+r ab
+w ec ec3_cafe_ec3
+r ec
+n 2
+w 31 313_cafe_313
+r 31
+w 72 723_cafe_723
+r 72
+w b3 b33_cafe_b33
+r b3
+w f4 f43_cafe_f43
+r f4
+w 39 393_cafe_393
+r 39
+w 7a 7a3_cafe_7a3
+r 7a
+w bb bb3_cafe_bb3
+r bb
+w fc fc3_cafe_fc3
+r fc
+n 2
+
+# The testbench now sweeps all 256 words with loads and checks each against
+# its reference value, so every store above is verified at least twice.
