@@ -525,16 +525,16 @@ export action posedge
 
                 # ---- channel 3: retire first, post second, so the slot a
                 # retiring ack frees is available to an eviction on the same
-                # edge.  Only a DIRTY give-up posts; a clean line is dropped
-                # silently, which is sound while the directory keeps no
-                # sharer state (phase 5 makes every eviction non-silent). ----
+                # edge.  EVERY give-up posts -- a clean one carries no data
+                # and the directory retires it in one pass -- which is what
+                # keeps the directory's sharer bit exact. ----
                 if c_ack_taken {
                     ack_g_en := false;
                 };
-                if c_gv_en & c_gv_d {
+                if c_gv_en {
                     ack_g_en   := true;
                     ack_g_line := c_gv_l;
-                    ack_g_dty  := true;
+                    ack_g_dty  := c_gv_d;
                     ack_g_data := c_gv_dat;
                 };
 
@@ -565,9 +565,10 @@ export action posedge
         # commit shapes -- the store-hit drain and the replay store-apply --
         # without them ever racing.
         #
-        # Clean evictions are silent (the directory keeps no sharer state
-        # yet); a dirty one posts its line on channel 3 and cannot start
-        # until the slot is free.
+        # EVERY eviction is non-silent (plan decision 1): clean or dirty,
+        # the victim goes out on channel 3, so the directory's sharer bit is
+        # exact and it never has to recall a line it has lost track of.  A
+        # give-up therefore cannot start until the channel-3 slot is free.
         # ==================================================================
         isolate cache_body = {
 
@@ -692,7 +693,7 @@ export action posedge
 
                 invariant [ca_st_line] c_st_en -> hold_g(c_st_h)
 
-                invariant [ca_gv_nodouble] c_gv_en & c_gv_d -> ~ack_g_en
+                invariant [ca_gv_nodouble] c_gv_en -> ~ack_g_en
 
                 invariant [ca_gv_nost] c_gv_en -> ~c_st_en
 
@@ -906,10 +907,8 @@ export action posedge
                 # `ae_r` and not `ack_g_en`, for the reason given above. ----
                 wire gv0 : bool
                 wire gv1 : bool
-                definition gv0 = (s0_m_state = m_fill) & tag_occ(v0)
-                    & (~tag_dty(v0) | ~ae_r)
-                definition gv1 = (s1_m_state = m_fill) & tag_occ(v1)
-                    & (~tag_dty(v1) | ~ae_r)
+                definition gv0 = (s0_m_state = m_fill) & tag_occ(v0) & ~ae_r
+                definition gv1 = (s1_m_state = m_fill) & tag_occ(v1) & ~ae_r
 
                 definition gv_en  = (arb0 & gv0) | (arb1 & gv1)
                 definition gv_l   = (s0_mvline if arb0 else s1_mvline)
@@ -1006,8 +1005,8 @@ export action posedge
                 action step_0(ae0 : bool) = {
                     if s0_m_state = m_fill {
                         if tag_occ(v0) {
-                            if ~tag_dty(v0) | ~ae0 {
-                                if tag_dty(v0) { ae_r := true; };
+                            if ~ae0 {
+                                ae_r := true;
                                 tag_occ(v0) := false;
                             };
                         } else {
@@ -1045,8 +1044,8 @@ export action posedge
                 action step_1(ae0 : bool) = {
                     if s1_m_state = m_fill {
                         if tag_occ(v1) {
-                            if ~tag_dty(v1) | ~ae0 {
-                                if tag_dty(v1) { ae_r := true; };
+                            if ~ae0 {
+                                ae_r := true;
                                 tag_occ(v1) := false;
                             };
                         } else {
@@ -1233,7 +1232,6 @@ export action posedge
                 # 3.4  The two records at `cachemem`, kept honest.
                 # ==========================================================
                 invariant [ae_sync] ack_g_en = ae_r
-                invariant [ack_dty_only] ack_g_en -> ack_g_dty
 
                 # ---- everything the cache is sitting on is in `hold_g`:
                 # every resident line, and every line an MSHR has already
@@ -1596,6 +1594,25 @@ export action posedge
                 var wb_lo_done : bool
                 var wb_hi_done : bool
 
+                # ==========================================================
+                # The sharer bit.  One per line rather than the plan's 8 sets
+                # x 8 ways of entries: the ENTRY ACCOUNTING -- the two-role
+                # injective map and the `[d_room]` bound that makes 8 ways
+                # exactly tight -- is the one genuinely novel argument in the
+                # plan and it is NOT attempted here.  What is proved is the
+                # thing that argument exists to support, and the thing the
+                # second cache will need: the bit is EXACT.  A line the cache
+                # holds always has its bit set, so a line with no bit is in
+                # no cache -- which is what lets the directory hand it out
+                # without recalling anything.
+                #
+                # Exactness is why every eviction had to become non-silent:
+                # a silently dropped clean line would leave a bit set with
+                # nothing behind it, and the directory would refuse to serve
+                # that line ever again.
+                # ==========================================================
+                var dsh(H : line) : bool
+
                 # ---- the command port's registers ----
                 var ev_cmd      : bool
                 var ev_cmd_wen  : bool
@@ -1603,6 +1620,7 @@ export action posedge
                 var ev_cmd_data : four_words
 
                 after init {
+                    dsh(H) := false;
                     dstate_r := 0; cr_line := 0; cr_excl := false;
                     dfb_lo := 0; dfb_hi := 0;
                     gr_v := false; gr_x := false; gr_l := 0; gr_d := 0;
@@ -1652,8 +1670,10 @@ export action posedge
 
                     ev_cmd := false;
 
-                    # ---- channel 2 retires ----
+                    # ---- channel 2 retires, and the bit goes up: the cache
+                    # has the line from this edge on ----
                     if gr_v & c_gr_taken {
+                        dsh(H) := (true if H = gr_l else dsh(H));
                         gr_v := false;
                         if dstate_r = d_gwt {
                             dstate_r := d_idle;
@@ -1729,6 +1749,7 @@ export action posedge
                     } else { if wb_st = wb_fin & wb_lo_done & wb_hi_done {
                         wb_st := wb_ret;
                     } else { if wb_st = wb_ret {
+                        dsh(H) := (false if H = wb_line else dsh(H));
                         wb_st      := wb_idle;
                         wb_lo_done := false;
                         wb_hi_done := false;
@@ -1746,8 +1767,7 @@ export action posedge
                     # ---- pick a new request.  Last, so the slot a grant
                     # freed this edge is not reused on the same edge. ----
                     if dstate_r = d_idle & c_req_en & wb_st = wb_idle & ~gr_v
-                            & ~hold_g(c_req_line)
-                            & ~(ack_g_en & ack_g_line = c_req_line) {
+                            & ~dsh(c_req_line) {
                         cr_line  := c_req_line;
                         cr_excl  := c_req_excl;
                         dstate_r := d_rd_lo;
@@ -1801,6 +1821,15 @@ export action posedge
                 # `cr_line` while the request is in flight.  That is the
                 # whole argument behind `[rd_clean]` and `[dfb_img]`.
                 # ==========================================================
+                # ---- THE phase-5 invariant: the directory's picture is
+                # exact.  Contrapositive: a line with no entry is in no
+                # cache.  Everything below about the fetch in flight is a
+                # corollary of it and of the pick guard. ----
+                invariant [d_exact] hold_g(H) -> dsh(H)
+                invariant [dsh_ack] ack_g_en -> dsh(ack_g_line)
+
+                invariant [d_nosh] dstate_r ~= d_idle -> ~dsh(cr_line)
+
                 invariant [d_notheld] dstate_r ~= d_idle -> ~hold_g(cr_line)
 
                 # ---- and its dirty data is not still on its way to DRAM.
