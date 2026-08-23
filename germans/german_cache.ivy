@@ -487,6 +487,22 @@ export action posedge
                                          else cache_owns(H, O));
                 };
 
+                # ---- a load answer is BINDING on the image.  With
+                # `[resp_img_int]` this arm rewrites `img` with the value it
+                # already holds, so it is a no-op today; it is here so that
+                # the weak contract above is the one the rest of the machine
+                # is proved against, and an LSQ that forwards a store to a
+                # load does not reopen it.  Read pre-edge, so it is the
+                # answer latched on the previous edge -- which is why it goes
+                # AHEAD of the store arm: a commit on this edge must not be
+                # rolled back by an answer that predates it. ----
+                if cache_to_lsq_resp_valid {
+                    img(H, O) := (cache_to_lsq_resp_data
+                                  if (H = cache_to_lsq_resp_h
+                                      & O = cache_to_lsq_resp_o)
+                                  else img(H, O));
+                };
+
                 # ---- the store commit.  `img` moves HERE and nowhere else,
                 # and ownership begins on the same edge -- the edge the datum
                 # enters the image and DRAM stops agreeing with it.  Two
@@ -580,6 +596,27 @@ export action posedge
             wire req_excl  : bool
             wire gr_taken  : bool
 
+            # ---- the pending-store view the LSQ contract is stated over.
+            # A store is accepted at the port one edge before it reaches the
+            # array: it waits in the stage, and on a miss it waits again in
+            # the allocating MSHR's slot.  Those three records ARE
+            # `in_progress`, and they are exported as wires so the contract
+            # can name them without naming the registers behind them. ----
+            wire stage_go : bool
+            wire ps_v : bool
+            wire ps_h : line
+            wire ps_o : woffset
+            wire ps_d : word
+            wire p0_v : bool
+            wire p0_h : line
+            wire p0_o : woffset
+            wire p0_d : word
+            wire p1_v : bool
+            wire p1_h : line
+            wire p1_o : woffset
+            wire p1_d : word
+            wire in_progress(H : line) : bool
+
             # ---- proof observation ports ----
             wire st_en  : bool
             wire st_h   : line
@@ -608,9 +645,48 @@ export action posedge
             # a held line or to the dirty ack carrying it.
             # ==============================================================
             specification {
-                invariant [resp_img] cache_to_lsq_resp_valid ->
+                # ---- the LSQ contract, in the two halves the plan calls
+                # for.  On a QUIET line the answer is exactly the image.  On
+                # a line with a store in progress it may be the image or any
+                # value a pending store is about to write -- and `cachemem`'s
+                # monitor then writes the answer back into `img`, so
+                # observation is binding and later loads linearise after it.
+                #
+                # The implementation satisfies the stronger `[resp_img_int]`
+                # unconditionally -- every answer comes out of the array and
+                # `[c_img]` pins the array to `img` -- so the image-update
+                # arm is provably a no-op and the weak pair follows.  The
+                # slack is for the LSQ seam and store-forwarding: with it,
+                # neither has to reopen this contract. ----
+                invariant [resp_img_int] cache_to_lsq_resp_valid ->
                     cache_to_lsq_resp_data = img(cache_to_lsq_resp_h,
                                                  cache_to_lsq_resp_o)
+
+                invariant [resp_quiet] cache_to_lsq_resp_valid
+                    & ~in_progress(cache_to_lsq_resp_h) ->
+                    cache_to_lsq_resp_data = img(cache_to_lsq_resp_h,
+                                                 cache_to_lsq_resp_o)
+
+                invariant [resp_inprog] cache_to_lsq_resp_valid
+                    & in_progress(cache_to_lsq_resp_h) ->
+                      cache_to_lsq_resp_data = img(cache_to_lsq_resp_h,
+                                                   cache_to_lsq_resp_o)
+                    | (ps_v & ps_h = cache_to_lsq_resp_h
+                       & ps_o = cache_to_lsq_resp_o
+                       & cache_to_lsq_resp_data = ps_d)
+                    | (p0_v & p0_h = cache_to_lsq_resp_h
+                       & p0_o = cache_to_lsq_resp_o
+                       & cache_to_lsq_resp_data = p0_d)
+                    | (p1_v & p1_h = cache_to_lsq_resp_h
+                       & p1_o = cache_to_lsq_resp_o
+                       & cache_to_lsq_resp_data = p1_d)
+
+                # ---- an advertised ready empties the stage of any staged
+                # store this very edge.  Near-tautological from the
+                # definitions, but it must be STATED to be usable outside:
+                # it is what lets the LSQ conclude that the edge a load's
+                # handshake fires, no store of its own remains staged. ----
+                invariant [rdy_drain] cache_to_lsq_creq_ready & ps_v -> stage_go
 
                 invariant [ca_gv_hold] c_gv_en -> hold_g(c_gv_l)
 
@@ -776,7 +852,6 @@ export action posedge
                 # a load answer never share an edge, so `[resp_img]` cannot
                 # be overtaken by an image move.
                 # ==========================================================
-                wire stage_go : bool
                 wire arb0     : bool
                 wire arb1     : bool
                 definition stage_go = p_valid
@@ -785,6 +860,23 @@ export action posedge
                     & ~(s0_m_state = m_fill | s0_m_state = m_replay)
                     & ~(s1_m_state = m_fill | s1_m_state = m_replay)
                     & (s0_m_state = m_idle | s1_m_state = m_idle)
+                definition ps_v = p_valid & p_wen
+                definition ps_h = p_h
+                definition ps_o = p_o
+                definition ps_d = p_wdata
+                definition p0_v = s0_rq_valid & s0_rq_wen
+                definition p0_h = s0_m_base
+                definition p0_o = s0_rq_off
+                definition p0_d = s0_rq_wdata
+                definition p1_v = s1_rq_valid & s1_rq_wen
+                definition p1_h = s1_m_base
+                definition p1_o = s1_rq_off
+                definition p1_d = s1_rq_wdata
+                definition in_progress(H) =
+                      (p_valid & p_wen & p_h = H)
+                    | (s0_rq_valid & s0_rq_wen & s0_m_base = H)
+                    | (s1_rq_valid & s1_rq_wen & s1_m_base = H)
+
                 definition arb0 = ~stage_go
                     & (s0_m_state = m_fill | s0_m_state = m_replay)
                 definition arb1 = ~stage_go
