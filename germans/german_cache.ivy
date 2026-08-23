@@ -1,5 +1,46 @@
 #lang ivy1.8
 
+# ============================================================================
+# PLAN PHASE 2: the directory, in isolation.
+#
+# The beat-granular cache is gone from this file (preserved verbatim in
+# `cache_beats.ivy`); the memory controller's client is now `dir_body`, the
+# German home node, and the only thing on the other side of the coherence
+# channels is `mock_body` -- a one-line stand-in for the cache that requests
+# lines, stores into what it holds, and writes back what it dirtied.
+#
+#            mock_body                (phase 3: the real cache)
+#          ch1 / ch2 / ch3
+#            dir_body                 (grants, dirty writebacks; no
+#          four_words beats            invalidates, no sharer array yet)
+#            mc_body                  (UNCHANGED)
+#          mem_* top-level wires
+#
+# What is proved here, and why each piece exists:
+#
+#   [dir_img]    `~cache_owns(H,O) -> dir(H,O) = img(H,O)` -- the phase's
+#                headline.  `dir` is the image the directory + controller
+#                present; the directory holds no data array (design decision
+#                4) and dirty data always round-trips memory (decision 3),
+#                so `dir` IS `mmem` and the fact is `mc_owns_img` restated at
+#                the seam the client consumes it across.
+#   [grant_img]  the payload of a grant is the image at the granted line.
+#                This is the client-facing half of the data guarantee and
+#                the only dir-facing data fact the cache will consume.
+#   [rd_clean]   by the time the directory reads DRAM for a request, nobody
+#                owns the line -- so `mc_owns_img` turns the read into `img`.
+#   [wb_img]     what the directory puts on the controller's command wires is
+#                accurate to `img`; `mc_owns_img` is proved from it.
+#   [wb_done]    an ack is only retired once its data has LANDED in DRAM.
+#                This is what lets the client's ownership bookkeeping close.
+#
+# Deliberately NOT here (phase 5): invalidates, the 8x8 sharer array, SWMR.
+# The directory tracks one client, so there is nothing to invalidate; the
+# entry array is protocol state for that flow and would carry no invariant
+# yet.  `cache_line` IS introduced here rather than in phase 3, so the
+# directory is built once in its final shape.
+# ============================================================================
+
 include numbers
 include order
 
@@ -15,6 +56,10 @@ type load_idx
 
 type four_words
 
+# ---- a whole cache line: the unit the directory and the client trade.
+# Two `four_words` beats wide, but the channels never see the seam. ----
+type cache_line
+
 function pack4(W3 : word, W2 : word, W1 : word, W0 : word) : four_words
 function unp0(M : four_words) : word
 function unp1(M : four_words) : word
@@ -28,16 +73,28 @@ type woffset
 type way
 
 type cache_slot
+# ---- the line <-> beat bridge.  `lsel`/`lins` are the word-granular view a
+# cache needs; `lpack`/`lhi`/`llo` are the beat-granular view the memory
+# controller needs, and the select-of-pack properties in `data_impl` are the
+# only place the two meet. ----
+function lsel(L : cache_line, O : woffset) : word
+function lins(L : cache_line, O : woffset, D : word) : cache_line
+function lpack(HI : four_words, LO : four_words) : cache_line
+function lhi(L : cache_line) : four_words
+function llo(L : cache_line) : four_words
+
 
 # ---- the memory controller's service counter.  `nat` has no bit
 # width, so it cannot appear in a hardware description. ----
 type latency
 
-# ---- the MSHR's control state and the drain phase.  Ivy enumerated
-# types have no bit width either; these are narrow bit vectors whose
-# named values are declared as 0-ary wires inside `cache_body`. ----
+# ---- control-state encodings.  Ivy enumerated types have no bit width
+# either; these are narrow bit vectors whose named values are declared as
+# 0-ary wires inside the isolate that uses them. ----
 type mstate
-type dphase
+type dstate
+type wbstate
+type mkstate
 
 # Copies of the above functions that can be synthesized to RTL. Kept separate
 # so that use does not pull in the adddress theory
@@ -48,6 +105,11 @@ wire hw_unp2(M : four_words) : word
 wire hw_unp3(M : four_words) : word
 wire hw_wsel4(M : four_words, J : bv2) : word
 wire hw_wins4(M : four_words, J : bv2, D : word) : four_words
+wire hw_lsel(L : cache_line, O : woffset) : word
+wire hw_lins(L : cache_line, O : woffset, D : word) : cache_line
+wire hw_lpack(HI : four_words, LO : four_words) : cache_line
+wire hw_lhi(L : cache_line) : four_words
+wire hw_llo(L : cache_line) : four_words
 wire hw_concatbv3(H : line, O : woffset) : addr
 wire hw_high(A : addr) : line
 wire hw_low(A : addr) : woffset
@@ -72,77 +134,10 @@ isolate basis = {
     interpret cache_slot -> bv[4]
     interpret latency -> bv[4]
     interpret mstate -> bv[3]
-    interpret dphase -> bv[2]
+    interpret dstate -> bv[3]
+    interpret wbstate -> bv[3]
+    interpret mkstate -> bv[2]
 }
-
-# ---- `word` and `four_words` are ABSTRACT outside this isolate.  The
-# bit-level encoding lives in the implementation, so every other
-# isolate sees a beat as an uninterpreted quadruple constrained only by
-# `p_unp0..3`.  This is the same trick `addr_thy` plays below, and for
-# the same reason: with four_words = bv[256] visible, every query that
-# mentions a fill or a writeback drags a 256-bit concat through the
-# solver, and z3 bit-blasts it.  Nothing outside needs the encoding --
-# beats are only ever built with `pack4` and taken apart with
-# `unp0..3` or, at a computed offset, with `wsel4`/`wins4`. ----
-isolate data_impl = {
-    property [p_unp0] forall W3 : word, W2 : word, W1 : word, W0 : word. unp0(pack4(W3, W2, W1, W0)) = W0
-    property [p_unp1] forall W3 : word, W2 : word, W1 : word, W0 : word. unp1(pack4(W3, W2, W1, W0)) = W1
-    property [p_unp2] forall W3 : word, W2 : word, W1 : word, W0 : word. unp2(pack4(W3, W2, W1, W0)) = W2
-    property [p_unp3] forall W3 : word, W2 : word, W1 : word, W0 : word. unp3(pack4(W3, W2, W1, W0)) = W3
-
-    # ---- the dynamic view of the same four positions.  `bv2` has four
-    # values and they are enumerated here, so a caller that knows which
-    # word it wants gets the static accessor back and one that does not
-    # reasons with `p_wins_hit`/`p_wins_miss` alone. ----
-    property [p_wsel0] forall M : four_words. wsel4(M, 0) = unp0(M)
-    property [p_wsel1] forall M : four_words. wsel4(M, 1) = unp1(M)
-    property [p_wsel2] forall M : four_words. wsel4(M, 2) = unp2(M)
-    property [p_wsel3] forall M : four_words. wsel4(M, 3) = unp3(M)
-    property [p_wins_hit] forall M : four_words, J : bv2, D : word.
-        wsel4(wins4(M, J, D), J) = D
-    property [p_wins_miss] forall M : four_words, J1 : bv2, J2 : bv2, D : word.
-        J1 ~= J2 -> wsel4(wins4(M, J1, D), J2) = wsel4(M, J2)
-    property [p_hw_pack4] forall W3 : word, W2 : word, W1 : word, W0 : word.
-        hw_pack4(W3, W2, W1, W0) = pack4(W3, W2, W1, W0)
-    property [p_hw_unp0] forall M : four_words. hw_unp0(M) = unp0(M)
-    property [p_hw_unp1] forall M : four_words. hw_unp1(M) = unp1(M)
-    property [p_hw_unp2] forall M : four_words. hw_unp2(M) = unp2(M)
-    property [p_hw_unp3] forall M : four_words. hw_unp3(M) = unp3(M)
-    property [p_hw_wsel4] forall M : four_words, J : bv2. hw_wsel4(M, J) = wsel4(M, J)
-    property [p_hw_wins4] forall M : four_words, J : bv2, D : word.
-        hw_wins4(M, J, D) = wins4(M, J, D)
-
-    implementation {
-        interpret word -> bv[64]
-        interpret four_words -> bv[256]
-        definition pack4(W3, W2, W1, W0) = W3 :: W2 :: W1 :: W0
-        definition unp0(M) = bfe[0][63](M)
-        definition unp1(M) = bfe[64][127](M)
-        definition unp2(M) = bfe[128][191](M)
-        definition unp3(M) = bfe[192][255](M)
-        definition wsel4(M, J) = (unp0(M) if J = 0 else
-                                 (unp1(M) if J = 1 else
-                                 (unp2(M) if J = 2 else unp3(M))))
-        definition wins4(M, J, D) =
-            (pack4(unp3(M), unp2(M), unp1(M), D) if J = 0 else
-            (pack4(unp3(M), unp2(M), D, unp0(M)) if J = 1 else
-            (pack4(unp3(M), D, unp1(M), unp0(M)) if J = 2 else
-             pack4(D, unp2(M), unp1(M), unp0(M)))))
-        definition hw_pack4(W3, W2, W1, W0) = W3 :: W2 :: W1 :: W0
-        definition hw_unp0(M) = bfe[0][63](M)
-        definition hw_unp1(M) = bfe[64][127](M)
-        definition hw_unp2(M) = bfe[128][191](M)
-        definition hw_unp3(M) = bfe[192][255](M)
-        definition hw_wsel4(M, J) = (hw_unp0(M) if J = 0 else
-                                    (hw_unp1(M) if J = 1 else
-                                    (hw_unp2(M) if J = 2 else hw_unp3(M))))
-        definition hw_wins4(M, J, D) =
-            (hw_pack4(hw_unp3(M), hw_unp2(M), hw_unp1(M), D) if J = 0 else
-            (hw_pack4(hw_unp3(M), hw_unp2(M), D, hw_unp0(M)) if J = 1 else
-            (hw_pack4(hw_unp3(M), D, hw_unp1(M), hw_unp0(M)) if J = 2 else
-             hw_pack4(D, hw_unp2(M), hw_unp1(M), hw_unp0(M)))))
-    }
-} with this, basis
 
 function concatbv3(H : line, O : woffset) : addr
 function high(A : addr) : line
@@ -175,6 +170,7 @@ isolate addr_thy = {
 
     property [p_way2]  forall W : way. W = 0 | W = 1
     property [p_way_ne] (0 : way) ~= (1 : way)
+    property [p_bit2]  forall B : bit. B = 0 | B = 1
     property [p_boff_beat]  forall B : bit, J : bv2. beat_of(concatbv2(B, J)) = B
     property [p_boff_word]  forall B : bit, J : bv2. boff2(concatbv2(B, J)) = J
     property [p_cover] forall O : woffset, B : bit. beat_of(O) = B ->
@@ -235,27 +231,134 @@ isolate addr_thy = {
     }
 } with this, basis
 
+# ---- `word`, `four_words` and `cache_line` are ABSTRACT outside this
+# isolate.  The bit-level encoding lives in the implementation, so every
+# other isolate sees a beat as an uninterpreted quadruple constrained only by
+# `p_unp0..3` and a line as an uninterpreted eight-tuple constrained by
+# `p_lsel_*`/`p_lins_*`.  This is the same trick `addr_thy` plays above, and
+# for the same reason: with four_words = bv[256] visible, every query that
+# mentions a fill or a writeback drags a 256-bit concat through the solver,
+# and z3 bit-blasts it -- at 512 bits per line it is worse.  Nothing outside
+# needs the encoding.
+#
+# It sits AFTER `addr_thy` and depends on it, which the beat-only version did
+# not: the line <-> beat bridge is stated at `concatbv2(B, J)` offsets, so
+# this isolate needs `woffset` interpreted and `p_boff_beat`/`p_boff_word` to
+# take a packed offset apart.  That is also the plan's "keep the bridge
+# axioms confined to the data isolate": they are PROVED here, against the
+# encodings, and only their statements escape. ----
+isolate data_impl = {
+    property [p_unp0] forall W3 : word, W2 : word, W1 : word, W0 : word. unp0(pack4(W3, W2, W1, W0)) = W0
+    property [p_unp1] forall W3 : word, W2 : word, W1 : word, W0 : word. unp1(pack4(W3, W2, W1, W0)) = W1
+    property [p_unp2] forall W3 : word, W2 : word, W1 : word, W0 : word. unp2(pack4(W3, W2, W1, W0)) = W2
+    property [p_unp3] forall W3 : word, W2 : word, W1 : word, W0 : word. unp3(pack4(W3, W2, W1, W0)) = W3
+
+    # ---- the dynamic view of the same four positions.  `bv2` has four
+    # values and they are enumerated here, so a caller that knows which
+    # word it wants gets the static accessor back and one that does not
+    # reasons with `p_wins_hit`/`p_wins_miss` alone. ----
+    property [p_wsel0] forall M : four_words. wsel4(M, 0) = unp0(M)
+    property [p_wsel1] forall M : four_words. wsel4(M, 1) = unp1(M)
+    property [p_wsel2] forall M : four_words. wsel4(M, 2) = unp2(M)
+    property [p_wsel3] forall M : four_words. wsel4(M, 3) = unp3(M)
+    property [p_wins_hit] forall M : four_words, J : bv2, D : word.
+        wsel4(wins4(M, J, D), J) = D
+    property [p_wins_miss] forall M : four_words, J1 : bv2, J2 : bv2, D : word.
+        J1 ~= J2 -> wsel4(wins4(M, J1, D), J2) = wsel4(M, J2)
+    property [p_hw_pack4] forall W3 : word, W2 : word, W1 : word, W0 : word.
+        hw_pack4(W3, W2, W1, W0) = pack4(W3, W2, W1, W0)
+    property [p_hw_unp0] forall M : four_words. hw_unp0(M) = unp0(M)
+    property [p_hw_unp1] forall M : four_words. hw_unp1(M) = unp1(M)
+    property [p_hw_unp2] forall M : four_words. hw_unp2(M) = unp2(M)
+    property [p_hw_unp3] forall M : four_words. hw_unp3(M) = unp3(M)
+    property [p_hw_wsel4] forall M : four_words, J : bv2. hw_wsel4(M, J) = wsel4(M, J)
+    property [p_hw_wins4] forall M : four_words, J : bv2, D : word.
+        hw_wins4(M, J, D) = wins4(M, J, D)
+
+    # ---- the line <-> beat bridge.  Four facts, and they are all anyone
+    # outside ever needs: a packed line reads back as the beats it was built
+    # from, and each beat of a line reads back as the line's words at that
+    # beat's offsets.  Everything is phrased at `concatbv2(B, J)` so no
+    # `beat_of`/`boff2` round trip appears in a client's query. ----
+    property [p_lpack_lo] forall HI : four_words, LO : four_words, J : bv2.
+        lsel(lpack(HI, LO), concatbv2(0, J)) = wsel4(LO, J)
+    property [p_lpack_hi] forall HI : four_words, LO : four_words, J : bv2.
+        lsel(lpack(HI, LO), concatbv2(1, J)) = wsel4(HI, J)
+    property [p_llo] forall L : cache_line, J : bv2.
+        wsel4(llo(L), J) = lsel(L, concatbv2(0, J))
+    property [p_lhi] forall L : cache_line, J : bv2.
+        wsel4(lhi(L), J) = lsel(L, concatbv2(1, J))
+    property [p_lins_hit] forall L : cache_line, O : woffset, D : word.
+        lsel(lins(L, O, D), O) = D
+    property [p_lins_miss] forall L : cache_line, O1 : woffset, O2 : woffset, D : word.
+        O1 ~= O2 -> lsel(lins(L, O1, D), O2) = lsel(L, O2)
+    property [p_hw_lsel] forall L : cache_line, O : woffset. hw_lsel(L, O) = lsel(L, O)
+    property [p_hw_lins] forall L : cache_line, O : woffset, D : word.
+        hw_lins(L, O, D) = lins(L, O, D)
+    property [p_hw_lpack] forall HI : four_words, LO : four_words.
+        hw_lpack(HI, LO) = lpack(HI, LO)
+    property [p_hw_lhi] forall L : cache_line. hw_lhi(L) = lhi(L)
+    property [p_hw_llo] forall L : cache_line. hw_llo(L) = llo(L)
+
+    implementation {
+        interpret word -> bv[64]
+        interpret four_words -> bv[256]
+        interpret cache_line -> bv[512]
+        definition pack4(W3, W2, W1, W0) = W3 :: W2 :: W1 :: W0
+        definition unp0(M) = bfe[0][63](M)
+        definition unp1(M) = bfe[64][127](M)
+        definition unp2(M) = bfe[128][191](M)
+        definition unp3(M) = bfe[192][255](M)
+        definition wsel4(M, J) = (unp0(M) if J = 0 else
+                                 (unp1(M) if J = 1 else
+                                 (unp2(M) if J = 2 else unp3(M))))
+        definition wins4(M, J, D) =
+            (pack4(unp3(M), unp2(M), unp1(M), D) if J = 0 else
+            (pack4(unp3(M), unp2(M), D, unp0(M)) if J = 1 else
+            (pack4(unp3(M), D, unp1(M), unp0(M)) if J = 2 else
+             pack4(D, unp2(M), unp1(M), unp0(M)))))
+        definition hw_pack4(W3, W2, W1, W0) = W3 :: W2 :: W1 :: W0
+        definition hw_unp0(M) = bfe[0][63](M)
+        definition hw_unp1(M) = bfe[64][127](M)
+        definition hw_unp2(M) = bfe[128][191](M)
+        definition hw_unp3(M) = bfe[192][255](M)
+        definition hw_wsel4(M, J) = (hw_unp0(M) if J = 0 else
+                                    (hw_unp1(M) if J = 1 else
+                                    (hw_unp2(M) if J = 2 else hw_unp3(M))))
+        definition hw_wins4(M, J, D) =
+            (hw_pack4(hw_unp3(M), hw_unp2(M), hw_unp1(M), D) if J = 0 else
+            (hw_pack4(hw_unp3(M), hw_unp2(M), D, hw_unp0(M)) if J = 1 else
+            (hw_pack4(hw_unp3(M), D, hw_unp1(M), hw_unp0(M)) if J = 2 else
+             hw_pack4(D, hw_unp2(M), hw_unp1(M), hw_unp0(M)))))
+
+        # ---- a line is its two beats, high first.  Every line operation is
+        # routed through `wsel4`/`wins4` on the selected half rather than
+        # through a fresh 512-bit case split, which is what keeps the six
+        # properties above provable in seconds. ----
+        definition lpack(HI, LO) = HI :: LO
+        definition llo(L) = bfe[0][255](L)
+        definition lhi(L) = bfe[256][511](L)
+        definition lsel(L, O) = (wsel4(llo(L), boff2(O)) if beat_of(O) = 0
+                                 else wsel4(lhi(L), boff2(O)))
+        definition lins(L, O, D) =
+            (lpack(lhi(L), wins4(llo(L), boff2(O), D)) if beat_of(O) = 0
+             else lpack(wins4(lhi(L), boff2(O), D), llo(L)))
+        definition hw_lpack(HI, LO) = HI :: LO
+        definition hw_llo(L) = bfe[0][255](L)
+        definition hw_lhi(L) = bfe[256][511](L)
+        definition hw_lsel(L, O) = (hw_wsel4(hw_llo(L), hw_boff2(O)) if hw_beat_of(O) = 0
+                                    else hw_wsel4(hw_lhi(L), hw_boff2(O)))
+        definition hw_lins(L, O, D) =
+            (hw_lpack(hw_lhi(L), hw_wins4(hw_llo(L), hw_boff2(O), D)) if hw_beat_of(O) = 0
+             else hw_lpack(hw_wins4(hw_lhi(L), hw_boff2(O), D), hw_llo(L)))
+    }
+} with this, basis, addr_thy
+
 export action posedge
 
-    
-    isolate cachemem = {
 
-        # ---- the LSQ channel, carried through this level.  A module may
-        # only name its own wires and its children's, so the LSQ's port
-        # cannot be wired straight to `cache_body`: every wire of the
-        # channel is declared here too and connected on both sides. ----
-        wire lsq_to_cache_req_en     : bool
-        wire lsq_to_cache_req_h      : line
-        wire lsq_to_cache_req_o      : woffset
-        wire lsq_to_cache_req_wen    : bool
-        wire lsq_to_cache_req_wdata  : word
-        wire lsq_to_cache_req_idx    : load_idx
-        wire cache_to_lsq_creq_ready : bool
-        wire cache_to_lsq_resp_valid : bool
-        wire cache_to_lsq_resp_h     : line
-        wire cache_to_lsq_resp_o     : woffset
-        wire cache_to_lsq_resp_data  : word
-        wire cache_to_lsq_resp_idx   : load_idx
+
+    isolate cachemem = {
 
         # ---- the memory-side port, carried out to the top of the design ----
         wire mem_rd_en   : bool
@@ -265,70 +368,107 @@ export action posedge
         wire mem_wr_data : four_words
         wire mem_rdata   : four_words
 
-        specification {
+        # ==================================================================
+        # The coherence channels, declared ONCE, here, ahead of both
+        # children.  Each net has exactly one name: the child that drives it
+        # exports a port wire and this level aliases the net to it, and the
+        # child that reads it reads THIS wire, not a copy of its own.
+        #
+        # That is not tidiness.  `ivy_check` admits a definition into an
+        # isolate's query only when the defined symbol occurs in that
+        # isolate's OWN code or invariants -- an occurrence inside an
+        # invariant imported from a sibling does not count.  With a net named
+        # twice, an imported invariant about the far end's copy is a
+        # statement about a symbol the query never connects to anything, and
+        # it silently says nothing.  (Measured: `[wb_done]` phrased over
+        # `dir_body.ack_line` left `mock_body.mk_owns` unprovable, and the
+        # query did not fail -- it ran for twenty minutes.)
+        #
+        # `c_st_*`/`c_mk_ev*` are proof observation nets rather than
+        # protocol: the store the ghost image moves on, and the eviction the
+        # channel-3 record is posted from.
+        # ==================================================================
+        wire c_req_en    : bool         # client -> directory
+        wire c_req_line  : line
+        wire c_req_excl  : bool
+        wire c_req_taken : bool         # directory -> client
+        wire c_gr_valid  : bool         # directory -> client
+        wire c_gr_excl   : bool
+        wire c_gr_line   : line
+        wire c_gr_data   : cache_line
+        wire c_gr_taken  : bool         # client -> directory
+        wire c_ack_taken : bool         # directory -> client
+        wire c_st_en     : bool         # client -> proof
+        wire c_st_h      : line
+        wire c_st_o      : woffset
+        wire c_st_d      : word
+        wire c_mk_ev     : bool         # client -> proof
+        wire c_mk_ev_l   : line
+        wire c_mk_ev_d   : bool
+        wire c_mk_ev_dat : cache_line
 
+        specification {
 
             function img(H : line, O : woffset) : word
 
-            # Specifies what lines are owned by the cache
-            # in practice, the lines that are staged, in MSHR, or cached
+            # Specifies what lines are owned by the client
+            # in practice, the lines it holds dirty or is shipping back
             function cache_owns(H : line, O : woffset) : bool
+
+            # ==============================================================
+            # The client's holding, and channel 3, kept HERE.
+            #
+            # Not decoration, and not a mirror that could be dropped: an
+            # isolate cannot prove anything about its own free inputs.  The
+            # directory has to state that the writeback it is running is the
+            # ack still in the channel (`[wb_ack]`), and that a retired ack's
+            # data has landed (`[wb_done]`) -- both are claims about the
+            # POST-state, and if the ack lives in the client's registers then
+            # across the seam it is a wire the environment may re-drive, so
+            # neither invariant is provable at all.  (Measured: the query
+            # does not fail, it diverges.)  Held here it is ordinary state
+            # whose transition both isolates see, and both facts are
+            # ordinary induction.
+            #
+            # `mk_g_hold` does the same job for the client's line: it moves
+            # only on `c_mk_ev` (the client gives the line up) and on
+            # `c_gr_valid & c_gr_taken` (the client takes a grant), and
+            # `c_gr_valid` is the DIRECTORY's own output, so the directory
+            # can prove the record does not move behind its back.  That is
+            # what makes `[rd_clean]` inductive.  `mock_body` keeps both
+            # synced (`mk_sync`, `mk_ack_sync`).
+            # ==============================================================
+            var mk_g_hold : bool
+            var mk_g_line : line
+
+            var ack_g_en   : bool
+            var ack_g_line : line
+            var ack_g_dty  : bool
+            var ack_g_data : cache_line
 
             after init {
                 img(H, O)         := init_img(H, O);
                 cache_owns(H, O)  := false;
+                mk_g_hold := false;
+                mk_g_line := 0;
+                ack_g_en := false; ack_g_line := 0;
+                ack_g_dty := false; ack_g_data := 0;
             }
 
-            # ==============================================================
-            # The staged store, recorded off the REQUEST wires.
-            #
-            # A store leaves the LSQ at the port handshake but sits in the
-            # cache's input stage until `stage_go`, the edge it drains into
-            # the cache -- and that is the edge `img` moves.  The raw stage
-            # registers are invisible outside `cache_body`'s implementation
-            # and raw wires are free values in `lsq_body`, so an invariant
-            # over them cannot persist across edges; this record, latched
-            # off wires both sides can see, is trackable state -- a fact
-            # BOTH sides can prove things about.  `cache_body` keeps it
-            # synced with its stage (`stage_sync`) and exports `rdy_drain`;
-            # the LSQ states `img_cimg` and `no_ld_st` against it.
-            #
-            # One record is enough because a second store cannot leave the
-            # LSQ until the first drains: intake requires the stage free or
-            # freeing (`rdy_drain`).
-            #
-            # The `img` update is keyed off `stage_go` and written FIRST,
-            # so on a drain-and-refill edge it reads the OLD record --
-            # the store that is draining -- before the intake arm latches
-            # the new one.
-            # ==============================================================
-            var stage_store : bool      # a store is staged ...
-            var stage_h_g   : line      # ... and this is it
-            var stage_o_g   : woffset
-            var stage_d_g   : word
-
-            after init {
-                stage_store := false;
-                stage_h_g := 0; stage_o_g := 0; stage_d_g := 0;
-            }
-
-            # ---- the guards here read CACHEMEM-LEVEL wires and the two
-            # child wires this monitor is defined by: `cache_body.stage_go`
-            # (the drain) and `mc_body.cmd_*` (the landing command beat).
-            # Both are declared at their child's BARE level, so they are
-            # visible in every isolate that sees `cachemem`; only their
-            # defining equations are hidden in the children's
-            # implementations, which leaves them free -- and a guard on a
-            # free wire fires. ----
+            # ---- this monitor is declared FIRST, so in every isolate's
+            # check it runs before any child's transition: the child wires it
+            # reads carry pre-edge values, and the records it writes are seen
+            # with the same value by every child that reads them later in the
+            # edge. ----
             after posedge {
 
                 # ---- CLEAR ownership at a command-beat landing, BEFORE
-                # the drain arm below: on the one edge where a store to a
-                # just-evicted line drains while that line's last beat
-                # lands, the set must win, so the freshly-drained word
-                # stays owned and `mc_owns_img` has nothing to prove
-                # there.  Keyed on the controller-side command wires --
-                # the same nets `mc_body`'s `mmem` write is keyed on. ----
+                # the store arm below: on the one edge where a store to a
+                # just-written-back line lands with that line's last beat,
+                # the set must win.  Keyed on the controller-side command
+                # wires -- the same nets `mc_body`'s `mmem` write is keyed
+                # on.  Unchanged from the cache-driven version; only the
+                # driver of those wires is different. ----
                 if mc_body.cmd_en & mc_body.cmd_wen {
                     cache_owns(H, O) := (false
                                          if (H = high(mc_body.cmd_addr)
@@ -336,1134 +476,277 @@ export action posedge
                                          else cache_owns(H, O));
                 };
 
-                if cache_body.stage_go {
-
-                    # ---- the `img` arm is guarded by `stage_store`, and
-                    # that guard is load-bearing for the SEAM, not for the
-                    # cache: to `lsq_body` the `stage_go` wire is a free
-                    # value, and on a spurious `stage_go` with nothing
-                    # staged, `img_cimg` has no exception to collapse -- so
-                    # `img` must not move either, or `img_cimg` is not
-                    # inductive.  For the real cache the
-                    # guard changes nothing: `stage_go` implies
-                    # `p_valid & p_wen`, which is `stage_store` by
-                    # `stage_sync`.
-                    #
-                    # A whole-array update in conditional form, as the old
-                    # port-handshake monitor was: written the obvious way,
-                    # `img(stage_h_g, stage_o_g) := stage_d_g`, an index
-                    # carrying a non-literal value is the shape this Ivy
-                    # build mishandles -- it neutralises the transition and
-                    # everything downstream passes vacuously. ----
-                    if stage_store {
-                        img(H, O) := (stage_d_g
-                                      if (H = stage_h_g & O = stage_o_g)
-                                      else img(H, O));
-                        # ownership begins HERE, the edge the datum enters
-                        # `img` and DRAM stops agreeing with the image
-                        cache_owns(H, O) := (true
-                                             if (H = stage_h_g
-                                                 & O = stage_o_g)
-                                             else cache_owns(H, O));
-                    };
-                    stage_store := false;
+                # ---- the client's store.  `img` moves HERE and nowhere
+                # else, and ownership begins on the same edge -- the edge
+                # the datum enters the image and DRAM stops agreeing with
+                # it.  A whole-array update in conditional form: written the
+                # obvious way, `img(c_st_h, c_st_o) := c_st_d`, an index
+                # carrying a non-literal value is the shape this Ivy build
+                # mishandles -- it neutralises the transition and everything
+                # downstream passes vacuously. ----
+                if c_st_en {
+                    img(H, O) := (c_st_d
+                                  if (H = c_st_h & O = c_st_o)
+                                  else img(H, O));
+                    cache_owns(H, O) := (true
+                                         if (H = c_st_h & O = c_st_o)
+                                         else cache_owns(H, O));
                 };
 
-                if lsq_to_cache_req_en
-                        & cache_to_lsq_creq_ready
-                        & lsq_to_cache_req_wen {
-                    stage_store := true;
-                    stage_h_g := lsq_to_cache_req_h;
-                    stage_o_g := lsq_to_cache_req_o;
-                    stage_d_g := lsq_to_cache_req_wdata;
+                # ---- channel 3: retire first, post second, so the slot a
+                # retiring ack frees is available to an eviction on the same
+                # edge. ----
+                if c_ack_taken {
+                    ack_g_en := false;
+                };
+                if c_mk_ev {
+                    ack_g_en   := true;
+                    ack_g_line := c_mk_ev_l;
+                    ack_g_dty  := c_mk_ev_d;
+                    ack_g_data := c_mk_ev_dat;
+                    mk_g_hold  := false;
+                };
+
+                # ---- and the client takes what it asked for ----
+                if c_gr_valid & c_gr_taken {
+                    mk_g_hold := true;
+                    mk_g_line := c_gr_line;
                 };
             }
         }
 
         # ==================================================================
-        # The cache, and below it the memory controller.  Both are datapath
-        # only.  This file proves the LSQ, and the only thing the LSQ is
-        # allowed to know about the cache is `cache_correct`, the assumption in
-        # `lsq_body`'s specification -- so neither isolate carries a reference
-        # tag, a ghost image, or an invariant.  They are here so the model is a
-        # complete machine and the LSQ's ports are driven by something real.
-        # Discharging `cache_correct` is the next piece of work and belongs to
-        # the isolate that will enclose both, not to this one.
+        # The client stand-in.
+        #
+        # One line of storage, one outstanding request, one channel-3 slot.
+        # It is not hardware and it is not meant to be: it is the smallest
+        # thing that can exercise every edge of the directory's data path --
+        # request, grant capture, store, dirty writeback -- and, crucially,
+        # the smallest thing that can DISCHARGE the seam facts the directory
+        # needs.  The seven invariants in its `specification` block are the
+        # contract phase 3's real cache has to re-prove; nothing else about
+        # this object escapes.
+        #
+        # Environment nondeterminism arrives as undriven wires (`go_*`),
+        # exactly as the LSQ port used to: an undefined wire is a free value
+        # every edge, so "the client decides to store now" is a free choice.
         # ==================================================================
+        isolate mock_body = {
 
-        isolate cache_body = {
+            # ---- the ports this client DRIVES.  Its inputs are the `c_*`
+            # nets and the `cachemem` records, read directly. ----
+            wire req_en    : bool
+            wire req_line  : line
+            wire req_excl  : bool
+            wire gr_taken  : bool
+            wire st_en     : bool
+            wire st_h      : line
+            wire st_o      : woffset
+            wire st_d      : word
+            wire mk_ev     : bool
+            wire mk_ev_l   : line
+            wire mk_ev_d   : bool
+            wire mk_ev_dat : cache_line
 
-            # ---- LSQ request channel: the request comes from the LSQ, the ready
-            # is driven here.  `lsq_to_cache_req_idx` is opaque to the cache: it
-            # is stored beside the request in the MSHR slot and handed straight
-            # back on the response so the LSQ can find the load again. ----
-            wire lsq_to_cache_req_en     : bool
-            wire lsq_to_cache_req_h      : line
-            wire lsq_to_cache_req_o      : woffset
-            wire lsq_to_cache_req_wen    : bool
-            wire lsq_to_cache_req_wdata  : word
-            wire lsq_to_cache_req_idx    : load_idx
-            wire cache_to_lsq_creq_ready : bool
-
-            # ---- LSQ response channel: all driven here ----
-            wire cache_to_lsq_resp_valid : bool
-            wire cache_to_lsq_resp_h     : line
-            wire cache_to_lsq_resp_o     : woffset
-            wire cache_to_lsq_resp_data  : word
-            wire cache_to_lsq_resp_idx   : load_idx
-
-            # ---- proof observation wire: the stage holds a store and it
-            # moves into the cache this edge.  Every ghost update that the
-            # drain implies -- `img` and `stage_store` -- keys off
-            # this one wire, which is what makes their agreement syntactic.
-            # Its defining equation (the stage-movable predicate, written
-            # out) lives in the implementation, so outside this isolate it
-            # is a free value constrained only by `rdy_drain` above. ----
-            wire stage_go : bool
-
-            # ---- memory command channel: the command is driven here, the ready
-            # comes from the memory controller ----
-            wire cmd_en    : bool
-            wire cmd_wen   : bool
-            wire cmd_addr  : addr
-            wire cmd_data  : four_words
-            wire cmd_ready : bool
-
-            # ---- memory response channel: all driven by the memory controller ----
-            wire rsp_valid : bool
-            wire rsp_addr  : addr
-            wire rsp_data  : four_words
-
-            # ==================================================================
-            # The contract.  These two are the whole of what the cache owes
-            # the rest of the machine, and they are the only invariants of
-            # this isolate that leave it.
+            # ==============================================================
+            # The contract.  This is the whole of what the client owes the
+            # directory, and the only thing phase 3's cache has to re-prove.
             #
-            # `resp_img`: the datum handed back is the reference image at the
-            # address the response echoes -- `new_proof.md` 1.4 and 1.5, whose
-            # two cases (out of the array, out of a fill buffer) are `c_img`
-            # and `fbuf_img` below.  No `resp_who` beside it any more: the
-            # LSQ's capture guard accepts only when the echoed address equals
-            # the entry's own, so the address certifies and the index merely
-            # routes -- no record of which load is being answered is needed.
+            # The first four are structural -- a client with a request
+            # outstanding, or an ack in the channel, is holding nothing; it
+            # only ever stores into the line it holds; it never posts a
+            # second ack over a live one.  Between them they pin every net
+            # that can move `img` or `cache_owns` to the `mk_g_hold` record,
+            # which is what makes `[rd_clean]` inductive.
             #
-            # `rdy_drain`: an advertised ready empties the stage of any
-            # staged store this very edge.  Near-tautological from the
-            # definitions (`creq_ready` is `ld_rdy_r & ~ev_ans`, `ld_rdy_r`
-            # is recomputed off the stage itself, and `stage_store -> p_valid`
-            # by `stage_sync`), but it must be STATED to be usable outside:
-            # it is what lets the LSQ conclude that the edge a load's
-            # handshake fires, no store remains staged (`no_ld_st`).
-            # ==================================================================
+            # `[mk_owns]` is the client's half of the old `[unowned]`: if a
+            # word is owned then either the client is still sitting on the
+            # line or the dirty ack carrying it has not been retired.  The
+            # directory's half -- the beats between the ack and DRAM -- is
+            # `[wb_lo_clean]`/`[wb_hi_clean]` on the other side of the seam,
+            # and the two meet at `[wb_done]`.  Contrapositive form, like the
+            # `[unowned]` it descends from: with `cache_owns` in the
+            # antecedent the invariant fires on every word the two array
+            # arms touch.
+            # ==============================================================
             specification {
-                invariant [resp_img] cache_to_lsq_resp_valid ->
-                    cache_to_lsq_resp_data = img(cache_to_lsq_resp_h,
-                                                 cache_to_lsq_resp_o)
+                invariant [mk_req_idle] c_req_en -> ~mk_g_hold & ~ack_g_en
 
-                invariant [rdy_drain] cache_to_lsq_creq_ready & stage_store ->
-                    stage_go
+                invariant [mk_ack_idle] ack_g_en -> ~mk_g_hold
 
-                # ---- `wb_img`: anything the cache puts on the command wire
-                # is accurate to `img`.  EXPORTED, and load-bearing: with it
-                # demoted to `private` the controller's `mc_owns_img` does not
-                # close at all (measured -- the query ran past four minutes
-                # while every other goal in the file finished in 0.3s).
-                #
-                # It reaches `mc_body` WITHOUT `mc_body` naming `cache_body`
-                # in its `with`: a `with this` clause presents the whole
-                # enclosing object, and the descent into it reaches sibling
-                # sub-isolates' `specification` blocks -- only `impl` and
-                # `private` children are skipped.  So `cachemem` is the
-                # channel, and the cache <-> controller dependency really is
-                # a CYCLE (`cache_body` needs `mc_resp`/`mc_owns_img`,
-                # `mc_body` needs `wb_img`) discharged as simultaneous
-                # induction -- each side assuming the other's invariants in
-                # the pre-state and proving its own in the post-state --
-                # with no cycle visible in any `with` clause.  That is also
-                # why the old `assume [a_wb_img]` was unnecessary: the fact
-                # was already arriving, checked, by import. ----
-                invariant [wb_img] cmd_en & cmd_wen ->
-                    wsel4(cmd_data, J) =
-                        img(high(cmd_addr),
-                            concatbv2(beat_of(low(cmd_addr)), J))
+                invariant [mk_st_line] c_st_en -> mk_g_hold & c_st_h = mk_g_line
+
+                invariant [mk_no_double] c_mk_ev ->
+                    ~ack_g_en & mk_g_hold & c_mk_ev_l = mk_g_line
+
+                invariant [mk_owns]
+                      ~(mk_g_hold & mk_g_line = H)
+                    & ~(ack_g_en & ack_g_dty & ack_g_line = H)
+                    -> ~cache_owns(H, O)
+
+                invariant [mk_clean_ack] ack_g_en & ~ack_g_dty ->
+                    ~cache_owns(ack_g_line, O)
+
+                # ---- the same fact one edge earlier, about the eviction
+                # that is being posted RIGHT NOW: the directory reads the
+                # channel-3 record after `cachemem` has written it, so on a
+                # posting edge `[mk_clean_ack]` is about the record that was
+                # there before.  A clean eviction surrenders a line nobody
+                # owns, and it never rides with a store. ----
+                invariant [mk_ev_clean] c_mk_ev & ~c_mk_ev_d ->
+                    ~cache_owns(c_mk_ev_l, O)
+                invariant [mk_ev_nost] c_mk_ev -> ~c_st_en
+
+                invariant [ack_img] ack_g_en & ack_g_dty ->
+                    lsel(ack_g_data, O) = img(ack_g_line, O)
             }
 
             implementation {
-                # ==========================================================
-                # The array.  One memory per former struct field, indexed
-                # by the packed (set, way) slot -- an RTLIL memory is
-                # one-dimensional and a struct sort has no bit width, so a
-                # array of records is a record of arrays.  The line's data
-                # is split into the two BEATS the memory port moves, which
-                # is the granularity a fill can write in one edge: a
-                # word-granular data array could not be filled at all,
-                # because eight writes on one edge collapse to one port.
-                #
-                # `set_lru` is ONE bit per set, not one per way.  Per way it
-                # took two writes to the same memory on every hit, which the
-                # translator merges into a single port -- silently keeping
-                # whichever came last.  With two ways the two bits were
-                # always complements, and only the way-1 bit was ever read.
-                # ==========================================================
-                var tag_occ(S : cache_slot) : bool
-                var tag_dty(S : cache_slot) : bool
-                var tag_ln(S : cache_slot)  : line
-                var set_lru(K : key)   : bit
-                var dat0(S : cache_slot)    : four_words
-                var dat1(S : cache_slot)    : four_words
+                # ---- the environment's choices ----
+                wire go_req   : bool
+                wire go_line  : line
+                wire go_excl  : bool
+                wire go_store : bool
+                wire go_off   : woffset
+                wire go_data  : word
+                wire go_evict : bool
 
-                # ---- the (set, way) view the invariants are written in.
-                # Plain defined functions, so `ivy_to_rtl` never sees them:
-                # it rejects an application of one in the datapath, and it
-                # does not look at an invariant. ----
-                function occupied(K : key, W : way) : bool
-                definition occupied(K, W) = tag_occ(cidx(K, W))
-                function dirty(K : key, W : way) : bool
-                definition dirty(K, W) = tag_dty(cidx(K, W))
-                function ltag(K : key, W : way) : line
-                definition ltag(K, W) = tag_ln(cidx(K, W))
-                function beat(K : key, W : way, B : bit) : four_words
-                definition beat(K, W, B) =
-                    (dat0(cidx(K, W)) if B = 0 else dat1(cidx(K, W)))
-                function val(K : key, W : way, O : woffset) : word
-                definition val(K, W, O) = wsel4(beat(K, W, beat_of(O)), boff2(O))
+                wire mk_idle : mkstate
+                wire mk_req  : mkstate
+                wire mk_wait : mkstate
+                definition mk_idle = 0
+                definition mk_req  = 1
+                definition mk_wait = 2
 
-                # ---- the two control encodings.  These were enumerated
-                # types; an enumeration has no bit width, so they are narrow
-                # bit vectors and the names are 0-ary wires.  A `wire` and
-                # not an `individual`: a 0-ary definition that is not a wire
-                # is emitted as a reference to a net nobody drives. ----
-                wire mshr_idle : mstate
-                wire mshr_req_lower : mstate
-                wire mshr_finished_lower : mstate
-                wire mshr_req_upper : mstate
-                wire mshr_drain : mstate
-                wire dp_resp : dphase
-                wire dp_wb_lo : dphase
-                wire dp_wb_hi : dphase
-                wire dp_fill : dphase
-                definition mshr_idle = 0
-                definition mshr_req_lower = 1
-                definition mshr_finished_lower = 2
-                definition mshr_req_upper = 3
-                definition mshr_drain = 4
-                definition dp_resp = 0
-                definition dp_wb_lo = 1
-                definition dp_wb_hi = 2
-                definition dp_fill = 3
+                # ---- the transaction ----
+                var mk_st : mkstate
+                var mk_bl : line
+                var mk_bx : bool
 
-                # ==========================================================
-                # The two MSHRs, as registers rather than as an array over
-                # `mshr_id`.  Three things force it, and each alone is
-                # decisive: `m_state` is written by the capture, by the
-                # command issue, by an allocation and by a fill on the same
-                # edge, and a memory has one write port per clock;
-                # `ld_rdy_r` is recomputed at the bottom of the edge out of
-                # state the edge has already moved, and reading an array
-                # after writing it in the same edge has no combinational
-                # meaning; and the fill buffer is written a beat at a time
-                # by the capture and a word at a time by `svc_head`.
-                #
-                # The proof still sees one array, through the accessors
-                # below -- but ONLY at the two literal indices.  Every
-                # invariant that used to quantify over `Id` is written out
-                # at 0 and 1 instead, and that is load-bearing rather than
-                # cosmetic: an accessor is an if-then-else on the index, so
-                # a quantified `Id` has no term for the solver to match on
-                # and every such invariant falls back on model-based
-                # instantiation.  With the array it was a clean trigger;
-                # with the registers `mem_img` stopped coming back at all.
-                #
-                # `mvline` is GHOST: the line the MSHR is evicting, recorded
-                # when the victim way is picked.  Metadata carried BESIDE
-                # the slot rather than read back out of it, which is what
-                # keeps the writeback proof inside the decidable fragment --
-                # naming the victim as `ltag(hash(m_base(Id)), ...)` under a
-                # quantifier sends the query from a line, through `hash`,
-                # into the array and back out to a line, which is the
-                # instantiation cycle `ivy_check` rejects.  It also outlives
-                # the fill that overwrites the slot.
-                #
-                # `m_wb0` is GHOST: the low beat of this MSHR's writeback
-                # has LANDED in memory, not merely been issued.
-                # ==========================================================
-                var s0_m_state : mstate
-                var s0_m_base : line
-                var s0_rq_valid : bool
-                var s0_rq_off : woffset
-                var s0_rq_wen : bool
-                var s0_rq_wdata : word
-                var s0_rq_idx : load_idx
-                var s0_mfb0 : four_words
-                var s0_mfb1 : four_words
-                var s0_m_dirty : bool
-                var s0_m_dphase : dphase
-                var s0_m_victim_way : way
-                var s0_mvline : line
-                var s0_m_wb0 : bool
-                var s1_m_state : mstate
-                var s1_m_base : line
-                var s1_rq_valid : bool
-                var s1_rq_off : woffset
-                var s1_rq_wen : bool
-                var s1_rq_wdata : word
-                var s1_rq_idx : load_idx
-                var s1_mfb0 : four_words
-                var s1_mfb1 : four_words
-                var s1_m_dirty : bool
-                var s1_m_dphase : dphase
-                var s1_m_victim_way : way
-                var s1_mvline : line
-                var s1_m_wb0 : bool
+                # ---- the one line of storage ----
+                var mk_v   : bool
+                var mk_l   : line
+                var mk_d   : cache_line
+                var mk_dty : bool
 
-                # ---- the input stage.  ALL requests pass through it: a
-                # request is latched here at the handshake and moves into
-                # the cache proper one edge later, when the stage-movable
-                # gate opens.  `ld_rdy_r` replaces the old full-quiescence
-                # `ready_r`: intake is sound iff the stage is empty or
-                # certainly drains this edge. ----
-                var p_valid : bool
-                var p_h     : line
-                var p_o     : woffset
-                var p_wen   : bool
-                var p_wdata : word
-                var p_idx   : load_idx
-                var ld_rdy_r : bool
+                # ---- this side's copy of the channel-3 slot ----
+                var mk_ae : bool
 
-                var port_used : bool
-
-                var ev_ans      : bool
-                var ev_ans_h    : line
-                var ev_ans_o    : woffset
-                var ev_ans_d    : word
-                var ev_ans_idx  : load_idx
-                var ev_cmd      : bool
-                var ev_cmd_wen  : bool
-                var ev_cmd_addr : addr
-                var ev_cmd_data : four_words
-
-                # ---- the array view of the MSHR registers, at the two
-                # literal indices only.  Same reason as the cache
-                # accessors: the invariants read better over an array, and
-                # a definition never reaches the netlist. ----
-                function m_state(Id : mshr_id) : mstate
-                definition m_state(Id) = (s0_m_state if Id = 0 else s1_m_state)
-                function m_base(Id : mshr_id) : line
-                definition m_base(Id) = (s0_m_base if Id = 0 else s1_m_base)
-                function rq_valid(Id : mshr_id) : bool
-                definition rq_valid(Id) = (s0_rq_valid if Id = 0 else s1_rq_valid)
-                function rq_off(Id : mshr_id) : woffset
-                definition rq_off(Id) = (s0_rq_off if Id = 0 else s1_rq_off)
-                function rq_wen(Id : mshr_id) : bool
-                definition rq_wen(Id) = (s0_rq_wen if Id = 0 else s1_rq_wen)
-                function rq_wdata(Id : mshr_id) : word
-                definition rq_wdata(Id) = (s0_rq_wdata if Id = 0 else s1_rq_wdata)
-                function rq_idx(Id : mshr_id) : load_idx
-                definition rq_idx(Id) = (s0_rq_idx if Id = 0 else s1_rq_idx)
-                function mfb0(Id : mshr_id) : four_words
-                definition mfb0(Id) = (s0_mfb0 if Id = 0 else s1_mfb0)
-                function mfb1(Id : mshr_id) : four_words
-                definition mfb1(Id) = (s0_mfb1 if Id = 0 else s1_mfb1)
-                function m_dirty(Id : mshr_id) : bool
-                definition m_dirty(Id) = (s0_m_dirty if Id = 0 else s1_m_dirty)
-                function m_dphase(Id : mshr_id) : dphase
-                definition m_dphase(Id) = (s0_m_dphase if Id = 0 else s1_m_dphase)
-                function m_victim_way(Id : mshr_id) : way
-                definition m_victim_way(Id) = (s0_m_victim_way if Id = 0 else s1_m_victim_way)
-                function mvline(Id : mshr_id) : line
-                definition mvline(Id) = (s0_mvline if Id = 0 else s1_mvline)
-                function m_wb0(Id : mshr_id) : bool
-                definition m_wb0(Id) = (s0_m_wb0 if Id = 0 else s1_m_wb0)
-                function m_beat(Id : mshr_id, B : bit) : four_words
-                definition m_beat(Id, B) = (mfb0(Id) if B = 0 else mfb1(Id))
-                function m_fbuf(Id : mshr_id, O : woffset) : word
-                definition m_fbuf(Id, O) = wsel4(m_beat(Id, beat_of(O)), boff2(O))
                 after init {
-                    tag_occ(S) := false;
-                    tag_dty(S) := false;
-                    tag_ln(S)  := 0;
-                    set_lru(K) := 0;
-                    dat0(S) := 0;
-                    dat1(S) := 0;
-                    s0_m_state := mshr_idle; s0_m_base := 0; s0_m_dirty := false;
-                    s0_m_dphase := dp_resp; s0_m_victim_way := 0;
-                    s0_mvline := 0; s0_m_wb0 := false;
-                    s0_mfb0 := 0; s0_mfb1 := 0;
-                    s0_rq_valid := false; s0_rq_off := 0; s0_rq_wen := false;
-                    s0_rq_wdata := 0; s0_rq_idx := 0;
-                    s1_m_state := mshr_idle; s1_m_base := 0; s1_m_dirty := false;
-                    s1_m_dphase := dp_resp; s1_m_victim_way := 0;
-                    s1_mvline := 0; s1_m_wb0 := false;
-                    s1_mfb0 := 0; s1_mfb1 := 0;
-                    s1_rq_valid := false; s1_rq_off := 0; s1_rq_wen := false;
-                    s1_rq_wdata := 0; s1_rq_idx := 0;
-                    p_valid := false; p_h := 0; p_o := 0;
-                    p_wen := false; p_wdata := 0; p_idx := 0;
-                    ld_rdy_r   := true;
-                    port_used  := false;
-                    ev_ans := false; ev_ans_h := 0; ev_ans_o := 0;
-                    ev_ans_d := 0; ev_ans_idx := 0;
-                    ev_cmd := false; ev_cmd_wen := false; ev_cmd_addr := 0;
-                    ev_cmd_data := 0;
+                    mk_st := 0; mk_bl := 0; mk_bx := false;
+                    mk_v := false; mk_l := 0; mk_d := 0; mk_dty := false;
+                    mk_ae := false;
                 }
 
-                relation evicting(Id : mshr_id)
-                definition evicting(Id) = (m_state(Id) = mshr_drain
-                    & (m_dphase(Id) = dp_wb_lo | m_dphase(Id) = dp_wb_hi | m_dphase(Id) = dp_fill))
+                definition req_en   = (mk_st = mk_req)
+                definition req_line = mk_bl
+                definition req_excl = mk_bx
 
-                # ---- the stage->cache gate, and it is where `img` moves.
-                # A staged request may enter the cache proper only when its
-                # line aliases no active MSHR, no MSHR is evicting, a free
-                # MSHR exists, and no answer is riding the response wire.
-                # This ONE predicate is the ready term (`ld_rdy_r`), the
-                # arbiter guard, and -- because `img` moves at the drain --
-                # the guard on every image movement.  That alignment is why
-                # no data-half invariant needs a stage exception: a staged
-                # request has not yet touched `img`, and by the time it
-                # does, `~alias`/`~evicting` hold.  All register-to-register
-                # compares (`p_h` is a register).
-                #
-                # The `~cache_to_lsq_resp_valid` conjunct is needed because
-                # a store drain moves `img`, and `resp_img` is a statement
-                # about `img` NOW for an answer latched on a previous edge;
-                # this isolate cannot lean on LSQ ordering facts internally.
-                #
-                # A defined relation, so its application cannot appear in a
-                # wire definition or the datapath -- it is written out at
-                # its three uses there (`stage_go`, the arbiter, the
-                # `ld_rdy_r` recompute); this form is for the invariants
-                # below. ----
-                relation stage_movable
-                definition stage_movable = p_valid
-                    & ~(s0_m_state ~= mshr_idle & s0_m_base = p_h)
-                    & ~(s1_m_state ~= mshr_idle & s1_m_base = p_h)
-                    & ~evicting(0) & ~evicting(1)
-                    & (s0_m_state = mshr_idle | s1_m_state = mshr_idle)
-                    & ~cache_to_lsq_resp_valid
+                definition gr_taken = (mk_st = mk_wait) & c_gr_valid
+                    & c_gr_line = mk_bl
 
-                # ---- the output wires are driven by the registers that hold the
-                # cache's response and command ports ----
+                # ---- every observation wire is a function of THIS
+                # isolate's registers and the free `go_*` choices, and of
+                # nothing at `cachemem`.  That is deliberate: the records at
+                # `cachemem` are written by a monitor that runs before this
+                # one, so a guard phrased over `ack_g_en` would be read by
+                # `cachemem` at its old value and re-read here at its new
+                # one, and the two arms would disagree.  `mk_ae` is this
+                # side's copy of the channel-3 slot, and `[mk_ack_sync]`
+                # ties it to the record. ----
+                definition st_en = mk_v & go_store & ~mk_ae
+                definition st_h  = mk_l
+                definition st_o  = go_off
+                definition st_d  = go_data
 
-                # ---- `~ev_ans` is load-bearing twice.  It keeps `resp_img`
-                # true across a response's wire cycle -- an intake edge could
-                # otherwise stage-and-drain a store under an answer already
-                # on the wire -- and it means an intake edge always finds
-                # the response port free for a hit answer, so the stage
-                # really does drain on every intake edge.  The LSQ has to
-                # see the same signal, because it retires the store off its
-                # queue the moment it sees `creq_ready`; advertising a ready
-                # the cache would not honour let the LSQ advance `ctag` past
-                # a store the cache never took. ----
-                definition cache_to_lsq_creq_ready = ld_rdy_r & ~ev_ans
-
-                # ---- `stage_go`, written out: `p_valid & p_wen &
-                # <stage_movable>` -- a defined relation cannot be applied
-                # in a wire definition.  A wire is frozen at the pre-edge
-                # state, and the arbiter's own written-out copy of the gate
-                # agrees with it: between the edge top and the arbiter only
-                # `ev_ans` among the gate's inputs is written, and the gate
-                # reads it through the `cache_to_lsq_resp_valid` WIRE, so
-                # both see the pre-edge value. ----
-                definition stage_go = p_valid & p_wen
-                    & ~(s0_m_state ~= mshr_idle & s0_m_base = p_h)
-                    & ~(s1_m_state ~= mshr_idle & s1_m_base = p_h)
-                    & ~(s0_m_state = mshr_drain & (s0_m_dphase = dp_wb_lo | s0_m_dphase = dp_wb_hi | s0_m_dphase = dp_fill))
-                    & ~(s1_m_state = mshr_drain & (s1_m_dphase = dp_wb_lo | s1_m_dphase = dp_wb_hi | s1_m_dphase = dp_fill))
-                    & (s0_m_state = mshr_idle | s1_m_state = mshr_idle)
-                    & ~cache_to_lsq_resp_valid
-
-                definition cache_to_lsq_resp_valid = ev_ans
-                definition cache_to_lsq_resp_h     = ev_ans_h
-                definition cache_to_lsq_resp_o     = ev_ans_o
-                definition cache_to_lsq_resp_data  = ev_ans_d
-                definition cache_to_lsq_resp_idx   = ev_ans_idx
-
-                definition cmd_en   = ev_cmd
-                definition cmd_wen  = ev_cmd_wen
-                definition cmd_addr = ev_cmd_addr
-                definition cmd_data = ev_cmd_data
-
-                action enqueue_0(off : woffset, wen : bool, wd : word,
-                               lq_idx : load_idx) = {
-                    s0_rq_valid := true;
-                    s0_rq_off   := off;
-                    s0_rq_wen   := wen;
-                    s0_rq_wdata := wd;
-                    s0_rq_idx   := lq_idx;
-                }
-                action enqueue_1(off : woffset, wen : bool, wd : word,
-                               lq_idx : load_idx) = {
-                    s1_rq_valid := true;
-                    s1_rq_off   := off;
-                    s1_rq_wen   := wen;
-                    s1_rq_wdata := wd;
-                    s1_rq_idx   := lq_idx;
-                }
-
-                action svc_head_0 = {
-                    if s0_rq_wen {
-                        if hw_beat_of(s0_rq_off) = 0 {
-                            s0_mfb0 := hw_wins4(s0_mfb0, hw_boff2(s0_rq_off), s0_rq_wdata);
-                        } else {
-                            s0_mfb1 := hw_wins4(s0_mfb1, hw_boff2(s0_rq_off), s0_rq_wdata);
-                        };
-                        s0_m_dirty  := true;
-                        s0_rq_valid := false;
-                    } else {
-                        if ~port_used & ~cache_to_lsq_resp_valid {
-                            ev_ans       := true;
-                            ev_ans_h     := s0_m_base;
-                            ev_ans_o     := s0_rq_off;
-                            ev_ans_d     := hw_wsel4((s0_mfb0 if hw_beat_of(s0_rq_off) = 0
-                                                   else s0_mfb1), hw_boff2(s0_rq_off));
-                            ev_ans_idx   := s0_rq_idx;
-                            port_used    := true;
-                            s0_rq_valid := false;
-                        };
-                    };
-                }
-                action svc_head_1 = {
-                    if s1_rq_wen {
-                        if hw_beat_of(s1_rq_off) = 0 {
-                            s1_mfb0 := hw_wins4(s1_mfb0, hw_boff2(s1_rq_off), s1_rq_wdata);
-                        } else {
-                            s1_mfb1 := hw_wins4(s1_mfb1, hw_boff2(s1_rq_off), s1_rq_wdata);
-                        };
-                        s1_m_dirty  := true;
-                        s1_rq_valid := false;
-                    } else {
-                        if ~port_used & ~cache_to_lsq_resp_valid {
-                            ev_ans       := true;
-                            ev_ans_h     := s1_m_base;
-                            ev_ans_o     := s1_rq_off;
-                            ev_ans_d     := hw_wsel4((s1_mfb0 if hw_beat_of(s1_rq_off) = 0
-                                                   else s1_mfb1), hw_boff2(s1_rq_off));
-                            ev_ans_idx   := s1_rq_idx;
-                            port_used    := true;
-                            s1_rq_valid := false;
-                        };
-                    };
-                }
-
-                action do_fill_0 = {
-                    var vk   : key := hw_hash(s0_m_base);
-                    var vw   : way := s0_m_victim_way;
-                    var oway : way := 1;
-                    if vw = 1 { oway := 0; };
-                    tag_ln(hw_cidx(vk, vw))  := s0_m_base;
-                    dat0(hw_cidx(vk, vw)) := s0_mfb0;
-                    dat1(hw_cidx(vk, vw)) := s0_mfb1;
-                    tag_dty(hw_cidx(vk, vw)) := s0_m_dirty;
-                    tag_occ(hw_cidx(vk, vw)) := true;
-                    if vw = 1 { set_lru(vk) := 0; } else { set_lru(vk) := 1; };
-                    s0_m_state := mshr_idle;
-                }
-                action do_fill_1 = {
-                    var vk   : key := hw_hash(s1_m_base);
-                    var vw   : way := s1_m_victim_way;
-                    var oway : way := 1;
-                    if vw = 1 { oway := 0; };
-                    tag_ln(hw_cidx(vk, vw))  := s1_m_base;
-                    dat0(hw_cidx(vk, vw)) := s1_mfb0;
-                    dat1(hw_cidx(vk, vw)) := s1_mfb1;
-                    tag_dty(hw_cidx(vk, vw)) := s1_m_dirty;
-                    tag_occ(hw_cidx(vk, vw)) := true;
-                    if vw = 1 { set_lru(vk) := 0; } else { set_lru(vk) := 1; };
-                    s1_m_state := mshr_idle;
-                }
-
-                action drain0 = {
-                    if s0_m_state = mshr_drain {
-                        if s0_m_dphase = dp_resp {
-                            if s0_rq_valid {
-                                call svc_head_0;
-                            } else {
-                                var vw : way := 1;
-                                if set_lru(hw_hash(s0_m_base)) = 1 { vw := 0; };
-                                # ---- if the other MSHR is evicting from
-                                # this same set, take the way it did not ----
-                                if (s1_m_state = mshr_drain
-                                    & (s1_m_dphase = dp_wb_lo | s1_m_dphase = dp_wb_hi
-                                       | s1_m_dphase = dp_fill))
-                                   & hw_hash(s1_m_base) = hw_hash(s0_m_base) {
-                                    if s1_m_victim_way = 0 { vw := 1; } else { vw := 0; };
-                                };
-                                s0_m_victim_way := vw;
-                                s0_mvline := tag_ln(hw_cidx(hw_hash(s0_m_base), vw));
-                                s0_m_wb0 := false;
-                                if tag_occ(hw_cidx(hw_hash(s0_m_base), vw))
-                                   & tag_dty(hw_cidx(hw_hash(s0_m_base), vw)) {
-                                    s0_m_dphase := dp_wb_lo;
-                                } else {
-                                    call do_fill_0;
-                                };
-                            };
-                        } else { if s0_m_dphase = dp_fill {
-                            call do_fill_0;
-                        } };
-                    };
-                }
-
-                action drain1 = {
-                    if s1_m_state = mshr_drain {
-                        if s1_m_dphase = dp_resp {
-                            if s1_rq_valid {
-                                call svc_head_1;
-                            } else {
-                                var vw : way := 1;
-                                if set_lru(hw_hash(s1_m_base)) = 1 { vw := 0; };
-                                if (s0_m_state = mshr_drain
-                                    & (s0_m_dphase = dp_wb_lo | s0_m_dphase = dp_wb_hi
-                                       | s0_m_dphase = dp_fill))
-                                   & hw_hash(s0_m_base) = hw_hash(s1_m_base) {
-                                    if s0_m_victim_way = 0 { vw := 1; } else { vw := 0; };
-                                };
-                                s1_m_victim_way := vw;
-                                s1_mvline := tag_ln(hw_cidx(hw_hash(s1_m_base), vw));
-                                s1_m_wb0 := false;
-                                if tag_occ(hw_cidx(hw_hash(s1_m_base), vw))
-                                   & tag_dty(hw_cidx(hw_hash(s1_m_base), vw)) {
-                                    s1_m_dphase := dp_wb_lo;
-                                } else {
-                                    call do_fill_1;
-                                };
-                            };
-                        } else { if s1_m_dphase = dp_fill {
-                            call do_fill_1;
-                        } };
-                    };
-                }
-
-                action issue_wb_0(b : bit) = {
-                    var vk : key := hw_hash(s0_m_base);
-                    var vw : way := s0_m_victim_way;
-                    ev_cmd      := true;
-                    ev_cmd_wen  := true;
-                    ev_cmd_addr := hw_concatbv3(tag_ln(hw_cidx(vk, vw)), hw_concatbv2(b, 0));
-                    ev_cmd_data := (dat0(hw_cidx(vk, vw)) if b = 0 else dat1(hw_cidx(vk, vw)));
-                }
-                action issue_wb_1(b : bit) = {
-                    var vk : key := hw_hash(s1_m_base);
-                    var vw : way := s1_m_victim_way;
-                    ev_cmd      := true;
-                    ev_cmd_wen  := true;
-                    ev_cmd_addr := hw_concatbv3(tag_ln(hw_cidx(vk, vw)), hw_concatbv2(b, 0));
-                    ev_cmd_data := (dat0(hw_cidx(vk, vw)) if b = 0 else dat1(hw_cidx(vk, vw)));
-                }
-
-                action issue_rd_0(b : bit) = {
-                    ev_cmd      := true;
-                    ev_cmd_wen  := false;
-                    ev_cmd_addr := hw_concatbv3(s0_m_base, hw_concatbv2(b, 0));
-                    ev_cmd_data := 0;
-                }
-                action issue_rd_1(b : bit) = {
-                    ev_cmd      := true;
-                    ev_cmd_wen  := false;
-                    ev_cmd_addr := hw_concatbv3(s1_m_base, hw_concatbv2(b, 0));
-                    ev_cmd_data := 0;
-                }
-
-                # ---- the one intake path into the cache proper.  Runs on
-                # the STAGE's registered contents, guarded by the written-
-                # out stage-movable gate in the arbiter below.  The body is
-                # the old `serve_request` with `p_*` as the source and two
-                # changes: the final else-chain allocates the MSHR whose
-                # OWN state is idle -- under the gate one of them is, so
-                # the old unchecked `else` is closed by construction -- and
-                # the hit-read answer keeps the `~port_used &
-                # ~cache_to_lsq_resp_valid` guard shape from `svc_head`;
-                # under the gate it is always satisfied, but stating it
-                # keeps the single-writer discipline syntactic.  (The two
-                # alias arms are dead under the gate's `~alias` conjuncts
-                # -- an aliasing request stalls in the stage until the
-                # fetch completes -- but they keep the body total.) ----
-                action serve_stage = {
-                    var h  : line    := p_h;
-                    var o  : woffset := p_o;
-                    var wen : bool   := p_wen;
-                    var d  : word    := p_wdata;
-                    var lq_idx : load_idx := p_idx;
-                    var rs : key     := hw_hash(h);
-                    var hit  : bool  := false;
-                    var hway : way   := 1;
-                    p_valid := false;
-                    if tag_occ(hw_cidx(rs, 1)) & tag_ln(hw_cidx(rs, 1)) = h { hit:=true; hway:=1; }
-                    else { if tag_occ(hw_cidx(rs, 0)) & tag_ln(hw_cidx(rs, 0)) = h { hit:=true; hway:=0; } };
-                    if hit {
-                        if ~wen {
-                            if ~port_used & ~cache_to_lsq_resp_valid {
-                                ev_ans      := true;
-                                ev_ans_h    := h;
-                                ev_ans_o    := o;
-                                ev_ans_d    := hw_wsel4((dat0(hw_cidx(rs, hway)) if hw_beat_of(o) = 0
-                                                      else dat1(hw_cidx(rs, hway))), hw_boff2(o));
-                                ev_ans_idx  := lq_idx;
-                                port_used := true;
-                            };
-                        } else {
-                            if hw_beat_of(o) = 0 {
-                                dat0(hw_cidx(rs, hway)) := hw_wins4(dat0(hw_cidx(rs, hway)), hw_boff2(o), d);
-                            } else {
-                                dat1(hw_cidx(rs, hway)) := hw_wins4(dat1(hw_cidx(rs, hway)), hw_boff2(o), d);
-                            };
-                            tag_dty(hw_cidx(rs, hway))  := true;
-                        };
-                        if hway = 1 { set_lru(rs) := 0; } else { set_lru(rs) := 1; };
-                    } else {
-                        if s0_m_state ~= mshr_idle & s0_m_base = h {
-                            call enqueue_0(o, wen, d, lq_idx);
-                        } else { if s1_m_state ~= mshr_idle & s1_m_base = h {
-                            call enqueue_1(o, wen, d, lq_idx);
-                        } else { if s0_m_state = mshr_idle {
-                            s0_m_state  := mshr_req_lower;
-                            s0_m_base   := h;
-                            s0_m_dirty  := false;
-                            s0_m_dphase := dp_resp;
-                            call enqueue_0(o, wen, d, lq_idx);
-                        } else {
-                            s1_m_state  := mshr_req_lower;
-                            s1_m_base   := h;
-                            s1_m_dirty  := false;
-                            s1_m_dphase := dp_resp;
-                            call enqueue_1(o, wen, d, lq_idx);
-                        } } };
-                    };
-                }
-
-                action capture = {
-                    var a : addr := rsp_addr;
-                    var d : four_words := rsp_data;
-                    if s0_m_state = mshr_req_lower & a = hw_concatbv3(s0_m_base, hw_concatbv2(0,0)) {
-                        s0_mfb0 := d;
-                        s0_m_state := mshr_finished_lower;
-                    } else { if s0_m_state = mshr_req_upper & a = hw_concatbv3(s0_m_base, hw_concatbv2(1,0)) {
-                        s0_mfb1 := d;
-                        s0_m_state := mshr_drain;
-                        s0_m_dphase := dp_resp;
-                    } };
-                    if s1_m_state = mshr_req_lower & a = hw_concatbv3(s1_m_base, hw_concatbv2(0,0)) {
-                        s1_mfb0 := d;
-                        s1_m_state := mshr_finished_lower;
-                    } else { if s1_m_state = mshr_req_upper & a = hw_concatbv3(s1_m_base, hw_concatbv2(1,0)) {
-                        s1_mfb1 := d;
-                        s1_m_state := mshr_drain;
-                        s1_m_dphase := dp_resp;
-                    } };
-                }
+                # ---- store and eviction are mutually exclusive by
+                # construction, so the line and its dirty bit are the same
+                # here as they are when `cachemem`'s monitor reads them ----
+                definition mk_ev     = mk_v & go_evict & ~go_store & ~mk_ae
+                definition mk_ev_l   = mk_l
+                definition mk_ev_d   = mk_dty
+                definition mk_ev_dat = mk_d
 
                 after posedge {
+                    var ae0 : bool := mk_ae;
 
-                    # ---- GHOST.  The command presented on the last edge is
-                    # applied to memory on THIS one, so a writeback beat that
-                    # was on the wire has now landed.  Recorded here, at the
-                    # top of the edge, because the array entry it was read
-                    # out of may be overwritten by a fill before the second
-                    # beat is even issued. ----
-                    if ev_cmd & ev_cmd_wen & hw_beat_of(hw_low(ev_cmd_addr)) = 0 {
-                        if (s0_m_state = mshr_drain & (s0_m_dphase = dp_wb_lo | s0_m_dphase = dp_wb_hi | s0_m_dphase = dp_fill)) & s0_mvline = hw_high(ev_cmd_addr) {
-                            s0_m_wb0 := true;
-                        };
-                        if (s1_m_state = mshr_drain & (s1_m_dphase = dp_wb_lo | s1_m_dphase = dp_wb_hi | s1_m_dphase = dp_fill)) & s1_mvline = hw_high(ev_cmd_addr) {
-                            s1_m_wb0 := true;
-                        };
-                    };
-                    port_used := false;
-                    ev_ans   := false; ev_cmd := false;
-
-                    if rsp_valid {
-                        call capture;
+                    # ---- the store, FIRST, so it reads the same registers
+                    # `cachemem`'s image arm just read ----
+                    if mk_v & go_store & ~mk_ae {
+                        mk_d   := hw_lins(mk_d, go_off, go_data);
+                        mk_dty := true;
                     };
 
-                    if cmd_ready {
-                        if s0_m_state = mshr_drain & s0_m_dphase = dp_wb_lo {
-                            call issue_wb_0(0); s0_m_dphase := dp_wb_hi;
-                        } else { if s0_m_state = mshr_drain & s0_m_dphase = dp_wb_hi {
-                            call issue_wb_0(1); s0_m_dphase := dp_fill;
-                        } else { if s1_m_state = mshr_drain & s1_m_dphase = dp_wb_lo {
-                            call issue_wb_1(0); s1_m_dphase := dp_wb_hi;
-                        } else { if s1_m_state = mshr_drain & s1_m_dphase = dp_wb_hi {
-                            call issue_wb_1(1); s1_m_dphase := dp_fill;
-                        } else { if s0_m_state = mshr_req_lower {
-                            call issue_rd_0(0);
-                        } else { if s0_m_state = mshr_finished_lower {
-                            call issue_rd_0(1); s0_m_state := mshr_req_upper;
-                        } else { if s1_m_state = mshr_req_lower {
-                            call issue_rd_1(0);
-                        } else { if s1_m_state = mshr_finished_lower {
-                            call issue_rd_1(1); s1_m_state := mshr_req_upper;
-                        } } } } } } } };
+                    # ---- the eviction: the payload goes into the channel-3
+                    # record at `cachemem`, and the slot is taken here.
+                    # Before the retire arm, and off the PRE-edge slot, so
+                    # the two arms cannot cross. ----
+                    if mk_v & go_evict & ~go_store & ~mk_ae {
+                        mk_v  := false;
+                        mk_ae := true;
                     };
 
-                    # ---- the arbiter: the staged request moves when the
-                    # gate opens; a stalled stage must NOT block the drains,
-                    # which are what clear the blockage -- so no deadlock.
-                    # The arms are mutually exclusive per edge, and only
-                    # `serve_stage` and the drains' `svc_head` write
-                    # `ev_ans`, so the response port keeps one writer.
-                    # The gate is `stage_movable` written out; among its
-                    # inputs only `ev_ans` has been written since the edge
-                    # top, and it is read through the WIRE, so this copy
-                    # agrees with the pre-edge `stage_go`. ----
-                    if p_valid & ~(s0_m_state ~= mshr_idle & s0_m_base = p_h)
-                            & ~(s1_m_state ~= mshr_idle & s1_m_base = p_h)
-                            & ~(s0_m_state = mshr_drain & (s0_m_dphase = dp_wb_lo | s0_m_dphase = dp_wb_hi | s0_m_dphase = dp_fill))
-                            & ~(s1_m_state = mshr_drain & (s1_m_dphase = dp_wb_lo | s1_m_dphase = dp_wb_hi | s1_m_dphase = dp_fill))
-                            & (s0_m_state = mshr_idle | s1_m_state = mshr_idle)
-                            & ~cache_to_lsq_resp_valid {
-                        call serve_stage;
-                    } else { if s0_m_state = mshr_drain {
-                        call drain0;
-                    } else {
-                        call drain1;
-                    } };
-
-                    # ---- stage intake -- after the move, so a drain-and-
-                    # refill edge works; touches only stage registers, so it
-                    # composes with any arm above ----
-                    if lsq_to_cache_req_en & cache_to_lsq_creq_ready {
-                        p_valid := true;
-                        p_h := lsq_to_cache_req_h;      p_o := lsq_to_cache_req_o;
-                        p_wen := lsq_to_cache_req_wen;  p_wdata := lsq_to_cache_req_wdata;
-                        p_idx := lsq_to_cache_req_idx;
+                    if ae0 & c_ack_taken {
+                        mk_ae := false;
                     };
 
-                    # ---- the ready, recomputed over post-edge state: the
-                    # stage is empty, or it certainly drains next edge.
-                    # `~ev_ans` here is the REGISTER -- the post-edge value
-                    # is what the `cache_to_lsq_resp_valid` wire will carry
-                    # when the gate is next evaluated. ----
-                    ld_rdy_r := ~p_valid
-                        | (p_valid
-                           & ~(s0_m_state ~= mshr_idle & s0_m_base = p_h)
-                           & ~(s1_m_state ~= mshr_idle & s1_m_base = p_h)
-                           & ~(s0_m_state = mshr_drain & (s0_m_dphase = dp_wb_lo | s0_m_dphase = dp_wb_hi | s0_m_dphase = dp_fill))
-                           & ~(s1_m_state = mshr_drain & (s1_m_dphase = dp_wb_lo | s1_m_dphase = dp_wb_hi | s1_m_dphase = dp_fill))
-                           & (s0_m_state = mshr_idle | s1_m_state = mshr_idle)
-                           & ~ev_ans);
+                    # ---- channel 2 capture, then channel 1 handshake: in
+                    # this order a request cannot be issued and answered on
+                    # one edge ----
+                    if mk_st = mk_wait & c_gr_valid & c_gr_line = mk_bl {
+                        mk_v   := true;
+                        mk_l   := mk_bl;
+                        mk_d   := c_gr_data;
+                        mk_dty := false;
+                        mk_st  := mk_idle;
+                    };
+
+                    if mk_st = mk_req & c_req_taken {
+                        mk_st := mk_wait;
+                    };
+
+                    if mk_st = mk_idle & ~mk_v & ~mk_ae & go_req {
+                        mk_st := mk_req;
+                        mk_bl := go_line;
+                        mk_bx := go_excl;
+                    };
                 }
 
-                # ==========================================================
-                # 1.1  The MSHRs do not alias the cache.  A miss allocates an
-                # MSHR only when no way holds the line, an existing MSHR for
-                # the line is reused instead of allocating a second, and
-                # `do_fill` installs the line and retires the MSHR in the
-                # same step -- so an active MSHR's base is never resident.
-                # This is what lets the cache and the fill buffer be reasoned
-                # about separately: a line lives in exactly one of them.
-                # ==========================================================
+                # ---- the records at `cachemem` really are this client's
+                # holding and its ack.  Both move on `mk_ev` and on the grant
+                # capture, and `gr_taken` is defined to BE the capture
+                # condition, so the agreement is syntactic. ----
+                invariant [mk_sync] mk_g_hold = mk_v
+                invariant [mk_sync_l] mk_v -> mk_g_line = mk_l
+                invariant [mk_ack_sync] ack_g_en = mk_ae
 
-                # ---- split by the beat bit: each consecution query then
-                # carries a ground beat, halving the writeback-wire case
-                # product that made the single-goal form intractable once
-                # the full transition went live. ----
-                # ==========================================================
-                # The un-ownership bound, contrapositive form.  Together
-                # with `no_alias_*`/`mshr_distinct` ("a fetched line is
-                # resident nowhere and in no other MSHR") it gives the
-                # capture chain `~cache_owns` at a clean fetch's words
-                # directly -- no separate fetch invariant.  Three points of
-                # precision:
-                #   * "resident" is DIRTY-resident: a clean resident
-                #     line's words are already un-owned, and stay so when
-                #     a fill silently drops the line;
-                #   * "in the MSHR" means the MSHR holds NEWER data -- a
-                #     serviced write (`m_dirty`) or the pending write
-                #     word; a clean fetch does not own its line, which is
-                #     the point of the decomposition;
-                #   * the wire conjunct covers the one edge between a
-                #     victim's fill and its last beat landing
-                #     (`fill_wb0_*`/`ev_unowned_*` below carry the low
-                #     beat).
-                # The controller's `mc_owns_img` supplies
-                # `~cache_owns -> mmem = img`.
-                # ==========================================================
-                invariant [unowned]
-                      (forall K : key, W : way. ~(occupied(K, W)
-                            & dirty(K, W) & ltag(K, W) = H))
-                    & (m_state(0) = mshr_idle | m_base(0) ~= H
-                       | (~m_dirty(0)
-                          & ~(rq_valid(0) & rq_wen(0) & rq_off(0) = O)))
-                    & (m_state(1) = mshr_idle | m_base(1) ~= H
-                       | (~m_dirty(1)
-                          & ~(rq_valid(1) & rq_wen(1) & rq_off(1) = O)))
-                    & ~(ev_cmd & ev_cmd_wen & high(ev_cmd_addr) = H
-                        & beat_of(low(ev_cmd_addr)) = beat_of(O))
+                # ---- one line, one transaction: a client with a request
+                # outstanding holds nothing and has nothing in channel 3.
+                # This is what `mshr_distinct`/`no_alias` will supply in the
+                # real cache. ----
+                invariant [mk_one] (mk_st ~= mk_idle) -> ~mk_v & ~mk_ae
+                invariant [mk_ae_v] mk_ae -> ~mk_v
+
+                # ---- the resident copy is the image, and only a dirty copy
+                # can be owned: the local `[c_img]` and `[dirty_excl]`. ----
+                invariant [mk_img] mk_v -> lsel(mk_d, O) = img(mk_l, O)
+                invariant [mk_dty_owns] ~mk_dty & mk_v & mk_l = H
                     -> ~cache_owns(H, O)
-
-                # ---- the fill phase is only reached on the writeback path
-                # with the low beat already landed: entering `dp_fill`
-                # required `cmd_ready` for the high beat, and `rdy_idle`
-                # says the wire was empty -- the low beat was gone because
-                # it landed (`wb_wire_0`'s contrapositive). ----
-                invariant [fill_wb0_0] m_state(0) = mshr_drain
-                    & m_dphase(0) = dp_fill -> m_wb0(0)
-                invariant [fill_wb0_1] m_state(1) = mshr_drain
-                    & m_dphase(1) = dp_fill -> m_wb0(1)
-
-                # ---- once the victim's low beat has landed, its words are
-                # un-owned (the landing cleared them, and no store to the
-                # victim line can drain while the eviction is in flight) --
-                # the fact `owns_bound` needs at the fill edge, where the
-                # victim leaves the array while its high beat rides the
-                # wire. ----
-                invariant [ev_unowned_0] evicting(0) & m_wb0(0)
-                    & beat_of(O) = 0 -> ~cache_owns(mvline(0), O)
-                invariant [ev_unowned_1] evicting(1) & m_wb0(1)
-                    & beat_of(O) = 0 -> ~cache_owns(mvline(1), O)
-
-                # (no separate fetch-unownedness invariant: the capture
-                # chain derives `~cache_owns(m_base, O)` from `no_alias_*`,
-                # `mshr_distinct`, `fetch_clean_*` and `unowned` above.)
-
-                invariant [no_alias_0] m_state(0) ~= mshr_idle
-                    & occupied(K, W) -> ltag(K, W) ~= m_base(0)
-                invariant [no_alias_1] m_state(1) ~= mshr_idle
-                    & occupied(K, W) -> ltag(K, W) ~= m_base(1)
-
-                invariant [mshr_distinct] m_state(0) ~= mshr_idle
-                    & m_state(1) ~= mshr_idle ->
-                    m_base(0) ~= m_base(1)
-
-                # ---- a resident line sits in the set its tag hashes to, and
-                # the two ways of a set never hold the same line ----
-                invariant [c_set] occupied(K, W) -> hash(ltag(K, W)) = K
-                invariant [c_ways] occupied(K, 0) & occupied(K, 1) ->
-                    ltag(K, 0) ~= ltag(K, 1)
-
-                # ==========================================================
-                # The stage.  `ld_rdy_r` is recomputed at the end of every
-                # edge as "the stage is empty or certainly drains next
-                # edge", so an advertised ready is a promise the stage
-                # frees; `rdy_drain` in the specification above is the
-                # exported consequence, proved off that register directly --
-                # there is no read-back lemma in between.
-                #
-                # `stage_sync`: the impl stage and the spec's staged-store
-                # record move in lockstep -- latched off the same handshake,
-                # cleared by the same drain.  `stage_store` is what
-                # `lsq_body` can see; this is what makes it a faithful
-                # window onto the stage.
-                # ==========================================================
-
-                invariant [stage_sync] (p_valid & p_wen <-> stage_store)
-                    & (stage_store -> stage_h_g = p_h
-                                    & stage_o_g = p_o
-                                    & stage_d_g = p_wdata)
-                invariant [slot_active_0] rq_valid(0) ->
-                    m_state(0) ~= mshr_idle
-                invariant [slot_active_1] rq_valid(1) ->
-                    m_state(1) ~= mshr_idle
-
-                invariant [ev_empty_0] evicting(0) -> ~rq_valid(0)
-                invariant [ev_empty_1] evicting(1) -> ~rq_valid(1)
-
-                relation fetching(Id : mshr_id)
-                definition fetching(Id) = m_state(Id) = mshr_req_lower
-                    | m_state(Id) = mshr_finished_lower
-                    | m_state(Id) = mshr_req_upper
-
-                # ---- a fetch buffer is clean: `m_dirty` is cleared at
-                # allocation and only `svc_head` sets it, which runs in
-                # `mshr_drain`. ----
-                invariant [fetch_clean_0] fetching(0) -> ~m_dirty(0)
-                invariant [fetch_clean_1] fetching(1) -> ~m_dirty(1)
-
-                # ---- an evicting MSHR has a real victim, and two MSHRs
-                # evicting in the same set were given different ways by
-                # `drain_step`, so one's fill cannot move the other's
-                # victim. ----
-                invariant [ev_victim_0] evicting(0) ->
-                      occupied(hash(m_base(0)), m_victim_way(0))
-                    & dirty(hash(m_base(0)), m_victim_way(0))
-                invariant [ev_victim_1] evicting(1) ->
-                      occupied(hash(m_base(1)), m_victim_way(1))
-                    & dirty(hash(m_base(1)), m_victim_way(1))
-
-                invariant [ev_distinct] evicting(0) & evicting(1)
-                    & hash(m_base(0)) = hash(m_base(1)) ->
-                    m_victim_way(0) ~= m_victim_way(1)
-
-                # ==========================================================
-                # The DATA half: `new_proof.md` 1.2 and 1.4-1.6.
-                #
-                # Everything below is stated against `img`, the cache's
-                # array-consistent image, and `mc_body.mmem`, the
-                # controller's memory.  No invariant of this isolate
-                # names a tag or the trace: `lsq_body.img_ctag` -- one
-                # level up, where the trace is in scope -- is what says
-                # `img` really tracks the reference image, and this
-                # isolate only has to
-                # keep its array, its fill buffers and main memory
-                # consistent with that array.
-                #
-                # THE INDEXING IS THE PROOF.  Every statement that mentions
-                # `mmem` is quantified over a single `A : addr` and takes it
-                # apart with `high`/`low`; none is quantified over a line.
-                # That is what keeps the goals decidable.  Written the
-                # obvious way -- "no way of any set holds line H", for a
-                # universally quantified `H : line` -- the test is
-                # `ltag(hash(H), W) = H`, whose right-hand side is the
-                # quantified variable itself, and `ivy_check` rejects it
-                # outright: from H it builds `hash(H)`, indexes the array,
-                # reads a line back out and feeds it to `hash` again.  Over
-                # an address the same test reads `ltag(K, W) = high(A)`
-                # -- an equation between two TERMS, with the quantified
-                # variable under a function on both sides -- and the cycle
-                # never forms.
-                # ==========================================================
-
-                # ---- 1.2  a resident line is the reference image.  This is
-                # the invariant everything else exists to keep. ----
-                invariant [c_img] occupied(K, W) ->
-                    val(K, W, O) = img(ltag(K, W), O)
-
-                # ---- an unserviced write in a slot has ALREADY moved the
-                # image: `img` is written the instant the request is
-                # absorbed, and the datum only reaches the fill buffer later,
-                # in `svc_head`.  So the slot is the one place that still
-                # holds it. ----
-                invariant [slot_img_0] rq_valid(0) & rq_wen(0) ->
-                    rq_wdata(0) = img(m_base(0), rq_off(0))
-                invariant [slot_img_1] rq_valid(1) & rq_wen(1) ->
-                    rq_wdata(1) = img(m_base(1), rq_off(1))
-
-                # ---- which beats of a fill buffer have been captured ----
-                relation fb_lo(Id : mshr_id)
-                definition fb_lo(Id) = m_state(Id) = mshr_finished_lower
-                    | m_state(Id) = mshr_req_upper
-                    | m_state(Id) = mshr_drain
-                relation fb_hi(Id : mshr_id)
-                definition fb_hi(Id) = m_state(Id) = mshr_drain
-
-                # ---- ... and the one offset an unserviced write owns.  The
-                # fill buffer is a beat behind the image there, and stays so
-                # until `svc_head` replays the write into it. ----
-                relation fb_hole(Id : mshr_id, O : woffset)
-                definition fb_hole(Id, O) = rq_valid(Id)
-                    & rq_wen(Id) & rq_off(Id) = O
-
-                invariant [fbuf_img_0]
-                      ((fb_lo(0) & beat_of(O) = 0) | (fb_hi(0) & beat_of(O) = 1))
-                    & ~fb_hole(0, O)
-                    -> m_fbuf(0, O) = img(m_base(0), O)
-                invariant [fbuf_img_1]
-                      ((fb_lo(1) & beat_of(O) = 0) | (fb_hi(1) & beat_of(O) = 1))
-                    & ~fb_hole(1, O)
-                    -> m_fbuf(1, O) = img(m_base(1), O)
-
-                # ==========================================================
-                # Main memory and the image.
-                #
-                # `mem_img` is the whole content of `new_proof.md`'s
-                # `cache_owned`: main memory IS the reference image except
-                # where the cache holds something newer.  There are exactly
-                # three such places, and they are the three exceptions below
-                # -- a resident DIRTY line, a line an MSHR is holding, and
-                # the one beat of a writeback still travelling on the command
-                # wire.  No ghost ownership set is needed: the three tests
-                # read the state that actually makes memory stale.
-                #
-                # The third exception is not slack.  `drain_step` runs after
-                # the command issue in the same edge, so the fill that
-                # retires a victim happens on the SAME edge its last beat is
-                # put on the wire, one edge before that beat lands.  For that
-                # one edge the victim is in neither the array nor an MSHR and
-                # memory is still a beat behind.
-                # ==========================================================
-                # (mem_img is declared at the head of the invariant
-                # section, so its consecution check -- by far the heaviest
-                # -- runs first.)
-
-                # ---- 1.5  the converse, for the line an MSHR is working on:
-                # nothing the cache holds is newer than memory there, so what
-                # the controller answers with IS the image.  `~m_dirty` is
-                # the test: it is set exactly when `svc_head` replays a write
-                # into the fill buffer, which is the only way the MSHR can
-                # get ahead of memory.  Established at allocation out of
-                # `mem_img`, since a miss that allocates has just checked
-                # that no way holds the line and no MSHR owns it. ----
-                invariant [mshr_mem_0] m_state(0) ~= mshr_idle
-                    & ~m_dirty(0)
-                    & ~fb_hole(0, O)
-                    -> mc_body.mmem(m_base(0), O) = img(m_base(0), O)
-                invariant [mshr_mem_1] m_state(1) ~= mshr_idle
-                    & ~m_dirty(1)
-                    & ~fb_hole(1, O)
-                    -> mc_body.mmem(m_base(1), O) = img(m_base(1), O)
-
-                # ==========================================================
-                # 1.6  An eviction ships the image.
-                # ==========================================================
-
-                # ---- what is on the command wire is the image ----
-                # (`wb_cmd` moved to the specification as `wb_img`, stated
-                # over the command wires.)
-
-                # ---- the victim's low beat is either still on the wire or
-                # already in memory, and `m_wb0` says which.  A writeback is
-                # two beats and the fill retires the victim on the edge the
-                # second one is issued, so by then the FIRST has to be
-                # accounted for out of state that outlives it -- the array
-                # entry it came from is about to be overwritten. ----
-                invariant [wb_wire_0] evicting(0)
-                    & m_dphase(0) = dp_wb_hi & ~m_wb0(0) ->
-                      ev_cmd & ev_cmd_wen
-                    & high(ev_cmd_addr) = mvline(0)
-                    & beat_of(low(ev_cmd_addr)) = 0
-                invariant [wb_wire_1] evicting(1)
-                    & m_dphase(1) = dp_wb_hi & ~m_wb0(1) ->
-                      ev_cmd & ev_cmd_wen
-                    & high(ev_cmd_addr) = mvline(1)
-                    & beat_of(low(ev_cmd_addr)) = 0
-
-                # ---- in `dp_fill`, the victim's high beat is either still
-                # riding the wire or it has landed and its words are
-                # already un-owned.  The unconditional "it is riding" form
-                # was FALSE: the arbiter prefers `drain0`, so an MSHR can
-                # sit in `dp_fill` for edges while the OTHER victim's
-                # writeback occupies the wire -- its own beat long since
-                # landed (this was never checked before: `mem_img` sat
-                # ahead of it in goal order and hung every run). ----
-                invariant [wb_wire_hi_0] evicting(0)
-                    & m_dphase(0) = dp_fill
-                    & ~(ev_cmd & ev_cmd_wen
-                        & high(ev_cmd_addr) = mvline(0)
-                        & beat_of(low(ev_cmd_addr)) = 1)
-                    & beat_of(O) = 1
-                    -> ~cache_owns(mvline(0), O)
-                invariant [wb_wire_hi_1] evicting(1)
-                    & m_dphase(1) = dp_fill
-                    & ~(ev_cmd & ev_cmd_wen
-                        & high(ev_cmd_addr) = mvline(1)
-                        & beat_of(low(ev_cmd_addr)) = 1)
-                    & beat_of(O) = 1
-                    -> ~cache_owns(mvline(1), O)
-
-                # ---- the victim is a real, dirty, resident line and
-                # `mvline` names it ----
-                invariant [mv_ok_0] evicting(0) ->
-                    mvline(0) = ltag(hash(m_base(0)),
-                                            m_victim_way(0))
-                invariant [mv_ok_1] evicting(1) ->
-                    mvline(1) = ltag(hash(m_base(1)),
-                                            m_victim_way(1))
-
             }
 
-        } with this, mc_body, addr_thy, basis, data_impl
+        } with this, addr_thy, basis, data_impl
 
         isolate mc_body = {
 
-            # ---- cache command channel: the command comes from the cache, the
-            # ready is driven here ----
+            # ---- directory command channel: the command comes from the
+            # directory, the ready is driven here ----
             wire cmd_en    : bool
             wire cmd_wen   : bool
             wire cmd_addr  : addr
             wire cmd_data  : four_words
             wire cmd_ready : bool
 
-            # ---- cache response channel: all driven here ----
+            # ---- directory response channel: all driven here ----
             wire rsp_valid : bool
             wire rsp_addr  : addr
             wire rsp_data  : four_words
@@ -1476,27 +759,21 @@ export action posedge
             wire mem_rdata   : four_words
 
             # ==================================================================
-            # The controller.
+            # The controller.  UNCHANGED from the cache-driven version: same
+            # beat-granular port, same two-command buffer, same latency
+            # counter, same `mc_owns_img`.  Only the driver of the command
+            # wires is different, and `mc_owns_img` never named the driver --
+            # it needs `wb_img`, and `wb_img` now arrives from `dir_body`.
             #
-            # `mmem` is real hardware -- the DRAM behind the port -- but the
-            # cache is proved against it, so it lives in the specification
-            # where the cache can see it.  Everything else stays in the
-            # datapath.
+            # `mmem` is real hardware -- the DRAM behind the port -- but its
+            # client is proved against it, so it lives in the specification
+            # where that client can see it.
             #
             # The write is unbuffered and is applied from the command wires
             # alone: a command lands in memory on the edge the port carries
-            # it, one edge after the cache issued it.  The buffer below
-            # delays only the *response*, and the write is applied at the
-            # top of the edge, so a read never overtakes a write to the same
-            # beat.
-            #
-            # What the controller guarantees here is `mc_resp` alone: a
-            # response carries the *current* content of `mmem` at the
-            # address it echoes, not a stale snapshot.  Tying `mmem` back
-            # to the reference image -- `new_proof.md`'s
-            # `~cache_owned(A) -> memory(A) = st(current).mem(A)` -- is the
-            # next piece of work and is not done here; see the note at the
-            # head of `cachemem`.
+            # it, one edge after it was issued.  The buffer below delays only
+            # the *response*, and the write is applied at the top of the
+            # edge, so a read never overtakes a write to the same beat.
             # ==================================================================
             specification {
                 # The memory that the memory controller presents
@@ -1518,29 +795,22 @@ export action posedge
                                            & beat_of(O) = beat_of(low(cmd_addr)))
                                        else mmem(H, O));
                         # (the matching `cache_owns` CLEAR lives in
-                        # `cachemem`'s monitor, ahead of the drain arm, so
-                        # a same-edge drain-set wins)
+                        # `cachemem`'s monitor, ahead of the store arm, so
+                        # a same-edge store-set wins)
                     };
                 }
 
                 # ==========================================================
-                # The controller's half of the old `mem_img`: wherever the
-                # cache does not own the word, the DRAM is the reference
+                # Wherever nobody owns the word, the DRAM is the reference
                 # image.  Proven HERE, against the controller's own small
-                # transition.  What it needs of the cache is `wb_img` --
+                # transition.  What it needs of its client is `wb_img` --
                 # anything put on the command wire is accurate to `img` --
                 # and that arrives by IMPORT, through `with this`: `cachemem`
                 # presents its children's `specification` blocks, so
-                # `cache_body.wb_img` is a pre-state assumption here without
-                # `cache_body` being named below.  It is load-bearing: with
+                # `dir_body.wb_img` is a pre-state assumption here without
+                # `dir_body` being named below.  It is load-bearing: with
                 # `wb_img` moved into a `private` block this goal stops
                 # closing entirely.
-                #
-                # This replaced an `assume [a_wb_img]` that restated the same
-                # formula by hand over this side of the nets.  The assume was
-                # never needed -- the real fact was already being imported --
-                # and being an `assume` it was also handed to every other
-                # isolate in the file and discharged in none.
                 # ==========================================================
 
                 invariant [mc_owns_img] ~cache_owns(H, O) ->
@@ -1567,10 +837,10 @@ export action posedge
 
                 # ---- the port never accepts a command on the edge one is
                 # already travelling: `cmd_ready` implies the wire is idle.
-                # The cache needs this to know that a writeback beat it
+                # The directory needs this to know that a writeback beat it
                 # issued has already been applied by the time the port lets
                 # it issue the next one -- which is what makes the two beats
-                # of an eviction sequential rather than overlapping. ----
+                # of a writeback sequential rather than overlapping. ----
                 invariant [rdy_idle] cmd_ready -> ~cmd_en
 
             }
@@ -1655,43 +925,418 @@ export action posedge
 
         } with this, addr_thy, basis, data_impl
 
-        # ---- the LSQ-side channel, connected on both sides of this level.
-        # The port itself now goes nowhere -- the LSQ is not in this file --
-        # but the two sides must still be the SAME nets: `cachemem`'s ghost
-        # monitor latches `stage_store` off the request wires at THIS level,
-        # and `cache_body.stage_sync` couples that record to the impl stage
-        # it fills.  Leave them unconnected and the monitor is driven by
-        # wires the cache cannot see, so `stage_sync` is not inductive. ----
-        definition cache_body.lsq_to_cache_req_en    = lsq_to_cache_req_en
-        definition cache_body.lsq_to_cache_req_h     = lsq_to_cache_req_h
-        definition cache_body.lsq_to_cache_req_o     = lsq_to_cache_req_o
-        definition cache_body.lsq_to_cache_req_wen   = lsq_to_cache_req_wen
-        definition cache_body.lsq_to_cache_req_wdata = lsq_to_cache_req_wdata
-        definition cache_body.lsq_to_cache_req_idx   = lsq_to_cache_req_idx
+        # ==================================================================
+        # The directory.
+        #
+        # It owns no data: a grant is answered out of DRAM (decision 4) and a
+        # dirty ack is pushed to DRAM before anything reads the line again
+        # (decision 3).  So the whole of it is a request register, a two-beat
+        # read ladder, and a two-beat writeback sequencer sharing one command
+        # port -- writebacks first, because a writeback is what unblocks the
+        # client, and because a read must never overtake the write it is
+        # waiting for.
+        #
+        # Blocking, single slot everywhere (decision 2): one request start to
+        # finish, one grant in channel 2, one ack in channel 3.
+        # ==================================================================
+        isolate dir_body = {
 
-        # ---- the cache-to-LSQ direction, aliased at the bare level so that
-        # `cachemem`'s side of each net is the SAME symbol as
-        # `cache_body`'s.  `cache_to_lsq_creq_ready` is the one the monitor
-        # reads; the rest are the response port, kept whole so the channel
-        # is not half-wired. ----
-        definition cache_to_lsq_creq_ready = cache_body.cache_to_lsq_creq_ready
-        definition cache_to_lsq_resp_valid = cache_body.cache_to_lsq_resp_valid
-        definition cache_to_lsq_resp_h     = cache_body.cache_to_lsq_resp_h
-        definition cache_to_lsq_resp_o     = cache_body.cache_to_lsq_resp_o
-        definition cache_to_lsq_resp_data  = cache_body.cache_to_lsq_resp_data
-        definition cache_to_lsq_resp_idx   = cache_body.cache_to_lsq_resp_idx
+            # ---- the ports this directory DRIVES on the client side.  Its
+            # client-side inputs are the `c_*` nets and the channel-3 record,
+            # read directly. ----
+            wire req_taken : bool
+            wire gr_valid  : bool
+            wire gr_excl   : bool
+            wire gr_line   : line
+            wire gr_data   : cache_line
+            wire ack_taken : bool
 
-        # ---- the cache's command port drives the memory controller's ----
-        definition mc_body.cmd_en    = cache_body.cmd_en
-        definition mc_body.cmd_wen   = cache_body.cmd_wen
-        definition mc_body.cmd_addr  = cache_body.cmd_addr
-        definition mc_body.cmd_data  = cache_body.cmd_data
+            # ---- memory command channel: the command is driven here, the
+            # ready comes from the memory controller ----
+            wire cmd_en    : bool
+            wire cmd_wen   : bool
+            wire cmd_addr  : addr
+            wire cmd_data  : four_words
+            wire cmd_ready : bool
 
-        # ---- the memory controller's response port drives the cache's ----
-        definition cache_body.cmd_ready = mc_body.cmd_ready
-        definition cache_body.rsp_valid = mc_body.rsp_valid
-        definition cache_body.rsp_addr  = mc_body.rsp_addr
-        definition cache_body.rsp_data  = mc_body.rsp_data
+            # ---- memory response channel: all driven by the controller ----
+            wire rsp_valid : bool
+            wire rsp_addr  : addr
+            wire rsp_data  : four_words
+
+            # ==============================================================
+            # The contract.
+            #
+            # `dir` is the image the directory and the controller jointly
+            # present to the client.  The directory keeps no data array, so
+            # it IS the controller's memory -- and that identity is the
+            # content of decisions 3 and 4, not a shortcut: if a dirty ack
+            # could be answered out of the directory instead of round-
+            # tripping DRAM, `dir` would need a case for it and every data
+            # invariant downstream would grow one too.
+            #
+            # `[grant_img_*]` is the client-facing guarantee: whatever comes
+            # back on channel 2 is the image.  It is stated per BEAT rather
+            # than at an arbitrary offset so that `p_lpack_lo`/`p_lpack_hi`
+            # fire on it directly; at a free offset the goal has to go
+            # through `p_cover` first and stops closing.
+            #
+            # `[wb_img]` is the controller-facing one, and `mc_body` proves
+            # `mc_owns_img` from it -- by IMPORT, through `with this`,
+            # exactly as it did from the cache's `wb_img` before.
+            #
+            # `[wb_done]` is the one fact that flows the other way across the
+            # client seam: an ack is not retired until its data is in DRAM,
+            # so the client may drop the line from its ownership books the
+            # edge it sees `c_ack_taken`.
+            # ==============================================================
+            specification {
+                function dir(H : line, O : woffset) : word
+                definition dir(H, O) = mc_body.mmem(H, O)
+
+                invariant [dir_img] ~cache_owns(H, O) -> dir(H, O) = img(H, O)
+
+                invariant [grant_img_lo] c_gr_valid ->
+                    lsel(c_gr_data, concatbv2(0, J)) = img(c_gr_line, concatbv2(0, J))
+                invariant [grant_img_hi] c_gr_valid ->
+                    lsel(c_gr_data, concatbv2(1, J)) = img(c_gr_line, concatbv2(1, J))
+
+                invariant [wb_img] cmd_en & cmd_wen ->
+                    wsel4(cmd_data, J) =
+                        img(high(cmd_addr),
+                            concatbv2(beat_of(low(cmd_addr)), J))
+
+                invariant [wb_done] c_ack_taken -> ~cache_owns(ack_g_line, O)
+            }
+
+            implementation {
+                wire d_idle   : dstate
+                wire d_rd_lo  : dstate
+                wire d_rdw_lo : dstate
+                wire d_rd_hi  : dstate
+                wire d_rdw_hi : dstate
+                wire d_grant  : dstate
+                wire d_gwt    : dstate
+                definition d_idle   = 0
+                definition d_rd_lo  = 1
+                definition d_rdw_lo = 2
+                definition d_rd_hi  = 3
+                definition d_rdw_hi = 4
+                definition d_grant  = 5
+                definition d_gwt    = 6
+
+                wire wb_idle : wbstate
+                wire wb_lo   : wbstate
+                wire wb_hi   : wbstate
+                wire wb_fin  : wbstate
+                wire wb_ret  : wbstate
+                definition wb_idle = 0
+                definition wb_lo   = 1
+                definition wb_hi   = 2
+                definition wb_fin  = 3
+                definition wb_ret  = 4
+
+                # ---- the current request ----
+                var dstate_r : dstate
+                var cr_line  : line
+                var cr_excl  : bool
+                var dfb_lo   : four_words
+                var dfb_hi   : four_words
+
+                # ---- channel 2's registers ----
+                var gr_v : bool
+                var gr_x : bool
+                var gr_l : line
+                var gr_d : cache_line
+
+                # ---- the writeback sequencer.  `wb_lo_done`/`wb_hi_done`
+                # are GHOST: the beat has LANDED in memory, not merely been
+                # issued.  Recorded at the top of the edge off the command
+                # wires, the same nets `cachemem`'s ownership clear is keyed
+                # on, so the two agree by construction. ----
+                var wb_st      : wbstate
+                var wb_line    : line
+                var wb_lo_done : bool
+                var wb_hi_done : bool
+
+                # ---- the command port's registers ----
+                var ev_cmd      : bool
+                var ev_cmd_wen  : bool
+                var ev_cmd_addr : addr
+                var ev_cmd_data : four_words
+
+                after init {
+                    dstate_r := 0; cr_line := 0; cr_excl := false;
+                    dfb_lo := 0; dfb_hi := 0;
+                    gr_v := false; gr_x := false; gr_l := 0; gr_d := 0;
+                    wb_st := 0; wb_line := 0;
+                    wb_lo_done := false; wb_hi_done := false;
+                    ev_cmd := false; ev_cmd_wen := false;
+                    ev_cmd_addr := 0; ev_cmd_data := 0;
+                }
+
+                definition gr_valid = gr_v
+                definition gr_excl  = gr_x
+                definition gr_line  = gr_l
+                definition gr_data  = gr_d
+
+                # ---- a request is taken the edge it is latched ----
+                definition req_taken = (dstate_r = d_idle) & c_req_en
+                    & (wb_st = wb_idle) & ~gr_v
+
+                # ---- an ack is retired when there is nothing left to do
+                # with it: EVERY ack goes through the sequencer, a clean one
+                # straight to `wb_ret` and a dirty one only once both its
+                # beats have landed.  Holding a dirty one that long is what
+                # makes the client's ownership books close without a second
+                # ghost on the client side; routing the clean one through the
+                # same state is what makes the retire pulse a function of
+                # this isolate's OWN register, so `[wb_done]` is a claim
+                # about state the directory can reason about after the edge
+                # rather than about the client's free wires. ----
+                definition ack_taken = (wb_st = wb_ret)
+
+                definition cmd_en   = ev_cmd
+                definition cmd_wen  = ev_cmd_wen
+                definition cmd_addr = ev_cmd_addr
+                definition cmd_data = ev_cmd_data
+
+                after posedge {
+                    # ---- GHOST.  The command presented on the last edge is
+                    # applied to memory on THIS one, so a writeback beat that
+                    # was on the wire has now landed. ----
+                    if ev_cmd & ev_cmd_wen & hw_high(ev_cmd_addr) = wb_line {
+                        if hw_beat_of(hw_low(ev_cmd_addr)) = 0 {
+                            wb_lo_done := true;
+                        } else {
+                            wb_hi_done := true;
+                        };
+                    };
+
+                    ev_cmd := false;
+
+                    # ---- channel 2 retires ----
+                    if gr_v & c_gr_taken {
+                        gr_v := false;
+                        if dstate_r = d_gwt {
+                            dstate_r := d_idle;
+                        };
+                    };
+
+                    # ---- the read ladder.  AHEAD of the command port, so the
+                    # state a response advances is the state the port then
+                    # issues from -- and so a command on the wire is never
+                    # left behind by a same-edge response, which is what
+                    # `[rd_cmd]` says. ----
+                    if rsp_valid & hw_high(rsp_addr) = cr_line {
+                        if dstate_r = d_rdw_lo & hw_beat_of(hw_low(rsp_addr)) = 0 {
+                            dfb_lo   := rsp_data;
+                            dstate_r := d_rd_hi;
+                        } else { if dstate_r = d_rdw_hi & hw_beat_of(hw_low(rsp_addr)) = 1 {
+                            dfb_hi   := rsp_data;
+                            dstate_r := d_grant;
+                        } };
+                    };
+
+                    # ---- the one command port.  Writeback beats first.
+                    # AHEAD of the channel-3 pickup below, so a beat is never
+                    # issued on the edge its ack was posted: `cachemem`'s
+                    # channel-3 record is written by a monitor that runs
+                    # before this one, and on that edge `[ack_img]` -- the
+                    # client's promise about the payload -- is a statement
+                    # about the PRE-edge record, which is not the one that
+                    # would go on the wire.  One edge later the record is
+                    # settled and the pre-state fact is the right one. ----
+                    if cmd_ready {
+                        if wb_st = wb_lo {
+                            ev_cmd      := true;
+                            ev_cmd_wen  := true;
+                            ev_cmd_addr := hw_concatbv3(wb_line, hw_concatbv2(0, 0));
+                            ev_cmd_data := hw_llo(ack_g_data);
+                            wb_st       := wb_hi;
+                        } else { if wb_st = wb_hi {
+                            ev_cmd      := true;
+                            ev_cmd_wen  := true;
+                            ev_cmd_addr := hw_concatbv3(wb_line, hw_concatbv2(1, 0));
+                            ev_cmd_data := hw_lhi(ack_g_data);
+                            wb_st       := wb_fin;
+                        } else { if dstate_r = d_rd_lo {
+                            ev_cmd      := true;
+                            ev_cmd_wen  := false;
+                            ev_cmd_addr := hw_concatbv3(cr_line, hw_concatbv2(0, 0));
+                            ev_cmd_data := 0;
+                            dstate_r    := d_rdw_lo;
+                        } else { if dstate_r = d_rd_hi {
+                            ev_cmd      := true;
+                            ev_cmd_wen  := false;
+                            ev_cmd_addr := hw_concatbv3(cr_line, hw_concatbv2(1, 0));
+                            ev_cmd_data := 0;
+                            dstate_r    := d_rdw_hi;
+                        } } } };
+                    };
+
+                    # ---- channel 3.  Pick a dirty ack up into the
+                    # sequencer, or finish with one whose beats have all
+                    # landed (`ack_taken` is high this edge). ----
+                    if wb_st = wb_idle {
+                        if ack_g_en {
+                            wb_line    := ack_g_line;
+                            wb_lo_done := false;
+                            wb_hi_done := false;
+                            if ack_g_dty {
+                                wb_st := wb_lo;
+                            } else {
+                                wb_st := wb_ret;
+                            };
+                        };
+                    } else { if wb_st = wb_fin & wb_lo_done & wb_hi_done {
+                        wb_st := wb_ret;
+                    } else { if wb_st = wb_ret {
+                        wb_st      := wb_idle;
+                        wb_lo_done := false;
+                        wb_hi_done := false;
+                    } } };
+
+                    # ---- the grant ----
+                    if dstate_r = d_grant {
+                        gr_v     := true;
+                        gr_x     := cr_excl;
+                        gr_l     := cr_line;
+                        gr_d     := hw_lpack(dfb_hi, dfb_lo);
+                        dstate_r := d_gwt;
+                    };
+
+                    # ---- pick a new request.  Last, so the slot a grant
+                    # freed this edge is not reused on the same edge. ----
+                    if dstate_r = d_idle & c_req_en & wb_st = wb_idle & ~gr_v
+                            & ~(mk_g_hold & mk_g_line = c_req_line) {
+                        cr_line  := c_req_line;
+                        cr_excl  := c_req_excl;
+                        dstate_r := d_rd_lo;
+                    };
+                }
+
+                # ==========================================================
+                # 2.1  Structure of the two sequencers.
+                # ==========================================================
+
+                # ---- a grant only ever rides channel 2 in the one state
+                # that put it there ----
+                invariant [d_gr_state] gr_v -> dstate_r = d_gwt
+                invariant [d_gwt_gr] dstate_r = d_gwt -> gr_v
+
+                # ---- the sequencer is running exactly while the ack it is
+                # running for is still in the channel ----
+                invariant [wb_ack] wb_st ~= wb_idle & wb_st ~= wb_ret ->
+                    ack_g_en & ack_g_dty & ack_g_line = wb_line
+
+                # ---- the retire state: the ack it is retiring is still in
+                # the record, and everything it carried is in DRAM.  These
+                # two ARE `[wb_done]`. ----
+                invariant [wb_ret_line] wb_st = wb_ret ->
+                    ack_g_en & ack_g_line = wb_line
+                invariant [wb_ret_clean] wb_st = wb_ret ->
+                    ~cache_owns(wb_line, O)
+
+                # ---- what is on the command wire, and for whom ----
+                invariant [wb_cmd] ev_cmd & ev_cmd_wen ->
+                    high(ev_cmd_addr) = wb_line
+                    & ((wb_st = wb_hi & beat_of(low(ev_cmd_addr)) = 0)
+                       | (wb_st = wb_fin & beat_of(low(ev_cmd_addr)) = 1))
+
+                # ---- which is what dates the two landing ghosts: the high
+                # beat is only ever on the wire out of `wb_fin` ----
+                invariant [wb_hi_late] wb_hi_done
+                    -> wb_st = wb_fin | wb_st = wb_ret
+                invariant [rd_cmd] ev_cmd & ~ev_cmd_wen ->
+                    (dstate_r = d_rdw_lo | dstate_r = d_rdw_hi)
+                    & high(ev_cmd_addr) = cr_line
+
+                # ==========================================================
+                # 2.2  The client is not sitting on the line being fetched.
+                #
+                # The record moves up only on `c_gr_valid & c_gr_taken`, and
+                # `c_gr_valid` is this isolate's own output, raised in
+                # `d_gwt` alone -- the edge the directory finishes.  So the
+                # client cannot acquire the line behind the directory's back,
+                # and `[mk_st_line]` then says no store can move `img` at
+                # `cr_line` while the request is in flight.  That is the
+                # whole argument behind `[rd_clean]` and `[dfb_img]`.
+                # ==========================================================
+                invariant [d_notheld] dstate_r ~= d_idle ->
+                    ~(mk_g_hold & mk_g_line = cr_line)
+
+                # ---- `[rd_clean]`: nothing owns the line under a request,
+                # from the edge it is picked to the edge it is granted. ----
+                invariant [rd_clean] dstate_r ~= d_idle ->
+                    ~cache_owns(cr_line, O)
+
+                # ==========================================================
+                # 2.3  The fetch buffers, and the grant they become.
+                # ==========================================================
+                invariant [dfb_img_lo]
+                    (dstate_r = d_rd_hi | dstate_r = d_rdw_hi
+                     | dstate_r = d_grant | dstate_r = d_gwt)
+                    -> wsel4(dfb_lo, J) = img(cr_line, concatbv2(0, J))
+                invariant [dfb_img_hi]
+                    (dstate_r = d_grant | dstate_r = d_gwt)
+                    -> wsel4(dfb_hi, J) = img(cr_line, concatbv2(1, J))
+                invariant [gr_of_cr] gr_v -> gr_l = cr_line
+
+                # ==========================================================
+                # 2.4  The writeback: what is in the sequencer, on the wire,
+                # and already in DRAM.
+                #
+                # `[wb_lo_clean]`/`[wb_hi_clean]` are the directory's half of
+                # the old `[unowned]` -- the beats between the client's ack
+                # and DRAM -- and they are what `[wb_done]` is assembled
+                # from.  Their preservation leans on `[mk_ack_idle]`: while
+                # the ack is in the channel the client holds nothing, so
+                # `[mk_st_line]` forbids a store that could re-own the line
+                # behind the landed beat.
+                # ==========================================================
+                invariant [wb_lo_clean] wb_lo_done & beat_of(O) = 0
+                    -> ~cache_owns(wb_line, O)
+                invariant [wb_hi_clean] wb_hi_done & beat_of(O) = 1
+                    -> ~cache_owns(wb_line, O)
+                invariant [wb_ghost_idle] wb_st = wb_idle
+                    -> ~wb_lo_done & ~wb_hi_done
+            }
+
+        } with this, mc_body, mock_body, addr_thy, basis, data_impl
+
+        # ---- each net aliased to the port that drives it, and to nothing
+        # else: the far side reads the net itself. ----
+        definition c_req_en    = mock_body.req_en
+        definition c_req_line  = mock_body.req_line
+        definition c_req_excl  = mock_body.req_excl
+        definition c_req_taken = dir_body.req_taken
+        definition c_gr_valid  = dir_body.gr_valid
+        definition c_gr_excl   = dir_body.gr_excl
+        definition c_gr_line   = dir_body.gr_line
+        definition c_gr_data   = dir_body.gr_data
+        definition c_gr_taken  = mock_body.gr_taken
+        definition c_ack_taken = dir_body.ack_taken
+        definition c_st_en     = mock_body.st_en
+        definition c_st_h      = mock_body.st_h
+        definition c_st_o      = mock_body.st_o
+        definition c_st_d      = mock_body.st_d
+        definition c_mk_ev     = mock_body.mk_ev
+        definition c_mk_ev_l   = mock_body.mk_ev_l
+        definition c_mk_ev_d   = mock_body.mk_ev_d
+        definition c_mk_ev_dat = mock_body.mk_ev_dat
+
+        # ---- the directory's command port drives the memory controller's ----
+        definition mc_body.cmd_en    = dir_body.cmd_en
+        definition mc_body.cmd_wen   = dir_body.cmd_wen
+        definition mc_body.cmd_addr  = dir_body.cmd_addr
+        definition mc_body.cmd_data  = dir_body.cmd_data
+
+        # ---- the memory controller's response port drives the directory's ----
+        definition dir_body.cmd_ready = mc_body.cmd_ready
+        definition dir_body.rsp_valid = mc_body.rsp_valid
+        definition dir_body.rsp_addr  = mc_body.rsp_addr
+        definition dir_body.rsp_data  = mc_body.rsp_data
 
         # ---- and the memory-side port on out ----
         definition mem_rd_en   = mc_body.mem_rd_en
