@@ -1,0 +1,415 @@
+#lang ivy1.8
+
+# ============================================================================
+# German's protocol + NON-SILENT EVICTION, + a single-address data ghost.
+#
+# A copy of `german.ivy` (kept intact) extended with the one protocol change
+# the RTL directory needs: a client may surrender a line it holds WITHOUT
+# having been asked, and the home consumes channel 3 UNCONDITIONALLY.  This
+# is what lets the concrete cache do exact directory tracking with no
+# back-invalidation flow: every eviction -- shared or exclusive, clean or
+# dirty -- is an `invalidateAck`.
+#
+# Deltas from `german.ivy`, each justified against the concrete design (the
+# abstract model is per-line; the concrete cache has 2 MSHRs but they are
+# `mshr_distinct`, so at most ONE transaction per line per client is live):
+#
+#   + voluntaryEvictRule           the eviction itself.
+#   * receiveInvalidateAckRule     guard `homeCurrentReqShared |
+#                                  homeCurrentReqExclusive` DROPPED; the
+#                                  home's ch3 arm is always on.  Clearing is
+#                                  idempotent (a stale ack finds the bit
+#                                  already clear) and `homeExclusiveGranted`
+#                                  is cleared only when the acking client is
+#                                  the owner -- unconditional clearing would
+#                                  drop a live owner's exclusivity on a
+#                                  stale ack.  It also retires
+#                                  `homeInvalidateList`, so the home never
+#                                  starts an invalidate it no longer needs.
+#   * grant{Shared,Exclusive}Rule  new guard `~invalidateAck(hc)`: do not
+#                                  grant to a client whose ack is still in
+#                                  the channel, or the grant's bit-set races
+#                                  the ack's bit-clear and the home loses a
+#                                  sharer.  One wire in RTL (`~ack_en(cr_cpu)`
+#                                  at `d_grant`); costs nothing, since a
+#                                  clean ack drains in one edge.
+#   + pending(C)                   ghost for "C's MSHR for this line is
+#                                  allocated".  `german.ivy` lets a client
+#                                  issue a second request while the first
+#                                  one's grant is still in the channel; with
+#                                  eviction in the model that state is
+#                                  poison (a client would hold a copy AND a
+#                                  grant, and evicting would put an ack and
+#                                  a grant in flight together).  The
+#                                  concrete cache cannot reach it -- one
+#                                  MSHR per line, `mshr_distinct` -- so the
+#                                  ghost simply says so.
+#
+# Invariants that WEAKEN (a stale invalidate -- one sent just before the
+# client's voluntary writeback was consumed -- outlives its request):
+#   - `invalidateAck(C) -> homeCurrentReq... & homeSharerList(C)
+#      & ~homeInvalidateList(C)`   only `~cacheShared/~cacheExclusive` left.
+#   - `invalidate(C) -> homeCurrentReq... & homeSharerList(C)`  deleted.
+#   - `invalidate(C) -> ~invalidateAck(C)`  deleted: ch2 and ch3 are
+#      independent, and the crossing of an inv with a writeback is exactly
+#      the race this extension has to absorb.
+#   - `homeExclusiveGranted & homeCurrentReq... & invalidateAck(C1)
+#      -> C1 = owner`  deleted (a stale ack comes from a non-owner).
+#
+# Invariant that STRENGTHENS -- the point of the whole exercise, and the
+# abstract rehearsal of `[d_exact]`:
+#   + `homeSharerList(C) ->` C holds the line, or a grant or an ack for it
+#     is in flight.  The home's picture is exact: a set bit always has a
+#     physical copy or an in-flight message behind it.
+#
+# The DATA GHOST (second half of the file) rehearses the phase 2/3 data
+# obligations on one address, where they are cheap: `[c_img]`, `[grant_img]`,
+# `[ack_img]`, `[mc_owns_img]` and -- the one that actually needs the
+# protocol -- `[rd_clean]`, the fact that memory is clean by the time the
+# home reads it to answer a grant.
+# ============================================================================
+
+type client
+type value
+
+
+var reqShared(C:client) : bool
+var reqExclusive(C:client) : bool
+var invalidate(C:client) : bool
+var grantShared(C:client) : bool
+var grantExclusive(C:client) : bool
+var invalidateAck(C:client) : bool
+var cacheShared(C:client) : bool
+var cacheExclusive(C:client) : bool
+var homeSharerList(C:client) : bool
+var homeInvalidateList(C:client) : bool
+var homeExclusiveGranted : bool
+var homeCurrentReqShared : bool
+var homeCurrentReqExclusive : bool
+var homeCurrentclient : client
+
+var owner : client
+
+# ---- ghost: C has an allocated MSHR for this line (requested, being
+# served, or its grant is in the channel).  Client-local. ----
+var pending(C:client) : bool
+
+# ==========================================================================
+# Data ghost, single address.
+#
+#   img       the coherent image: the value of the latest COMPLETED store.
+#   mmem      DRAM.
+#   cache_owns  DRAM is allowed to disagree with `img`, because a cache
+#             holds newer data or is shipping it.  Same meaning as the
+#             concrete `cache_owns(H, O)`.
+#   dirty_who witness for `cache_owns`: keeps the invariant quantifier-free
+#             (there is at most one dirty copy, so a witness is exact).
+#   cdata/cdirty  the client's copy and its dirtiness.
+#   gdata     grant payload riding channel 2.
+#   adata/adirty  ack payload riding channel 3, and whether it carries data.
+# ==========================================================================
+var img : value
+var mmem : value
+var cache_owns : bool
+var dirty_who : client
+var cdata(C:client) : value
+var cdirty(C:client) : bool
+var gdata(C:client) : value
+var adata(C:client) : value
+var adirty(C:client) : bool
+
+after init {
+    reqShared(C:client) := false;
+    reqExclusive(C:client) := false;
+    invalidate(C:client) := false;
+    grantShared(C:client) := false;
+    grantExclusive(C:client) := false;
+    invalidateAck(C:client) := false;
+    cacheShared(C:client) := false;
+    cacheExclusive(C:client) := false;
+    homeSharerList(C:client) := false;
+    homeInvalidateList(C:client) := false;
+    homeExclusiveGranted := false;
+    homeCurrentReqShared := false;
+    homeCurrentReqExclusive := false;
+    pending(C:client) := false;
+    cdirty(C:client) := false;
+    adirty(C:client) := false;
+    cache_owns := false;
+    mmem := img;
+}
+
+action reqSharedRule(cl:client) = {
+    require (~cacheShared(cl) & ~cacheExclusive(cl)) & (~reqShared(cl) & ~reqExclusive(cl))
+          & ~pending(cl);
+    reqShared(cl) := true;
+    pending(cl) := true;
+}
+
+action reqExclusiveRule(cl:client) = {
+    require (~cacheShared(cl) & ~cacheExclusive(cl)) & (~reqShared(cl) & ~reqExclusive(cl))
+          & ~pending(cl);
+    reqExclusive(cl) := true;
+    pending(cl) := true
+}
+
+action pickNewSharedRequestRule(cl:client) = {
+    require (~homeCurrentReqShared & ~homeCurrentReqExclusive) & reqShared(cl);
+    homeCurrentReqShared := true;
+    reqShared(cl) := false;
+    homeCurrentclient := cl;
+    homeInvalidateList(C) := homeSharerList(C);
+}
+
+action pickNewExclusiveRequestRule(cl:client) = {
+    require (~homeCurrentReqShared & ~homeCurrentReqExclusive) & reqExclusive(cl);
+    homeCurrentReqExclusive := true;
+    reqExclusive(cl) := false;
+    homeCurrentclient := cl;
+    homeInvalidateList(C) := homeSharerList(C);
+}
+
+# ---- the grant payload is read out of DRAM, which is the concrete
+# `d_rd_lo/d_rd_hi` fetch collapsed to one step.  `[rd_clean]` (below) is
+# what makes that read return `img`. ----
+action grantSharedRule = {
+    require
+        homeCurrentReqShared
+      & ~homeExclusiveGranted
+      & ~invalidate(homeCurrentclient)
+      & ~invalidateAck(homeCurrentclient)
+      & ~grantShared(homeCurrentclient)
+      & ~grantExclusive(homeCurrentclient);
+    homeSharerList(homeCurrentclient) := true;
+    homeCurrentReqShared := false;
+    grantShared(homeCurrentclient) := true;
+    gdata(homeCurrentclient) := mmem;
+}
+
+action grantExclusiveRule = {
+    require
+        homeCurrentReqExclusive
+      & ~invalidate(homeCurrentclient)
+      & ~invalidateAck(homeCurrentclient)
+      & ~grantShared(homeCurrentclient)
+      & ~grantExclusive(homeCurrentclient)
+      & forall I. ~homeSharerList(I);
+    homeSharerList(homeCurrentclient) := true;
+    homeCurrentReqExclusive := false;
+    homeExclusiveGranted := true;
+    grantExclusive(homeCurrentclient) := true;
+    gdata(homeCurrentclient) := mmem;
+    owner := homeCurrentclient; 
+}
+
+action sendInvalidateRule(cl:client) = {
+    require (~invalidate(cl) & ~grantShared(cl) & ~grantExclusive(cl)) & homeInvalidateList(cl)
+    & (homeCurrentReqExclusive | (homeCurrentReqShared & homeExclusiveGranted));
+    invalidate(cl) := true;
+    homeInvalidateList(cl) := false;
+}
+
+# ---- DELTA: the home's ch3 arm is always on.  No request needs to be in
+# progress, and the ack need not answer anything: it is equally the reply to
+# an invalidate, the reply to a stale invalidate (client holds nothing --
+# clearing an already-clear bit is a no-op) and a voluntary writeback.
+# A dirty ack lands in DRAM here; concretely that is the two-beat writeback
+# sequencer, and the ack is held in ch3 until its last beat is accepted, so
+# the one-step model is faithful. ----
+action receiveInvalidateAckRule(cl:client) = {
+    require invalidateAck(cl);
+    homeSharerList(cl) := false;
+    homeInvalidateList(cl) := false;
+    if cl = owner {
+        homeExclusiveGranted := false;
+    };
+    if adirty(cl) {
+        mmem := adata(cl);
+        cache_owns := false;
+    };
+    adirty(cl) := false;
+    invalidateAck(cl) := false;
+}
+
+action sharerInvalidatesCacheRule(cl:client) = {
+    require invalidate(cl) & ~invalidateAck(cl);
+    invalidate(cl) := false;
+    invalidateAck(cl) := true;
+    adata(cl) := cdata(cl);
+    adirty(cl) := cdirty(cl);
+    cacheShared(cl) := false;
+    cacheExclusive(cl) := false;
+    cdirty(cl) := false;
+}
+
+# ---- DELTA: non-silent eviction.  Same channel, same message, no request
+# from the home.  Guards are all client-local and all discharged in the
+# concrete cache: ch3 must be free (`~invalidateAck`); an outstanding
+# invalidate for this line is served by the invalidate arm instead, which has
+# ch3 priority (`~invalidate`); and a line being fetched is not resident, so
+# it cannot also be a victim (`~pending`, i.e. `no_alias`). ----
+action voluntaryEvictRule(cl:client) = {
+    require (cacheShared(cl) | cacheExclusive(cl))
+          & ~invalidateAck(cl)
+          & ~invalidate(cl)
+          & ~pending(cl);
+    cacheShared(cl) := false;
+    cacheExclusive(cl) := false;
+    adata(cl) := cdata(cl);
+    adirty(cl) := cdirty(cl);
+    cdirty(cl) := false;
+    invalidateAck(cl) := true;
+}
+
+action receiveSharedGrantRule(cl:client) = {
+    require grantShared(cl);
+    cacheShared(cl) := true;
+    grantShared(cl) := false;
+    cdata(cl) := gdata(cl);
+    cdirty(cl) := false;
+    pending(cl) := false;
+}
+
+action receiveExclusiveGrantRule(cl:client) = {
+    require grantExclusive(cl);
+    cacheExclusive(cl) := true;
+    grantExclusive(cl) := false;
+    cdata(cl) := gdata(cl);
+    cdirty(cl) := false;
+    pending(cl) := false;
+}
+
+# ---- the store commit: the ghost `img` moves HERE and nowhere else, and
+# ownership begins on the same edge.  Concretely this is `store_commit`. ----
+action storeRule(cl:client, v:value) = {
+    require cacheExclusive(cl);
+    cdata(cl) := v;
+    cdirty(cl) := true;
+    img := v;
+    cache_owns := true;
+    dirty_who := cl;
+}
+
+# ---- the load: the top-level data contract, `[resp_img]`. ----
+action loadRule(cl:client) = {
+    require cacheShared(cl) | cacheExclusive(cl);
+    ensure cdata(cl) = img;
+}
+
+private {
+    invariant forall C1. ~(invalidateAck(C1) & (grantShared(C1) | grantExclusive(C1)))
+    invariant forall C1. grantShared(C1) -> ~homeExclusiveGranted
+}
+
+invariant ~ (C ~= D & cacheExclusive(C) & (cacheExclusive(D) | cacheShared(D)))
+
+invariant forall C1. ~(reqShared(C1) & reqExclusive(C1))
+
+invariant forall C1. ~(invalidate(C1) & grantShared(C1))
+
+invariant forall C1. ~(invalidate(C1) & grantExclusive(C1))
+
+invariant forall C1. ~(grantShared(C1) & grantExclusive(C1))
+
+invariant forall C1. ~(cacheShared(C1) & cacheExclusive(C1))
+
+invariant ~(homeCurrentReqShared & homeCurrentReqExclusive)
+
+invariant (cacheShared(C) | grantShared(C)) -> homeSharerList(C) & ~homeExclusiveGranted
+
+invariant (cacheExclusive(C) | grantExclusive(C)) -> homeSharerList(C) & homeExclusiveGranted & C = owner
+
+invariant homeExclusiveGranted & homeSharerList(C) -> C = owner
+
+# ---- weakened: an ack surrenders the copy, and that is ALL it says now.
+# It may be a voluntary writeback (no request in progress), or the reply to
+# an invalidate whose sharer bit a writeback already cleared. ----
+invariant invalidateAck(C) -> ~(cacheShared(C) | cacheExclusive(C))
+
+# ---- exact tracking (rehearsal of `[d_exact]`): a set sharer bit always has
+# a copy or an in-flight message behind it.  This is what makes the
+# directory's entry accounting sound -- and, concretely, what bounds the
+# number of directory entries a client set can need. ----
+invariant homeSharerList(C) -> cacheShared(C) | cacheExclusive(C)
+                             | grantShared(C) | grantExclusive(C)
+                             | invalidateAck(C)
+
+invariant homeInvalidateList(C) -> homeSharerList(C)
+
+# ---- one transaction per client per line, and a client in a transaction
+# holds no copy of the line ("a line being filled is not resident"). ----
+invariant [pend_req] (reqShared(C) | reqExclusive(C)
+                      | grantShared(C) | grantExclusive(C)) -> pending(C)
+invariant [pend_home] (homeCurrentReqShared | homeCurrentReqExclusive)
+                      -> pending(homeCurrentclient)
+invariant [pend_nocopy] pending(C) -> ~cacheShared(C) & ~cacheExclusive(C)
+
+# ---- ... and the transaction is in exactly one place at a time: held on
+# ch1, latched in the home's current-request registers, or riding ch2 as a
+# grant.  This is what makes `pending` fall on the grant's arrival. ----
+invariant [pend_one_a] (reqShared(C) | reqExclusive(C))
+                       -> ~grantShared(C) & ~grantExclusive(C)
+invariant [pend_one_b] (reqShared(C) | reqExclusive(C))
+                       -> ~((homeCurrentReqShared | homeCurrentReqExclusive)
+                            & homeCurrentclient = C)
+invariant [pend_one_c] (grantShared(C) | grantExclusive(C))
+                       -> ~((homeCurrentReqShared | homeCurrentReqExclusive)
+                            & homeCurrentclient = C)
+
+# ==========================================================================
+# Data.
+# ==========================================================================
+
+# ---- only an exclusive copy can be dirty; concretely `[dirty_excl]`,
+# `tag_dty -> tag_exc`. ----
+invariant [dirty_excl] cdirty(C) -> cacheExclusive(C)
+
+# ---- a resident copy is the image; concretely `[c_img]`. ----
+invariant [c_img] (cacheShared(C) | cacheExclusive(C)) -> cdata(C) = img
+
+# ---- a grant in the channel carries the image; the ONE dir-facing data
+# fact the cache consumes.  Concretely `[grant_img]`. ----
+invariant [grant_img] (grantShared(C) | grantExclusive(C)) -> gdata(C) = img
+
+# ---- a dirty ack comes from the owner and its bit is still set: the home
+# has not yet consumed it, so the exclusivity that made the copy dirty is
+# still recorded.  This is what stops a stale (always clean) ack from being
+# confused with a writeback. ----
+invariant [ack_dirty] invalidateAck(C) & adirty(C)
+    -> homeSharerList(C) & homeExclusiveGranted & C = owner
+invariant [ack_idle] ~invalidateAck(C) -> ~adirty(C)
+
+# ---- a dirty ack carries the image; concretely `[ack_img]`, and the
+# `[wb_img]` obligation on the dir->mc command wires follows from it. ----
+invariant [ack_img] invalidateAck(C) & adirty(C) -> adata(C) = img
+
+# ---- `cache_owns` is witnessed: someone holds a dirty copy, or a dirty ack
+# is in the channel.  Concretely the two halves of `[unowned]`. ----
+invariant [owns_witness] cache_owns
+    -> cdirty(dirty_who) | (invalidateAck(dirty_who) & adirty(dirty_who))
+
+# ---- `[rd_clean]`: by the time the home reads DRAM to answer a request,
+# DRAM is the image.  Both grant rules discharge it out of these two:
+# grantShared has `~homeExclusiveGranted`, grantExclusive has every sharer
+# bit clear, and each contradicts ownership. ----
+invariant [owns_excl] cache_owns -> homeExclusiveGranted
+invariant [owns_sharer] cache_owns -> homeSharerList(owner)
+
+# ---- `[mc_owns_img]`, verbatim in meaning from the concrete file. ----
+invariant [mc_owns_img] ~cache_owns -> mmem = img
+
+
+export reqSharedRule
+export reqExclusiveRule
+export pickNewSharedRequestRule
+export pickNewExclusiveRequestRule
+export grantExclusiveRule
+export grantSharedRule
+export receiveSharedGrantRule
+export receiveExclusiveGrantRule
+export sendInvalidateRule
+export sharerInvalidatesCacheRule
+export receiveInvalidateAckRule
+export voluntaryEvictRule
+export storeRule
+export loadRule
