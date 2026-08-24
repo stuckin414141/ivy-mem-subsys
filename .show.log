@@ -1,0 +1,1036 @@
+type index
+type key
+type word
+type line
+type bit
+type bv2
+type store_idx
+type load_idx
+type four_words
+type addr
+type woffset
+type way
+type cslot
+type tag
+type trace.state_t
+relation index.succ(V0:index,V1:index)
+function pack4(V0:word,V1:word,V2:word,V3:word) : four_words
+function unp0(V0:four_words) : word
+function unp1(V0:four_words) : word
+function unp2(V0:four_words) : word
+function unp3(V0:four_words) : word
+function wsel4(V0:four_words,V1:bv2) : word
+function wins4(V0:four_words,V1:bv2,V2:word) : four_words
+function hw_pack4(V0:word,V1:word,V2:word,V3:word) : four_words
+function hw_unp0(V0:four_words) : word
+function hw_unp1(V0:four_words) : word
+function hw_unp2(V0:four_words) : word
+function hw_unp3(V0:four_words) : word
+function hw_wsel4(V0:four_words,V1:bv2) : word
+function hw_wins4(V0:four_words,V1:bv2,V2:word) : four_words
+function hw_concatbv3(V0:line,V1:woffset) : addr
+function hw_high(V0:addr) : line
+function hw_low(V0:addr) : woffset
+function hw_concatbv2(V0:bit,V1:bv2) : woffset
+function hw_beat_of(V0:woffset) : bit
+function hw_boff2(V0:woffset) : bv2
+function hw_hash(V0:line) : key
+function hw_cidx(V0:key,V1:way) : cslot
+function concatbv3(V0:line,V1:woffset) : addr
+function high(V0:addr) : line
+function low(V0:addr) : woffset
+function concatbv2(V0:bit,V1:bv2) : woffset
+function beat_of(V0:woffset) : bit
+function boff2(V0:woffset) : bv2
+function hash(V0:line) : key
+function cidx(V0:key,V1:way) : cslot
+relation tag.succ(V0:tag,V1:tag)
+relation op_wen(V0:tag)
+function op_h(V0:tag) : line
+function op_o(V0:tag) : woffset
+function op_addr(V0:tag) : addr
+function op_wdata(V0:tag) : word
+function init_mem(V0:addr) : word
+function init_img(V0:line,V1:woffset) : word
+function abs_memory.mem(V0:addr) : word
+individual abs_memory.mnow : tag
+function trace.mem(V0:trace.state_t,V1:addr) : word
+function trace.rdata(V0:trace.state_t) : word
+individual trace.now : tag
+individual trace.nxt : tag
+function trace.st(V0:tag) : trace.state_t
+relation trace.done(V0:tag)
+individual mem_subsys.lsq_body.cpu_to_lsq_req_addr : addr
+relation mem_subsys.lsq_body.cpu_to_lsq_req_wen
+individual mem_subsys.lsq_body.cpu_to_lsq_req_wdata : word
+relation mem_subsys.lsq_body.lsq_to_cpu_ready
+relation mem_subsys.lsq_body.cache_to_lsq_creq_ready
+relation mem_subsys.lsq_body.cache_to_lsq_resp_valid
+individual mem_subsys.lsq_body.cache_to_lsq_resp_h : line
+individual mem_subsys.lsq_body.cache_to_lsq_resp_o : woffset
+individual mem_subsys.lsq_body.cache_to_lsq_resp_data : word
+individual mem_subsys.lsq_body.cache_to_lsq_resp_idx : load_idx
+relation mem_subsys.lsq_body.ld_ans
+relation mem_subsys.lsq_body.st_go
+individual mem_subsys.lsq_body.ld_head : load_idx
+individual mem_subsys.lsq_body.ld_tail : load_idx
+individual mem_subsys.lsq_body.st_head : store_idx
+individual mem_subsys.lsq_body.st_tail : store_idx
+individual mem_subsys.lsq_body.current : tag
+individual mem_subsys.lsq_body.ctag : tag
+function mem_subsys.lsq_body.stag(V0:store_idx) : tag
+function mem_subsys.lsq_body.ltag(V0:load_idx) : tag
+individual mem_subsys.lsq_body.cpu_tag_r : tag
+function mem_subsys.lsq_body.store_addr(V0:store_idx) : addr
+function mem_subsys.lsq_body.store_data(V0:store_idx) : word
+function mem_subsys.lsq_body.store_mark(V0:store_idx) : load_idx
+individual mem_subsys.lsq_body.store_head : store_idx
+individual mem_subsys.lsq_body.store_tail : store_idx
+function mem_subsys.lsq_body.load_addr(V0:load_idx) : addr
+relation mem_subsys.lsq_body.load_rdy(V0:load_idx)
+function mem_subsys.lsq_body.load_data(V0:load_idx) : word
+function mem_subsys.lsq_body.load_mark(V0:load_idx) : store_idx
+individual mem_subsys.lsq_body.load_head : load_idx
+individual mem_subsys.lsq_body.load_tail : load_idx
+relation mem_subsys.lsq_body.req_en_r
+individual mem_subsys.lsq_body.req_addr_r : addr
+relation mem_subsys.lsq_body.req_wen_r
+individual mem_subsys.lsq_body.req_wdata_r : word
+individual mem_subsys.lsq_body.req_idx_r : load_idx
+relation mem_subsys.lsq_body.load_sent(V0:load_idx)
+relation mem_subsys.lsq_body.cpu_valid_r
+individual mem_subsys.lsq_body.cpu_addr_r : addr
+individual mem_subsys.lsq_body.cpu_data_r : word
+relation mem_subsys.lsq_body.cpu_ready_r
+relation mem_subsys.lsq_body.store_pending(V0:store_idx)
+relation mem_subsys.lsq_body.load_pending(V0:load_idx)
+relation mem_subsys.lsq_body.store_elig(V0:store_idx)
+relation mem_subsys.lsq_body.load_elig(V0:load_idx)
+relation mem_subsys.cachemem.lsq_to_cache_req_en
+individual mem_subsys.cachemem.lsq_to_cache_req_h : line
+individual mem_subsys.cachemem.lsq_to_cache_req_o : woffset
+relation mem_subsys.cachemem.lsq_to_cache_req_wen
+individual mem_subsys.cachemem.lsq_to_cache_req_wdata : word
+relation mem_subsys.cachemem.cache_to_lsq_creq_ready
+relation mem_subsys.cachemem.stage_go_s
+function mem_subsys.cachemem.img(V0:line,V1:woffset) : word
+relation mem_subsys.cachemem.stage_store
+individual mem_subsys.cachemem.stage_h_g : line
+individual mem_subsys.cachemem.stage_o_g : woffset
+individual mem_subsys.cachemem.stage_d_g : word
+relation mem_subsys.cachemem.mc_body.cmd_en
+relation mem_subsys.cachemem.mc_body.cmd_wen
+individual mem_subsys.cachemem.mc_body.cmd_addr : addr
+individual mem_subsys.cachemem.mc_body.cmd_data : four_words
+relation mem_subsys.cachemem.mc_body.mem_rd_en
+individual mem_subsys.cachemem.mc_body.mem_rd_addr : addr
+individual mem_subsys.cachemem.mc_body.mem_rdata : four_words
+function mem_subsys.cachemem.mc_body.mmem(V0:addr) : word
+
+schema [rec[nat]][rec[nat]] {
+    type q
+    function base(V0:nat) : q
+    function step(V0:q,V1:nat) : q
+    function fun(V0:nat) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[nat]][ind[nat]] {
+    relation p(V0:nat)
+    property [base] {
+        individual x : nat
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : nat
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[nat]][lep[nat]] {
+    individual n : nat
+    relation p(V0:nat)
+    property exists L. (L:nat >= n & (forall B. (B:nat >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[index]][rec[index]] {
+    type q
+    function base(V0:index) : q
+    function step(V0:q,V1:index) : q
+    function fun(V0:index) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[index]][ind[index]] {
+    relation p(V0:index)
+    property [base] {
+        individual x : index
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : index
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[index]][lep[index]] {
+    individual n : index
+    relation p(V0:index)
+    property exists L. (L:index >= n & (forall B. (B:index >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[key]][rec[key]] {
+    type q
+    function base(V0:key) : q
+    function step(V0:q,V1:key) : q
+    function fun(V0:key) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[key]][ind[key]] {
+    relation p(V0:key)
+    property [base] {
+        individual x : key
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : key
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[key]][lep[key]] {
+    individual n : key
+    relation p(V0:key)
+    property exists L. (L:key >= n & (forall B. (B:key >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[bit]][rec[bit]] {
+    type q
+    function base(V0:bit) : q
+    function step(V0:q,V1:bit) : q
+    function fun(V0:bit) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[bit]][ind[bit]] {
+    relation p(V0:bit)
+    property [base] {
+        individual x : bit
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : bit
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[bit]][lep[bit]] {
+    individual n : bit
+    relation p(V0:bit)
+    property exists L. (L:bit >= n & (forall B. (B:bit >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[bv2]][rec[bv2]] {
+    type q
+    function base(V0:bv2) : q
+    function step(V0:q,V1:bv2) : q
+    function fun(V0:bv2) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[bv2]][ind[bv2]] {
+    relation p(V0:bv2)
+    property [base] {
+        individual x : bv2
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : bv2
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[bv2]][lep[bv2]] {
+    individual n : bv2
+    relation p(V0:bv2)
+    property exists L. (L:bv2 >= n & (forall B. (B:bv2 >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[mshr_id]][rec[mshr_id]] {
+    type q
+    function base(V0:mshr_id) : q
+    function step(V0:q,V1:mshr_id) : q
+    function fun(V0:mshr_id) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[mshr_id]][ind[mshr_id]] {
+    relation p(V0:mshr_id)
+    property [base] {
+        individual x : mshr_id
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : mshr_id
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[mshr_id]][lep[mshr_id]] {
+    individual n : mshr_id
+    relation p(V0:mshr_id)
+    property exists L. (L:mshr_id >= n & (forall B. (B:mshr_id >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[store_idx]][rec[store_idx]] {
+    type q
+    function base(V0:store_idx) : q
+    function step(V0:q,V1:store_idx) : q
+    function fun(V0:store_idx) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[store_idx]][ind[store_idx]] {
+    relation p(V0:store_idx)
+    property [base] {
+        individual x : store_idx
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : store_idx
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[store_idx]][lep[store_idx]] {
+    individual n : store_idx
+    relation p(V0:store_idx)
+    property exists L. (L:store_idx >= n & (forall B. (B:store_idx >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[load_idx]][rec[load_idx]] {
+    type q
+    function base(V0:load_idx) : q
+    function step(V0:q,V1:load_idx) : q
+    function fun(V0:load_idx) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[load_idx]][ind[load_idx]] {
+    relation p(V0:load_idx)
+    property [base] {
+        individual x : load_idx
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : load_idx
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[load_idx]][lep[load_idx]] {
+    individual n : load_idx
+    relation p(V0:load_idx)
+    property exists L. (L:load_idx >= n & (forall B. (B:load_idx >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[cslot]][rec[cslot]] {
+    type q
+    function base(V0:cslot) : q
+    function step(V0:q,V1:cslot) : q
+    function fun(V0:cslot) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[cslot]][ind[cslot]] {
+    relation p(V0:cslot)
+    property [base] {
+        individual x : cslot
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : cslot
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[cslot]][lep[cslot]] {
+    individual n : cslot
+    relation p(V0:cslot)
+    property exists L. (L:cslot >= n & (forall B. (B:cslot >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[latency]][rec[latency]] {
+    type q
+    function base(V0:latency) : q
+    function step(V0:q,V1:latency) : q
+    function fun(V0:latency) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[latency]][ind[latency]] {
+    relation p(V0:latency)
+    property [base] {
+        individual x : latency
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : latency
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[latency]][lep[latency]] {
+    individual n : latency
+    relation p(V0:latency)
+    property exists L. (L:latency >= n & (forall B. (B:latency >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[mstate]][rec[mstate]] {
+    type q
+    function base(V0:mstate) : q
+    function step(V0:q,V1:mstate) : q
+    function fun(V0:mstate) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[mstate]][ind[mstate]] {
+    relation p(V0:mstate)
+    property [base] {
+        individual x : mstate
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : mstate
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[mstate]][lep[mstate]] {
+    individual n : mstate
+    relation p(V0:mstate)
+    property exists L. (L:mstate >= n & (forall B. (B:mstate >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[dphase]][rec[dphase]] {
+    type q
+    function base(V0:dphase) : q
+    function step(V0:q,V1:dphase) : q
+    function fun(V0:dphase) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[dphase]][ind[dphase]] {
+    relation p(V0:dphase)
+    property [base] {
+        individual x : dphase
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : dphase
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[dphase]][lep[dphase]] {
+    individual n : dphase
+    relation p(V0:dphase)
+    property exists L. (L:dphase >= n & (forall B. (B:dphase >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[word]][rec[word]] {
+    type q
+    function base(V0:word) : q
+    function step(V0:q,V1:word) : q
+    function fun(V0:word) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[word]][ind[word]] {
+    relation p(V0:word)
+    property [base] {
+        individual x : word
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : word
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[word]][lep[word]] {
+    individual n : word
+    relation p(V0:word)
+    property exists L. (L:word >= n & (forall B. (B:word >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[four_words]][rec[four_words]] {
+    type q
+    function base(V0:four_words) : q
+    function step(V0:q,V1:four_words) : q
+    function fun(V0:four_words) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[four_words]][ind[four_words]] {
+    relation p(V0:four_words)
+    property [base] {
+        individual x : four_words
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : four_words
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[four_words]][lep[four_words]] {
+    individual n : four_words
+    relation p(V0:four_words)
+    property exists L. (L:four_words >= n & (forall B. (B:four_words >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[tag]][rec[tag]] {
+    type q
+    function base(V0:tag) : q
+    function step(V0:q,V1:tag) : q
+    function fun(V0:tag) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[tag]][ind[tag]] {
+    relation p(V0:tag)
+    property [base] {
+        individual x : tag
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : tag
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[tag]][lep[tag]] {
+    individual n : tag
+    relation p(V0:tag)
+    property exists L. (L:tag >= n & (forall B. (B:tag >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[woffset]][rec[woffset]] {
+    type q
+    function base(V0:woffset) : q
+    function step(V0:q,V1:woffset) : q
+    function fun(V0:woffset) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[woffset]][ind[woffset]] {
+    relation p(V0:woffset)
+    property [base] {
+        individual x : woffset
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : woffset
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[woffset]][lep[woffset]] {
+    individual n : woffset
+    relation p(V0:woffset)
+    property exists L. (L:woffset >= n & (forall B. (B:woffset >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[way]][rec[way]] {
+    type q
+    function base(V0:way) : q
+    function step(V0:q,V1:way) : q
+    function fun(V0:way) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[way]][ind[way]] {
+    relation p(V0:way)
+    property [base] {
+        individual x : way
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : way
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[way]][lep[way]] {
+    individual n : way
+    relation p(V0:way)
+    property exists L. (L:way >= n & (forall B. (B:way >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[addr]][rec[addr]] {
+    type q
+    function base(V0:addr) : q
+    function step(V0:q,V1:addr) : q
+    function fun(V0:addr) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[addr]][ind[addr]] {
+    relation p(V0:addr)
+    property [base] {
+        individual x : addr
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : addr
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[addr]][lep[addr]] {
+    individual n : addr
+    relation p(V0:addr)
+    property exists L. (L:addr >= n & (forall B. (B:addr >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [rec[line]][rec[line]] {
+    type q
+    function base(V0:line) : q
+    function step(V0:q,V1:line) : q
+    function fun(V0:line) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[line]][ind[line]] {
+    relation p(V0:line)
+    property [base] {
+        individual x : line
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : line
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[line]][lep[line]] {
+    individual n : line
+    relation p(V0:line)
+    property exists L. (L:line >= n & (forall B. (B:line >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+schema [nat.range_t.constr][nat.range_t.constr] {
+    property exists Y. (nat.range_t.begin(Y) = X0 & nat.range_t.end(Y) = X1)
+}
+
+property [index.spec.prop23] index.succ(X,Z) -> (X < Z & ~(X < Y & Y < Z))
+property [index.spec.transitivity] (T:index < U & U < V) -> T < V
+property [index.spec.antisymmetry] ~(T:index < U & U < T)
+property [index.spec.totality] T:index < U | T = U | U < T
+property [index.spec.prop20] 0:index <= X
+property [data_impl.p_unp0] forall W1,W2,W3,W0. unp0(pack4(W3,W2,W1,W0)) = W0
+property [data_impl.p_unp1] forall W1,W2,W3,W0. unp1(pack4(W3,W2,W1,W0)) = W1
+property [data_impl.p_unp2] forall W1,W2,W3,W0. unp2(pack4(W3,W2,W1,W0)) = W2
+property [data_impl.p_unp3] forall W1,W2,W3,W0. unp3(pack4(W3,W2,W1,W0)) = W3
+property [data_impl.p_wsel0] forall M. wsel4(M,0) = unp0(M)
+property [data_impl.p_wsel1] forall M. wsel4(M,1) = unp1(M)
+property [data_impl.p_wsel2] forall M. wsel4(M,2) = unp2(M)
+property [data_impl.p_wsel3] forall M. wsel4(M,3) = unp3(M)
+property [data_impl.p_wins_hit] forall M,D,J. wsel4(wins4(M,J,D),J) = D
+property [data_impl.p_wins_miss] forall J2,M,D,J1. J1:bv2 ~= J2 -> wsel4(wins4(M,J1,D),J2) = wsel4(M,J2)
+property [data_impl.p_hw_pack4] forall W1,W2,W3,W0. hw_pack4(W3,W2,W1,W0) = pack4(W3,W2,W1,W0)
+property [data_impl.p_hw_unp0] forall M. hw_unp0(M) = unp0(M)
+property [data_impl.p_hw_unp1] forall M. hw_unp1(M) = unp1(M)
+property [data_impl.p_hw_unp2] forall M. hw_unp2(M) = unp2(M)
+property [data_impl.p_hw_unp3] forall M. hw_unp3(M) = unp3(M)
+property [data_impl.p_hw_wsel4] forall M,J. hw_wsel4(M,J) = wsel4(M,J)
+property [data_impl.p_hw_wins4] forall M,D,J. hw_wins4(M,J,D) = wins4(M,J,D)
+property [tag.spec.prop23] tag.succ(X,Z) -> (X < Z & ~(X < Y & Y < Z))
+property [tag.spec.transitivity] (T:tag < U & U < V) -> T < V
+property [tag.spec.antisymmetry] ~(T:tag < U & U < T)
+property [tag.spec.totality] T:tag < U | T = U | U < T
+property [tag.spec.prop20] 0:tag <= X
+property [addr_thy.p_way2] forall W. W:way = 0 | W = 1
+property [addr_thy.p_way_ne] 0:way ~= 1
+property [addr_thy.p_boff_beat] forall B,J. beat_of(concatbv2(B,J)) = B
+property [addr_thy.p_boff_word] forall B,J. boff2(concatbv2(B,J)) = J
+property [addr_thy.p_cover] forall O,B. beat_of(O) = B -> O = concatbv2(B,0) | O = concatbv2(B,1) | O = concatbv2(B,2) | O = concatbv2(B,3)
+property [addr_thy.p_full_inj] forall O1,H1,O2,H2. concatbv3(H1,O1) = concatbv3(H2,O2) -> (H1 = H2 & O1 = O2)
+property [addr_thy.p_highfull] forall O,H. high(concatbv3(H,O)) = H
+property [addr_thy.p_lowfull] forall O,H. low(concatbv3(H,O)) = O
+property [addr_thy.p_hw_high] forall A. hw_high(A) = high(A)
+property [addr_thy.p_hw_low] forall A. hw_low(A) = low(A)
+property [addr_thy.p_hw_cat3] forall O,H. hw_concatbv3(H,O) = concatbv3(H,O)
+property [addr_thy.p_hw_cat2] forall B,J. hw_concatbv2(B,J) = concatbv2(B,J)
+property [addr_thy.p_hw_beat] forall O. hw_beat_of(O) = beat_of(O)
+property [addr_thy.p_hw_boff] forall O. hw_boff2(O) = boff2(O)
+property [addr_thy.p_hw_hash] forall H. hw_hash(H) = hash(H)
+property [addr_thy.p_hw_cidx] forall W,K. hw_cidx(K,W) = cidx(K,W)
+property [addr_thy.p_initimg] forall O,H. init_img(H,O) = init_mem(concatbv3(H,O))
+invariant [mem_subsys.lsq_body.cur_le] mem_subsys.lsq_body.current <= mem_subsys.lsq_body.ctag
+invariant [mem_subsys.lsq_body.gap] trace.mem(trace.st(mem_subsys.lsq_body.ctag),A) = trace.mem(trace.st(mem_subsys.lsq_body.current),A)
+invariant [mem_subsys.lsq_body.img_ref] trace.mem(trace.st(mem_subsys.lsq_body.current),concatbv3(H,O)) = (mem_subsys.cachemem.stage_d_g if (mem_subsys.cachemem.stage_store & H = mem_subsys.cachemem.stage_h_g & O = mem_subsys.cachemem.stage_o_g) else mem_subsys.cachemem.img(H,O))
+invariant [mem_subsys.lsq_body.q_s] (mem_subsys.lsq_body.store_head <= mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_tail <= 4)
+invariant [mem_subsys.lsq_body.q_l] (mem_subsys.lsq_body.load_head <= mem_subsys.lsq_body.load_tail & mem_subsys.lsq_body.load_tail <= 4)
+invariant [mem_subsys.lsq_body.q_rdy] mem_subsys.lsq_body.cpu_ready_r -> (mem_subsys.lsq_body.store_tail < 4 & mem_subsys.lsq_body.load_tail < 4)
+invariant [mem_subsys.lsq_body.c_now] mem_subsys.lsq_body.ctag <= trace.now
+invariant [mem_subsys.lsq_body.s_range] mem_subsys.lsq_body.store_pending(J) -> (mem_subsys.lsq_body.ctag < mem_subsys.lsq_body.stag(J) & mem_subsys.lsq_body.stag(J) <= trace.now)
+invariant [mem_subsys.lsq_body.l_range] mem_subsys.lsq_body.load_pending(K) -> (0:tag < mem_subsys.lsq_body.ltag(K) & mem_subsys.lsq_body.ltag(K) <= trace.now)
+invariant [mem_subsys.lsq_body.l_front] (mem_subsys.lsq_body.load_pending(K) & ~mem_subsys.lsq_body.load_rdy(K) & ~mem_subsys.lsq_body.load_sent(K)) -> mem_subsys.lsq_body.ctag < mem_subsys.lsq_body.ltag(K)
+invariant [mem_subsys.lsq_body.s_kind] mem_subsys.lsq_body.store_pending(J) -> (op_wen(mem_subsys.lsq_body.stag(J)) & op_addr(mem_subsys.lsq_body.stag(J)) = mem_subsys.lsq_body.store_addr(J) & op_wdata(mem_subsys.lsq_body.stag(J)) = mem_subsys.lsq_body.store_data(J))
+invariant [mem_subsys.lsq_body.l_kind] mem_subsys.lsq_body.load_pending(K) -> (~op_wen(mem_subsys.lsq_body.ltag(K)) & op_addr(mem_subsys.lsq_body.ltag(K)) = mem_subsys.lsq_body.load_addr(K))
+invariant [mem_subsys.lsq_body.s_mono] (mem_subsys.lsq_body.store_pending(J1) & mem_subsys.lsq_body.store_pending(J2) & J1 < J2) -> mem_subsys.lsq_body.stag(J1) < mem_subsys.lsq_body.stag(J2)
+invariant [mem_subsys.lsq_body.l_mono] (mem_subsys.lsq_body.load_pending(K1) & mem_subsys.lsq_body.load_pending(K2) & K1 < K2) -> mem_subsys.lsq_body.ltag(K1) < mem_subsys.lsq_body.ltag(K2)
+invariant [mem_subsys.lsq_body.m_s] mem_subsys.lsq_body.store_pending(J) -> (mem_subsys.lsq_body.load_head <= mem_subsys.lsq_body.store_mark(J) & mem_subsys.lsq_body.store_mark(J) <= mem_subsys.lsq_body.load_tail)
+invariant [mem_subsys.lsq_body.m_l] mem_subsys.lsq_body.load_pending(K) -> (mem_subsys.lsq_body.store_head <= mem_subsys.lsq_body.load_mark(K) & mem_subsys.lsq_body.load_mark(K) <= mem_subsys.lsq_body.store_tail)
+invariant [mem_subsys.lsq_body.m_mono_s] (mem_subsys.lsq_body.store_pending(J1) & mem_subsys.lsq_body.store_pending(J2) & J1 <= J2) -> mem_subsys.lsq_body.store_mark(J1) <= mem_subsys.lsq_body.store_mark(J2)
+invariant [mem_subsys.lsq_body.m_mono_l] (mem_subsys.lsq_body.load_pending(K1) & mem_subsys.lsq_body.load_pending(K2) & K1 <= K2) -> mem_subsys.lsq_body.load_mark(K1) <= mem_subsys.lsq_body.load_mark(K2)
+invariant [mem_subsys.lsq_body.cross_s] (mem_subsys.lsq_body.store_pending(J) & mem_subsys.lsq_body.load_pending(K)) -> (mem_subsys.lsq_body.stag(J) < mem_subsys.lsq_body.ltag(K) <-> K >= mem_subsys.lsq_body.store_mark(J))
+invariant [mem_subsys.lsq_body.cross_l] (mem_subsys.lsq_body.store_pending(J) & mem_subsys.lsq_body.load_pending(K)) -> (mem_subsys.lsq_body.ltag(K) < mem_subsys.lsq_body.stag(J) <-> J >= mem_subsys.lsq_body.load_mark(K))
+invariant [mem_subsys.lsq_body.cov] mem_subsys.lsq_body.ctag < trace.now -> (mem_subsys.lsq_body.store_pending(mem_subsys.lsq_body.store_head) & tag.succ(mem_subsys.lsq_body.ctag,mem_subsys.lsq_body.stag(mem_subsys.lsq_body.store_head))) | (exists K. (mem_subsys.lsq_body.load_pending(K) & tag.succ(mem_subsys.lsq_body.ctag,mem_subsys.lsq_body.ltag(K))))
+invariant [mem_subsys.lsq_body.newest_s] (mem_subsys.lsq_body.store_pending(J) & J + 1 = mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_mark(J) = mem_subsys.lsq_body.load_tail) -> mem_subsys.lsq_body.stag(J) = trace.now
+invariant [mem_subsys.lsq_body.newest_l] (mem_subsys.lsq_body.load_pending(K) & K + 1 = mem_subsys.lsq_body.load_tail & mem_subsys.lsq_body.load_mark(K) = mem_subsys.lsq_body.store_tail) -> mem_subsys.lsq_body.ltag(K) = trace.now
+invariant [mem_subsys.lsq_body.nogap_ss] (mem_subsys.lsq_body.store_pending(J) & J + 1 < mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_mark(J + 1) = mem_subsys.lsq_body.store_mark(J)) -> tag.succ(mem_subsys.lsq_body.stag(J),mem_subsys.lsq_body.stag(J + 1))
+invariant [mem_subsys.lsq_body.nogap_sl] (mem_subsys.lsq_body.store_pending(J) & mem_subsys.lsq_body.store_mark(J) < mem_subsys.lsq_body.load_tail & (J + 1 >= mem_subsys.lsq_body.store_tail | mem_subsys.lsq_body.store_mark(J) < mem_subsys.lsq_body.store_mark(J + 1))) -> tag.succ(mem_subsys.lsq_body.stag(J),mem_subsys.lsq_body.ltag(mem_subsys.lsq_body.store_mark(J)))
+invariant [mem_subsys.lsq_body.nogap_s0] (mem_subsys.lsq_body.store_pending(J) & mem_subsys.lsq_body.stag(J) < trace.now) -> (J + 1 < mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_mark(J + 1) = mem_subsys.lsq_body.store_mark(J)) | mem_subsys.lsq_body.store_mark(J) < mem_subsys.lsq_body.load_tail
+invariant [mem_subsys.lsq_body.nogap_ll] (mem_subsys.lsq_body.load_pending(K) & K + 1 < mem_subsys.lsq_body.load_tail & mem_subsys.lsq_body.load_mark(K + 1) = mem_subsys.lsq_body.load_mark(K)) -> tag.succ(mem_subsys.lsq_body.ltag(K),mem_subsys.lsq_body.ltag(K + 1))
+invariant [mem_subsys.lsq_body.nogap_ls] (mem_subsys.lsq_body.load_pending(K) & mem_subsys.lsq_body.load_mark(K) < mem_subsys.lsq_body.store_tail & (K + 1 >= mem_subsys.lsq_body.load_tail | mem_subsys.lsq_body.load_mark(K) < mem_subsys.lsq_body.load_mark(K + 1))) -> tag.succ(mem_subsys.lsq_body.ltag(K),mem_subsys.lsq_body.stag(mem_subsys.lsq_body.load_mark(K)))
+invariant [mem_subsys.lsq_body.nogap_l0] (mem_subsys.lsq_body.load_pending(K) & mem_subsys.lsq_body.ltag(K) < trace.now) -> (K + 1 < mem_subsys.lsq_body.load_tail & mem_subsys.lsq_body.load_mark(K + 1) = mem_subsys.lsq_body.load_mark(K)) | mem_subsys.lsq_body.load_mark(K) < mem_subsys.lsq_body.store_tail
+invariant [mem_subsys.lsq_body.s_img] (mem_subsys.lsq_body.store_pending(J) & mem_subsys.lsq_body.store_head < J) -> trace.mem(trace.st(mem_subsys.lsq_body.stag(J)),A) = (mem_subsys.lsq_body.store_data(J) if (A = mem_subsys.lsq_body.store_addr(J)) else trace.mem(trace.st(mem_subsys.lsq_body.stag(J - 1)),A))
+invariant [mem_subsys.lsq_body.s_img0] mem_subsys.lsq_body.store_pending(mem_subsys.lsq_body.store_head) -> trace.mem(trace.st(mem_subsys.lsq_body.stag(mem_subsys.lsq_body.store_head)),A) = (mem_subsys.lsq_body.store_data(mem_subsys.lsq_body.store_head) if (A = mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head)) else trace.mem(trace.st(mem_subsys.lsq_body.ctag),A))
+invariant [mem_subsys.lsq_body.s_imgN] ((mem_subsys.lsq_body.store_head = mem_subsys.lsq_body.store_tail -> trace.mem(trace.st(trace.now),A) = trace.mem(trace.st(mem_subsys.lsq_body.ctag),A)) & (mem_subsys.lsq_body.store_head < mem_subsys.lsq_body.store_tail -> trace.mem(trace.st(trace.now),A) = trace.mem(trace.st(mem_subsys.lsq_body.stag(mem_subsys.lsq_body.store_tail - 1)),A)))
+invariant [mem_subsys.lsq_body.l_val] (mem_subsys.lsq_body.load_pending(K) & mem_subsys.lsq_body.load_rdy(K)) -> mem_subsys.lsq_body.load_data(K) = trace.rdata(trace.st(mem_subsys.lsq_body.ltag(K)))
+invariant [mem_subsys.lsq_body.l_gap] (mem_subsys.lsq_body.load_pending(K) & ~mem_subsys.lsq_body.load_rdy(K) & mem_subsys.lsq_body.store_pending(J) & J < mem_subsys.lsq_body.load_mark(K)) -> mem_subsys.lsq_body.store_addr(J) ~= mem_subsys.lsq_body.load_addr(K)
+invariant [mem_subsys.lsq_body.l_img] (mem_subsys.lsq_body.load_pending(K) & ~mem_subsys.lsq_body.load_rdy(K)) -> trace.mem(trace.st(mem_subsys.lsq_body.ltag(K)),mem_subsys.lsq_body.load_addr(K)) = trace.mem(trace.st(mem_subsys.lsq_body.ctag),mem_subsys.lsq_body.load_addr(K))
+invariant [mem_subsys.lsq_body.l_rdata] (mem_subsys.lsq_body.load_pending(K) & ~mem_subsys.lsq_body.load_rdy(K)) -> trace.rdata(trace.st(mem_subsys.lsq_body.ltag(K))) = trace.mem(trace.st(mem_subsys.lsq_body.ctag),mem_subsys.lsq_body.load_addr(K))
+invariant [mem_subsys.lsq_body.cur_lt] (mem_subsys.lsq_body.load_pending(K) & ~mem_subsys.lsq_body.load_rdy(K) & ~mem_subsys.lsq_body.load_sent(K)) -> mem_subsys.lsq_body.current < mem_subsys.lsq_body.ltag(K)
+invariant [mem_subsys.lsq_body.pres_s] (mem_subsys.lsq_body.req_en_r & mem_subsys.lsq_body.req_wen_r) -> (mem_subsys.lsq_body.store_pending(mem_subsys.lsq_body.store_head) & mem_subsys.lsq_body.store_elig(mem_subsys.lsq_body.store_head) & mem_subsys.lsq_body.req_addr_r = mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head) & mem_subsys.lsq_body.req_wdata_r = mem_subsys.lsq_body.store_data(mem_subsys.lsq_body.store_head))
+invariant [mem_subsys.lsq_body.pres_l] (mem_subsys.lsq_body.req_en_r & ~mem_subsys.lsq_body.req_wen_r) -> (mem_subsys.lsq_body.load_pending(mem_subsys.lsq_body.req_idx_r) & mem_subsys.lsq_body.req_addr_r = mem_subsys.lsq_body.load_addr(mem_subsys.lsq_body.req_idx_r) & mem_subsys.lsq_body.load_elig(mem_subsys.lsq_body.req_idx_r) & ~mem_subsys.lsq_body.load_rdy(mem_subsys.lsq_body.req_idx_r) & ~mem_subsys.lsq_body.load_sent(mem_subsys.lsq_body.req_idx_r))
+invariant [mem_subsys.lsq_body.sent_pend] mem_subsys.lsq_body.load_sent(K) -> mem_subsys.lsq_body.load_pending(K)
+invariant [mem_subsys.lsq_body.outst] (mem_subsys.lsq_body.load_pending(K) & mem_subsys.lsq_body.load_sent(K)) -> (mem_subsys.lsq_body.load_elig(K) & ~mem_subsys.lsq_body.load_rdy(K))
+invariant [mem_subsys.lsq_body.no_ld_st] (mem_subsys.lsq_body.load_pending(K) & mem_subsys.lsq_body.load_sent(K) & mem_subsys.cachemem.stage_store) -> ~(mem_subsys.cachemem.stage_h_g = high(mem_subsys.lsq_body.load_addr(K)) & mem_subsys.cachemem.stage_o_g = low(mem_subsys.lsq_body.load_addr(K)))
+invariant [mem_subsys.lsq_body.canary_stg] ~mem_subsys.cachemem.stage_store
+invariant [mem_subsys.lsq_body.resp] mem_subsys.lsq_body.cpu_valid_r -> (~op_wen(mem_subsys.lsq_body.cpu_tag_r) & mem_subsys.lsq_body.cpu_tag_r <= trace.now & mem_subsys.lsq_body.cpu_addr_r = op_addr(mem_subsys.lsq_body.cpu_tag_r) & mem_subsys.lsq_body.cpu_data_r = trace.rdata(trace.st(mem_subsys.lsq_body.cpu_tag_r)))
+invariant [mem_subsys.lsq_body.consistency] (mem_subsys.lsq_body.cpu_valid_r & mem_subsys.lsq_body.load_pending(K)) -> mem_subsys.lsq_body.cpu_tag_r < mem_subsys.lsq_body.ltag(K)
+definition [addr_thy.def126] concatbv2(B,J) = concat(B:bit,J)
+definition [addr_thy.def127] op_addr(T) = concatbv3(op_h(T),op_o(T))
+definition [addr_thy.def128] cidx(K,W) = concat(K:key,W)
+definition [trace.def147] trace.done(T) = (0:tag < T & T <= trace.now)
+definition [mem_subsys.def149] mem_subsys.cpu_req_addr = op_addr(trace.nxt)
+definition [mem_subsys.def150] mem_subsys.cpu_req_wen = op_wen(trace.nxt)
+definition [mem_subsys.def151] mem_subsys.cpu_req_wdata = op_wdata(trace.nxt)
+definition [mem_subsys.lsq_body.def156] mem_subsys.lsq_body.store_pending(J) = (mem_subsys.lsq_body.store_head <= J & J < mem_subsys.lsq_body.store_tail)
+definition [mem_subsys.lsq_body.def157] mem_subsys.lsq_body.load_pending(K) = (mem_subsys.lsq_body.load_head <= K & K < mem_subsys.lsq_body.load_tail)
+definition [mem_subsys.lsq_body.def158] mem_subsys.lsq_body.store_elig(J) = forall K. (mem_subsys.lsq_body.load_head <= K & K < mem_subsys.lsq_body.load_tail & K < mem_subsys.lsq_body.store_mark(J)) -> mem_subsys.lsq_body.load_rdy(K) | (mem_subsys.lsq_body.load_sent(K) & mem_subsys.lsq_body.load_addr(K) ~= mem_subsys.lsq_body.store_addr(J))
+definition [mem_subsys.lsq_body.def159] mem_subsys.lsq_body.load_elig(K) = mem_subsys.lsq_body.store_head >= mem_subsys.lsq_body.load_mark(K)
+definition [mem_subsys.lsq_body.def160] mem_subsys.lsq_body.lsq_to_cache_req_en = mem_subsys.lsq_body.req_en_r
+definition [mem_subsys.lsq_body.def161] mem_subsys.lsq_body.lsq_to_cache_req_h = hw_high(mem_subsys.lsq_body.req_addr_r)
+definition [mem_subsys.lsq_body.def162] mem_subsys.lsq_body.lsq_to_cache_req_o = hw_low(mem_subsys.lsq_body.req_addr_r)
+definition [mem_subsys.lsq_body.def163] mem_subsys.lsq_body.lsq_to_cache_req_wen = mem_subsys.lsq_body.req_wen_r
+definition [mem_subsys.lsq_body.def164] mem_subsys.lsq_body.lsq_to_cache_req_wdata = mem_subsys.lsq_body.req_wdata_r
+definition [mem_subsys.lsq_body.def169] mem_subsys.lsq_body.lsq_to_cpu_ready = mem_subsys.lsq_body.cpu_ready_r
+definition [mem_subsys.lsq_body.def170] mem_subsys.lsq_body.ld_ans = (mem_subsys.lsq_body.load_head < mem_subsys.lsq_body.load_tail & mem_subsys.lsq_body.store_head >= mem_subsys.lsq_body.load_mark(mem_subsys.lsq_body.load_head) & mem_subsys.lsq_body.load_rdy(mem_subsys.lsq_body.load_head))
+definition [mem_subsys.lsq_body.def171] mem_subsys.lsq_body.st_go = (mem_subsys.lsq_body.req_en_r & mem_subsys.lsq_body.cache_to_lsq_creq_ready & mem_subsys.lsq_body.req_wen_r)
+definition [mem_subsys.lsq_body.def172] mem_subsys.lsq_body.ld_head = mem_subsys.lsq_body.load_head
+definition [mem_subsys.lsq_body.def173] mem_subsys.lsq_body.ld_tail = mem_subsys.lsq_body.load_tail
+definition [mem_subsys.lsq_body.def174] mem_subsys.lsq_body.st_head = mem_subsys.lsq_body.store_head
+definition [mem_subsys.lsq_body.def175] mem_subsys.lsq_body.st_tail = mem_subsys.lsq_body.store_tail
+definition [mem_subsys.cachemem.def257] mem_subsys.cachemem.mc_body.cmd_en = mem_subsys.cachemem.cache_body.cmd_en
+definition [mem_subsys.cachemem.def258] mem_subsys.cachemem.mc_body.cmd_wen = mem_subsys.cachemem.cache_body.cmd_wen
+definition [mem_subsys.cachemem.def259] mem_subsys.cachemem.mc_body.cmd_addr = mem_subsys.cachemem.cache_body.cmd_addr
+definition [mem_subsys.cachemem.def260] mem_subsys.cachemem.mc_body.cmd_data = mem_subsys.cachemem.cache_body.cmd_data
+definition [mem_subsys.cachemem.def270] mem_subsys.cachemem.mc_body.mem_rdata = mem_subsys.cachemem.mem_rdata
+definition [mem_subsys.def271] mem_subsys.cachemem.lsq_to_cache_req_en = mem_subsys.lsq_body.lsq_to_cache_req_en
+definition [mem_subsys.def272] mem_subsys.cachemem.lsq_to_cache_req_h = mem_subsys.lsq_body.lsq_to_cache_req_h
+definition [mem_subsys.def273] mem_subsys.cachemem.lsq_to_cache_req_o = mem_subsys.lsq_body.lsq_to_cache_req_o
+definition [mem_subsys.def274] mem_subsys.cachemem.lsq_to_cache_req_wen = mem_subsys.lsq_body.lsq_to_cache_req_wen
+definition [mem_subsys.def275] mem_subsys.cachemem.lsq_to_cache_req_wdata = mem_subsys.lsq_body.lsq_to_cache_req_wdata
+definition [mem_subsys.def277] mem_subsys.lsq_body.cache_to_lsq_creq_ready = mem_subsys.cachemem.cache_to_lsq_creq_ready
+definition [mem_subsys.def278] mem_subsys.lsq_body.cache_to_lsq_resp_valid = mem_subsys.cachemem.cache_to_lsq_resp_valid
+definition [mem_subsys.def279] mem_subsys.lsq_body.cache_to_lsq_resp_h = mem_subsys.cachemem.cache_to_lsq_resp_h
+definition [mem_subsys.def280] mem_subsys.lsq_body.cache_to_lsq_resp_o = mem_subsys.cachemem.cache_to_lsq_resp_o
+definition [mem_subsys.def281] mem_subsys.lsq_body.cache_to_lsq_resp_data = mem_subsys.cachemem.cache_to_lsq_resp_data
+definition [mem_subsys.def282] mem_subsys.lsq_body.cache_to_lsq_resp_idx = mem_subsys.cachemem.cache_to_lsq_resp_idx
+definition [mem_subsys.def283] mem_subsys.lsq_body.cpu_to_lsq_req_addr = mem_subsys.cpu_req_addr
+definition [mem_subsys.def284] mem_subsys.lsq_body.cpu_to_lsq_req_wen = mem_subsys.cpu_req_wen
+definition [mem_subsys.def285] mem_subsys.lsq_body.cpu_to_lsq_req_wdata = mem_subsys.cpu_req_wdata
+definition [mem_subsys.def295] mem_subsys.cachemem.mem_rdata = mem_subsys.mem_rdata
+interp bit -> bv[1]
+interp bv2 -> bv[2]
+interp cslot -> bv[4]
+interp dphase -> bv[2]
+interp key -> bv[3]
+interp latency -> bv[4]
+interp load_idx -> bv[3]
+interp mshr_id -> bv[1]
+interp mstate -> bv[3]
+interp nat -> nat
+interp store_idx -> bv[3]
+interp way -> bv[1]
+interp woffset -> bv[3]
+
+after init {
+    {
+        abs_memory.mem(A) := init_mem(A);
+        abs_memory.mnow := 0:tag
+    }
+}
+after init {
+    {
+        trace.now := 0:tag;
+        call trace.nxt := ext:tag.next(trace.now);
+        trace.mem(trace.st(T),A) := init_mem(A)
+    }
+}
+after init {
+    {
+        mem_subsys.lsq_body.current := 0:tag;
+        mem_subsys.lsq_body.ctag := 0:tag
+    }
+}
+after init {
+    {
+        mem_subsys.lsq_body.store_head := 0:store_idx;
+        mem_subsys.lsq_body.store_tail := 0:store_idx;
+        mem_subsys.lsq_body.load_head := 0:load_idx;
+        mem_subsys.lsq_body.load_tail := 0:load_idx;
+        mem_subsys.lsq_body.store_mark(J) := 0:load_idx;
+        mem_subsys.lsq_body.load_mark(K) := 0:store_idx;
+        mem_subsys.lsq_body.load_rdy(K) := false;
+        mem_subsys.lsq_body.req_en_r := false;
+        mem_subsys.lsq_body.load_sent(K) := false;
+        mem_subsys.lsq_body.cpu_valid_r := false;
+        mem_subsys.lsq_body.cpu_ready_r := true
+    }
+}
+after init {
+    mem_subsys.cachemem.img(H,O) := init_img(H,O)
+}
+after init {
+    {
+        mem_subsys.cachemem.stage_store := false;
+        mem_subsys.cachemem.stage_h_g := 0:line;
+        mem_subsys.cachemem.stage_o_g := 0:woffset;
+        mem_subsys.cachemem.stage_d_g := 0:word
+    }
+}
+after init {
+    mem_subsys.cachemem.mc_body.mmem(A) := init_img(high(A),low(A))
+}
+action ext:tag.next(x:tag) returns(y:tag) = {
+    assume [tag.spec.asrt24] (x < y & (x < Y -> y <= Y));
+    assume [tag.spec.asrt25] tag.succ(x,y)
+}
+action posedge = {
+    {
+        assume [mem_subsys.lsq_body.a_rdy_drain] (mem_subsys.lsq_body.cache_to_lsq_creq_ready & mem_subsys.cachemem.stage_store) -> mem_subsys.cachemem.stage_go_s;
+        assume [mem_subsys.lsq_body.a_resp_img] mem_subsys.lsq_body.cache_to_lsq_resp_valid -> mem_subsys.lsq_body.cache_to_lsq_resp_data = mem_subsys.cachemem.img(mem_subsys.lsq_body.cache_to_lsq_resp_h,mem_subsys.lsq_body.cache_to_lsq_resp_o);
+        assume [mem_subsys.cachemem.mc_body.dram_read] mem_subsys.cachemem.mc_body.mem_rd_en -> (unp0(mem_subsys.cachemem.mc_body.mem_rdata) = mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.mem_rd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.mem_rd_addr)),0))) & unp1(mem_subsys.cachemem.mc_body.mem_rdata) = mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.mem_rd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.mem_rd_addr)),1))) & unp2(mem_subsys.cachemem.mc_body.mem_rdata) = mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.mem_rd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.mem_rd_addr)),2))) & unp3(mem_subsys.cachemem.mc_body.mem_rdata) = mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.mem_rd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.mem_rd_addr)),3))));
+        if mem_subsys.lsq_body.ld_ans {
+            mem_subsys.lsq_body.cpu_tag_r := mem_subsys.lsq_body.ltag(mem_subsys.lsq_body.ld_head);
+            if mem_subsys.lsq_body.ctag < mem_subsys.lsq_body.ltag(mem_subsys.lsq_body.ld_head) {
+                mem_subsys.lsq_body.ctag := mem_subsys.lsq_body.ltag(mem_subsys.lsq_body.ld_head)
+            }
+        };
+        if mem_subsys.lsq_body.st_go {
+            mem_subsys.lsq_body.current := mem_subsys.lsq_body.stag(mem_subsys.lsq_body.st_head)
+        };
+        if (mem_subsys.lsq_body.st_go & mem_subsys.lsq_body.ctag < mem_subsys.lsq_body.stag(mem_subsys.lsq_body.st_head)) {
+            mem_subsys.lsq_body.ctag := mem_subsys.lsq_body.stag(mem_subsys.lsq_body.st_head)
+        };
+        if mem_subsys.lsq_body.lsq_to_cpu_ready {
+            call trace.step;
+            if mem_subsys.lsq_body.cpu_to_lsq_req_wen {
+                mem_subsys.lsq_body.stag(mem_subsys.lsq_body.st_tail) := trace.now
+            }
+            else {
+                mem_subsys.lsq_body.ltag(mem_subsys.lsq_body.ld_tail) := trace.now
+            }
+        };
+        if (mem_subsys.lsq_body.store_head = mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.load_head = mem_subsys.lsq_body.load_tail) {
+            mem_subsys.lsq_body.store_head := 0:store_idx;
+            mem_subsys.lsq_body.store_tail := 0:store_idx;
+            mem_subsys.lsq_body.load_head := 0:load_idx;
+            mem_subsys.lsq_body.load_tail := 0:load_idx
+        };
+        mem_subsys.lsq_body.cpu_valid_r := false;
+        if mem_subsys.lsq_body.ld_ans {
+            mem_subsys.lsq_body.cpu_valid_r := true;
+            mem_subsys.lsq_body.cpu_addr_r := mem_subsys.lsq_body.load_addr(mem_subsys.lsq_body.load_head);
+            mem_subsys.lsq_body.cpu_data_r := mem_subsys.lsq_body.load_data(mem_subsys.lsq_body.load_head);
+            mem_subsys.lsq_body.load_head := mem_subsys.lsq_body.load_head + 1
+        };
+        if (mem_subsys.lsq_body.load_sent(0) & mem_subsys.lsq_body.load_head <= 0 & 0:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(0) & mem_subsys.lsq_body.cache_to_lsq_resp_valid & mem_subsys.lsq_body.cache_to_lsq_resp_idx = 0 & mem_subsys.lsq_body.cache_to_lsq_resp_h = hw_high(mem_subsys.lsq_body.load_addr(0)) & mem_subsys.lsq_body.cache_to_lsq_resp_o = hw_low(mem_subsys.lsq_body.load_addr(0))) {
+            mem_subsys.lsq_body.load_rdy(0) := true;
+            mem_subsys.lsq_body.load_data(0) := mem_subsys.lsq_body.cache_to_lsq_resp_data;
+            mem_subsys.lsq_body.load_sent(0) := false
+        };
+        if (mem_subsys.lsq_body.load_sent(1) & mem_subsys.lsq_body.load_head <= 1 & 1:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(1) & mem_subsys.lsq_body.cache_to_lsq_resp_valid & mem_subsys.lsq_body.cache_to_lsq_resp_idx = 1 & mem_subsys.lsq_body.cache_to_lsq_resp_h = hw_high(mem_subsys.lsq_body.load_addr(1)) & mem_subsys.lsq_body.cache_to_lsq_resp_o = hw_low(mem_subsys.lsq_body.load_addr(1))) {
+            mem_subsys.lsq_body.load_rdy(1) := true;
+            mem_subsys.lsq_body.load_data(1) := mem_subsys.lsq_body.cache_to_lsq_resp_data;
+            mem_subsys.lsq_body.load_sent(1) := false
+        };
+        if (mem_subsys.lsq_body.load_sent(2) & mem_subsys.lsq_body.load_head <= 2 & 2:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(2) & mem_subsys.lsq_body.cache_to_lsq_resp_valid & mem_subsys.lsq_body.cache_to_lsq_resp_idx = 2 & mem_subsys.lsq_body.cache_to_lsq_resp_h = hw_high(mem_subsys.lsq_body.load_addr(2)) & mem_subsys.lsq_body.cache_to_lsq_resp_o = hw_low(mem_subsys.lsq_body.load_addr(2))) {
+            mem_subsys.lsq_body.load_rdy(2) := true;
+            mem_subsys.lsq_body.load_data(2) := mem_subsys.lsq_body.cache_to_lsq_resp_data;
+            mem_subsys.lsq_body.load_sent(2) := false
+        };
+        if (mem_subsys.lsq_body.load_sent(3) & mem_subsys.lsq_body.load_head <= 3 & 3:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(3) & mem_subsys.lsq_body.cache_to_lsq_resp_valid & mem_subsys.lsq_body.cache_to_lsq_resp_idx = 3 & mem_subsys.lsq_body.cache_to_lsq_resp_h = hw_high(mem_subsys.lsq_body.load_addr(3)) & mem_subsys.lsq_body.cache_to_lsq_resp_o = hw_low(mem_subsys.lsq_body.load_addr(3))) {
+            mem_subsys.lsq_body.load_rdy(3) := true;
+            mem_subsys.lsq_body.load_data(3) := mem_subsys.lsq_body.cache_to_lsq_resp_data;
+            mem_subsys.lsq_body.load_sent(3) := false
+        };
+        if (mem_subsys.lsq_body.req_en_r & mem_subsys.lsq_body.cache_to_lsq_creq_ready) {
+            mem_subsys.lsq_body.req_en_r := false;
+            if mem_subsys.lsq_body.st_go {
+                mem_subsys.lsq_body.store_head := mem_subsys.lsq_body.store_head + 1
+            }
+            else {
+                mem_subsys.lsq_body.load_sent(mem_subsys.lsq_body.req_idx_r) := true
+            }
+        };
+        if ~mem_subsys.lsq_body.req_en_r {
+            local loc:lsel {
+                loc:lsel := false;
+                local loc:laddr {
+                    loc:laddr := 0:addr;
+                    local loc:lidx {
+                        loc:lidx := 0:load_idx;
+                        if (mem_subsys.lsq_body.load_head <= 3 & 3:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(3) & ~mem_subsys.lsq_body.load_sent(3) & mem_subsys.lsq_body.store_head >= mem_subsys.lsq_body.load_mark(3)) {
+                            loc:lsel := true;
+                            loc:laddr := mem_subsys.lsq_body.load_addr(3);
+                            loc:lidx := 3:load_idx
+                        };
+                        if (mem_subsys.lsq_body.load_head <= 2 & 2:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(2) & ~mem_subsys.lsq_body.load_sent(2) & mem_subsys.lsq_body.store_head >= mem_subsys.lsq_body.load_mark(2)) {
+                            loc:lsel := true;
+                            loc:laddr := mem_subsys.lsq_body.load_addr(2);
+                            loc:lidx := 2:load_idx
+                        };
+                        if (mem_subsys.lsq_body.load_head <= 1 & 1:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(1) & ~mem_subsys.lsq_body.load_sent(1) & mem_subsys.lsq_body.store_head >= mem_subsys.lsq_body.load_mark(1)) {
+                            loc:lsel := true;
+                            loc:laddr := mem_subsys.lsq_body.load_addr(1);
+                            loc:lidx := 1:load_idx
+                        };
+                        if (mem_subsys.lsq_body.load_head <= 0 & 0:load_idx < mem_subsys.lsq_body.load_tail & ~mem_subsys.lsq_body.load_rdy(0) & ~mem_subsys.lsq_body.load_sent(0) & mem_subsys.lsq_body.store_head >= mem_subsys.lsq_body.load_mark(0)) {
+                            loc:lsel := true;
+                            loc:laddr := mem_subsys.lsq_body.load_addr(0);
+                            loc:lidx := 0:load_idx
+                        };
+                        if loc:lsel {
+                            mem_subsys.lsq_body.req_en_r := true;
+                            mem_subsys.lsq_body.req_wen_r := false;
+                            mem_subsys.lsq_body.req_addr_r := loc:laddr;
+                            mem_subsys.lsq_body.req_idx_r := loc:lidx
+                        }
+                        else {
+                            if (mem_subsys.lsq_body.store_head < mem_subsys.lsq_body.store_tail & (~(mem_subsys.lsq_body.load_head <= 0 & 0:load_idx < mem_subsys.lsq_body.load_tail & 0:load_idx < mem_subsys.lsq_body.store_mark(mem_subsys.lsq_body.store_head)) | mem_subsys.lsq_body.load_rdy(0) | (mem_subsys.lsq_body.load_sent(0) & mem_subsys.lsq_body.load_addr(0) ~= mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head))) & (~(mem_subsys.lsq_body.load_head <= 1 & 1:load_idx < mem_subsys.lsq_body.load_tail & 1:load_idx < mem_subsys.lsq_body.store_mark(mem_subsys.lsq_body.store_head)) | mem_subsys.lsq_body.load_rdy(1) | (mem_subsys.lsq_body.load_sent(1) & mem_subsys.lsq_body.load_addr(1) ~= mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head))) & (~(mem_subsys.lsq_body.load_head <= 2 & 2:load_idx < mem_subsys.lsq_body.load_tail & 2:load_idx < mem_subsys.lsq_body.store_mark(mem_subsys.lsq_body.store_head)) | mem_subsys.lsq_body.load_rdy(2) | (mem_subsys.lsq_body.load_sent(2) & mem_subsys.lsq_body.load_addr(2) ~= mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head))) & (~(mem_subsys.lsq_body.load_head <= 3 & 3:load_idx < mem_subsys.lsq_body.load_tail & 3:load_idx < mem_subsys.lsq_body.store_mark(mem_subsys.lsq_body.store_head)) | mem_subsys.lsq_body.load_rdy(3) | (mem_subsys.lsq_body.load_sent(3) & mem_subsys.lsq_body.load_addr(3) ~= mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head)))) {
+                                mem_subsys.lsq_body.req_en_r := true;
+                                mem_subsys.lsq_body.req_wen_r := true;
+                                mem_subsys.lsq_body.req_addr_r := mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_head);
+                                mem_subsys.lsq_body.req_wdata_r := mem_subsys.lsq_body.store_data(mem_subsys.lsq_body.store_head)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if mem_subsys.lsq_body.lsq_to_cpu_ready {
+            if mem_subsys.lsq_body.cpu_to_lsq_req_wen {
+                mem_subsys.lsq_body.store_addr(mem_subsys.lsq_body.store_tail) := mem_subsys.lsq_body.cpu_to_lsq_req_addr;
+                mem_subsys.lsq_body.store_data(mem_subsys.lsq_body.store_tail) := mem_subsys.lsq_body.cpu_to_lsq_req_wdata;
+                mem_subsys.lsq_body.store_mark(mem_subsys.lsq_body.store_tail) := mem_subsys.lsq_body.load_tail;
+                mem_subsys.lsq_body.store_tail := mem_subsys.lsq_body.store_tail + 1
+            }
+            else {
+                local loc:fhit {
+                    loc:fhit := false;
+                    local loc:fdat {
+                        loc:fdat := 0:word;
+                        if (mem_subsys.lsq_body.store_head <= 0 & 0:store_idx < mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_addr(0) = mem_subsys.lsq_body.cpu_to_lsq_req_addr) {
+                            loc:fhit := true;
+                            loc:fdat := mem_subsys.lsq_body.store_data(0)
+                        };
+                        if (mem_subsys.lsq_body.store_head <= 1 & 1:store_idx < mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_addr(1) = mem_subsys.lsq_body.cpu_to_lsq_req_addr) {
+                            loc:fhit := true;
+                            loc:fdat := mem_subsys.lsq_body.store_data(1)
+                        };
+                        if (mem_subsys.lsq_body.store_head <= 2 & 2:store_idx < mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_addr(2) = mem_subsys.lsq_body.cpu_to_lsq_req_addr) {
+                            loc:fhit := true;
+                            loc:fdat := mem_subsys.lsq_body.store_data(2)
+                        };
+                        if (mem_subsys.lsq_body.store_head <= 3 & 3:store_idx < mem_subsys.lsq_body.store_tail & mem_subsys.lsq_body.store_addr(3) = mem_subsys.lsq_body.cpu_to_lsq_req_addr) {
+                            loc:fhit := true;
+                            loc:fdat := mem_subsys.lsq_body.store_data(3)
+                        };
+                        mem_subsys.lsq_body.load_addr(mem_subsys.lsq_body.load_tail) := mem_subsys.lsq_body.cpu_to_lsq_req_addr;
+                        mem_subsys.lsq_body.load_rdy(mem_subsys.lsq_body.load_tail) := loc:fhit;
+                        mem_subsys.lsq_body.load_data(mem_subsys.lsq_body.load_tail) := loc:fdat;
+                        mem_subsys.lsq_body.load_mark(mem_subsys.lsq_body.load_tail) := mem_subsys.lsq_body.store_tail;
+                        mem_subsys.lsq_body.load_tail := mem_subsys.lsq_body.load_tail + 1
+                    }
+                }
+            }
+        };
+        mem_subsys.lsq_body.cpu_ready_r := (mem_subsys.lsq_body.store_tail < 4 & mem_subsys.lsq_body.load_tail < 4);
+        if mem_subsys.cachemem.stage_go_s {
+            if mem_subsys.cachemem.stage_store {
+                mem_subsys.cachemem.img(H,O) := (mem_subsys.cachemem.stage_d_g if (H = mem_subsys.cachemem.stage_h_g & O = mem_subsys.cachemem.stage_o_g) else mem_subsys.cachemem.img(H,O))
+            };
+            mem_subsys.cachemem.stage_store := false
+        };
+        if (mem_subsys.cachemem.lsq_to_cache_req_en & mem_subsys.cachemem.cache_to_lsq_creq_ready & mem_subsys.cachemem.lsq_to_cache_req_wen) {
+            mem_subsys.cachemem.stage_store := true;
+            mem_subsys.cachemem.stage_h_g := mem_subsys.cachemem.lsq_to_cache_req_h;
+            mem_subsys.cachemem.stage_o_g := mem_subsys.cachemem.lsq_to_cache_req_o;
+            mem_subsys.cachemem.stage_d_g := mem_subsys.cachemem.lsq_to_cache_req_wdata
+        };
+        if (mem_subsys.cachemem.mc_body.cmd_en & mem_subsys.cachemem.mc_body.cmd_wen) {
+            mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.cmd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.cmd_addr)),0))) := unp0(mem_subsys.cachemem.mc_body.cmd_data);
+            mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.cmd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.cmd_addr)),1))) := unp1(mem_subsys.cachemem.mc_body.cmd_data);
+            mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.cmd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.cmd_addr)),2))) := unp2(mem_subsys.cachemem.mc_body.cmd_data);
+            mem_subsys.cachemem.mc_body.mmem(concatbv3(high(mem_subsys.cachemem.mc_body.cmd_addr),concatbv2(beat_of(low(mem_subsys.cachemem.mc_body.cmd_addr)),3))) := unp3(mem_subsys.cachemem.mc_body.cmd_data)
+        }
+    };
+    assume abs_memory.mnow = trace.now;
+    assume (tag.succ(T,U) & trace.done(U)) -> trace.mem(trace.st(U),A) = (op_wdata(U) if (op_wen(U) & A = op_addr(U)) else trace.mem(trace.st(T),A));
+    assume abs_memory.mem(A) = trace.mem(trace.st(trace.now),A);
+    assume (tag.succ(T,U) & trace.done(U) & ~op_wen(U)) -> trace.rdata(trace.st(U)) = trace.mem(trace.st(T),op_addr(U));
+    assume tag.succ(trace.now,trace.nxt)
+}
+action ext:abs_memory.step = {
+    call abs_memory.mnow := ext:tag.next(abs_memory.mnow);
+    if op_wen(abs_memory.mnow) {
+        abs_memory.mem(op_addr(abs_memory.mnow)) := op_wdata(abs_memory.mnow)
+    }
+}
+action trace.step = {
+    trace.now := trace.nxt;
+    call trace.nxt := ext:tag.next(trace.nxt);
+    call ext:abs_memory.step;
+    trace.mem(trace.st(trace.now),A) := abs_memory.mem(A);
+    if ~op_wen(trace.now) {
+        trace.rdata(trace.st(trace.now)) := abs_memory.mem(op_addr(trace.now))
+    }
+}
+export posedge

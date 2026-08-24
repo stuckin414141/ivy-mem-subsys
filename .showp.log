@@ -1,0 +1,88 @@
+type word
+relation m.a.b_to_a_rdy
+relation m.a.go
+relation m.a.moved
+relation m.a.en_r
+relation m.b.a_to_b_en
+relation m.b.b_to_a_rdy
+relation m.b.flag
+relation m.b.flag2
+individual m.b.hsel : word
+relation m.b.arr(V0:word)
+relation m.b.go_s
+
+schema [rec[word]][rec[word]] {
+    type q
+    function base(V0:word) : q
+    function step(V0:q,V1:word) : q
+    function fun(V0:word) : q
+    property fun(X) = (base(X) if (X <= 0) else step(fun(X - 1),X))
+}
+
+schema [ind[word]][ind[word]] {
+    relation p(V0:word)
+    property [base] {
+        individual x : word
+        property x <= 0 -> p(x)
+    }
+    property [step] {
+        individual x : word
+        property p(x) -> p(x + 1)
+    }
+    property p(X)
+}
+
+schema [lep[word]][lep[word]] {
+    individual n : word
+    relation p(V0:word)
+    property exists L. (L:word >= n & (forall B. (B:word >= n & p(B)) -> (p(L) & L <= B)))
+}
+
+invariant [m.a.c1] ~m.b.flag
+invariant [m.a.c3] ~m.a.moved
+invariant [m.a.c8] m.a.b_to_a_rdy -> m.b.go_s
+definition [m.a.def6] m.a.a_to_b_en = m.a.en_r
+definition [m.a.def7] m.a.go = (m.a.en_r & m.a.b_to_a_rdy)
+definition [m.b.def16] m.b.b_to_a_rdy = m.b.c.b_to_a_rdy
+definition [m.b.def17] m.b.go_s = m.b.c.go
+definition [m.def18] m.b.a_to_b_en = m.a.a_to_b_en
+definition [m.def19] m.a.b_to_a_rdy = m.b.b_to_a_rdy
+
+after init {
+    m.a.moved := false
+}
+after init {
+    m.a.en_r := false
+}
+after init {
+    {
+        m.b.flag := false;
+        m.b.flag2 := false;
+        m.b.hsel := 0:word;
+        m.b.arr(X) := false
+    }
+}
+action posedge = {
+    assume [m.a.a_drain] (m.a.b_to_a_rdy & m.b.flag2) -> m.b.go_s;
+    if m.a.go {
+        m.a.moved := true
+    };
+    if ~m.a.en_r {
+        m.a.en_r := true
+    };
+    if (m.a.en_r & m.a.b_to_a_rdy) {
+        m.a.en_r := false
+    };
+    if m.b.go_s {
+        if m.b.flag2 {
+            m.b.arr(X) := (true if (X = m.b.hsel) else m.b.arr(X))
+        };
+        m.b.flag2 := false
+    };
+    if (m.b.a_to_b_en & m.b.b_to_a_rdy) {
+        m.b.flag := true;
+        m.b.flag2 := true;
+        m.b.hsel := 1:word
+    }
+}
+export posedge
