@@ -840,6 +840,7 @@ export action posedge
 
                 # Data we send as part of the invalidate is valid
                 # TODO: how does this work w/ consistency model?
+                # TODO: how does MSHR/fill arbitration work?
                 invariant [ack_img_p0] ack0_g_en & ack0_g_dty ->
                     lsel(ack0_g_data, O) = img(ack0_g_line, O)
 
@@ -2675,21 +2676,6 @@ export action posedge
                 # for the two clients.  Falls out of `[d_ex*]` + `[dex_one]`. ----
                 invariant [g_one_excl] ~(exclusive0(H) & exclusive1(H))
 
-                # ---- `[commit_safe]`: exclusivity empties every other
-                # holder.  Logically nothing beyond SWMR -- it is the
-                # single-writer clause of it -- and it is kept as its own
-                # named invariant purely as the isolate-boundary cut, so every
-                # `*_img` preservation case cites ONE lemma instead of
-                # re-deriving the backbone.  A store commit is an instance:
-                # `[ca_st_excl_*]` turns `c0_st_en` into `exclusive0(c0_st_h)`.
-                #
-                # Keyed on the permission ghost and NOT on the commit wire
-                # itself: `c0_st_en` is driven by a cache definition this
-                # isolate cannot see, so in the post-state it is an
-                # unconstrained boolean and an invariant guarded by it is not
-                # provable here at all (measured: the query does not fail, it
-                # runs for minutes).  The commit-edge reading is recovered at
-                # the cache, where the wire has a definition. ----
                 invariant [commit_safe0] exclusive0(H) ->
                       ~holds1(H)
                     & ~(ack1_g_en & ack1_g_dty & ack1_g_line = H)

@@ -9,7 +9,44 @@ drift; the symbol names will not.
 
 ---
 
-## 1. Exclusive-only: no `grantShared`, therefore no invalidate flow
+## 1. Sharing is implemented; the directory's ENTRY ARRAY is not
+
+**Done (phase 5).** `grantShared`/`grantExclusive`, the invalidate flow, and
+per-permission SWMR are in `german_cache.ivy`: `tag_exc` beside
+`tag_occ`/`tag_dty`, loads hitting on presence and stores on permission, the
+store-to-Shared self-downgrade, one held invalidate slot per cache with array
+and channel-3 priority (including the MSHR post-grant bounce), `d_inv` with
+`inv_need(C)`, and `[swmr0]`/`[swmr1]` -- an exclusive holder excludes every
+copy in the other cache, shared holders coexist.
+
+**Not done: the 8x8 entry array of plan decision 1**, and the reason is now
+measured rather than suspected.  The sizing argument needs `[d_exact]` in the
+direction "line H has no entry -> H is in no cache"; that sends a quantified
+line through `hash` into the entry array and back out through the tag, and
+`ivy_check` answers `error: The verification condition is not in the fragment
+FAU`, naming `e_tag(cidx(hash(H),0)) = H`.  The admissible direction
+quantifies the SET index and derives the line from the array (probed: passes),
+but that requires the holder ghosts themselves to be set-indexed --
+`held0(K,W)`/`heldln0(K,W)` plus ground registers for the MSHR reservations --
+i.e. a redesign of the `cachemem` ghost layer, which also retires the plan's
+`cacheS/E(C,H)` tag-scan formulation for the same FAU reason.  Until then the
+directory keeps one bit per line per CPU plus one exclusive bit, which is
+provable and not synthesizable.
+
+**Backbone (phase 6).** `german.ivy`'s invariant set is transcribed per line
+over this file's holder relations, with the correspondence table in
+`dir_body` section 6.5; the two-CPU structure it also calls for (second cache
+isolate, second channel set, dir arbiter, per-CPU staged + parked ghosts,
+second LSQ port) predates phase 5 and was already in the tree.
+
+**Deviations taken, with approval:** invalidates ride a separate per-CPU slot
+rather than sharing channel 2 (this file's own recommendation, below); a cache
+is never sent an invalidate for a line it does not hold, because the directory
+suppresses sends to a CPU with an ack in flight and `[d_back*]` +
+`[inv_live*]` make that a theorem rather than a convention; the owner is
+`dex(H) & dshC(H)` rather than a stored `own` field.
+
+## 1b. Historical: exclusive-only (superseded by phase 5)
 
 **What is there.** One grant kind. A request is served only for a line that
 neither cache has an entry for — the pick guard is

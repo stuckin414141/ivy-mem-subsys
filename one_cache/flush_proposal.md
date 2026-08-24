@@ -18,7 +18,7 @@ and `ctag` advances over the flush tag through the ordinary `ld_ans` arm
 (L554-560). The flush's response is proved correct by `resp` (L1218-1222)
 without `resp` being touched.
 
-The LSQ's queues, its 36 invariants, its ghost monitor and its theorem are
+The LSQ's queues, its 39 invariants, its ghost monitor and its theorem are
 byte-identical. Its **one** flush-specific line is a conjunct on the ready
 wire:
 
@@ -174,6 +174,15 @@ unaffected.
 Deadlock-free: the stalled flush occupies no slot, so it blocks nothing that the
 store queue's drain depends on.
 
+**The conjunct makes `cpu_ready` combinational in `cpu_req_flush`, which is a
+new contract on whatever drives the port.** `cpu_req_flush` must be a function
+of the operation being presented, never of `cpu_ready`, or the ready path closes
+a combinational loop. `testbench.sv` is safe — it registers the whole request
+including `cpu_req_en` (L283-286) — but `cpu_int/integration_plan.md` point 6
+has the CPU holding MEM on `cpu_ready` (`dmem_stall`), so the constraint has to
+be stated before that integration, not discovered by it. The decode bit is
+available a stage earlier than the stall, so this costs the CPU nothing.
+
 Narrower alternative, if the over-synchronisation matters: gate on "no pending
 store aliases `cpu_to_lsq_req_addr`" instead. Same proof, but it drags a
 four-way address compare into the ready wire — the arbitration path — to save a
@@ -231,8 +240,10 @@ the line sits dirty in the array.
 | L1669-1675 | `var p_flush : bool`, latched at intake (L2168-2173) |
 | L2037-2047 | flush hit: answer as now, then allocate the flush MSHR if `p_flush & tag_dty(cidx(rs, hway))` |
 | L2122-2130 | the four writeback arms test `(s0_m_state = mshr_drain \| s0_m_state = mshr_flush)` |
-| L1919/L1951 | `drain0`/`drain1` gain a self-guarded flush arm |
-| L2159-2162 | the arbiter's middle test becomes `s0_m_state = mshr_drain \| s0_m_state = mshr_flush` |
+| L1919/L1951 | `drain0`/`drain1` are **not** touched; the flush's terminal step is dispatched directly |
+| L2159-2162 | the arbiter gains two phase-guarded flush arms ahead of the drains |
+| L1744-1745 | `p_flush := false` in `after init`, beside the other stage registers |
+| L1444-1450 | `wire lsq_to_cache_req_flush : bool`, declared in `cache_body` as well as in `cachemem` |
 
 The allocation, in the `~wen` arm of `serve_stage`'s hit branch:
 
@@ -251,8 +262,7 @@ The else-chain closes by construction: the gate (L1785) guarantees an idle slot,
 the same argument the existing allocate path uses (L2014-2017). The answer and
 the allocation write disjoint state, so the response port keeps one writer.
 
-And the terminal step, reached from `drain0`/`drain1` when the phase has
-advanced to `dp_fill`:
+And the terminal step, its own action rather than an arm inside `drain0`,
 
 ```
 action flush_done_0 = {
@@ -260,6 +270,27 @@ action flush_done_0 = {
     s0_m_state := mshr_idle;
 }
 ```
+
+dispatched from the arbiter (L2159-2162), **guarded on the phase, not on the
+state**:
+
+```
+if <the gate, written out> { call serve_stage; }
+else { if s0_m_state = mshr_flush & s0_m_dphase = dp_fill { call flush_done_0; }
+  else { if s1_m_state = mshr_flush & s1_m_dphase = dp_fill { call flush_done_1; }
+    else { if s0_m_state = mshr_drain { call drain0; }
+      else { call drain1; } } } };
+```
+
+The phase guard is not cosmetic. A flush in `dp_wb_lo`/`dp_wb_hi` needs only the
+command-issue block (L2122-2130), never an arbiter turn — so guarding on
+`m_state = mshr_flush` alone would have a flush in slot 0 consume every arbiter
+turn for the length of two `cmd_ready` waits, starving `drain1` of its
+`svc_head` and its victim pick. Bounded, but it stalls a load answer behind a
+flush for no reason. Guarded on the phase, the other MSHR drains underneath the
+flush, which is exactly the two-evictor case `ev_distinct` (L2327) and
+`wb_wire_hi_*` (L2467-2470) were written for: `drain1`'s victim pick sees
+`evicting(0)` and takes the other way.
 
 `tag_occ`, `tag_ln`, `dat0`, `dat1` and `set_lru` are untouched: this is `clwb`,
 not `clflush`. The line stays resident and a following load still hits, `c_img`

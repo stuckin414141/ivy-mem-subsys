@@ -330,27 +330,46 @@ Invariant catalog:
 
 ## Phases (each ends green: `/home/anthonydu/memory_sys_verif/ivy/venv/bin/ivy_check german_cache.ivy`)
 
+Stop in between each step in 1-6 so I can review. 
+
 0. **Baseline**: check current `german_cache.ivy` as-is; record pass/fail and runtime as
    the reference point. Git commit per green phase thereafter.
 1. **Abstract model** (`german_evict.ivy`, copy of `german.ivy` -- keep the classic
    intact): add voluntary eviction + unconditional ack consumption; fix up the invariant
    set (deltas listed above); optionally add a single-address data ghost to rehearse
    `grant_img`/`ack_img`/`mc_owns_img`. Cheap derisking of every protocol-level decision.
-2. **Line-granular cache + single-client directory**: introduce `cache_line`
-   (`lsel`/`lins`, `lpack`/`lhi`/`llo`); rework both MSHRs to the new state list with
-   whole-line `mfb`s; switch to park-without-img-move + apply-at-replay and
-   replay-from-array; insert `dir_body` between the cache and the *unchanged* mc,
-   carrying the two-beat fetch/writeback sequencer; ch1/ch2/ch3 for CPU 0 only (ch1/ch3
-   arbitration between the two MSHRs already real); keep `mc_owns_img` verbatim and
-   prove `[rd_clean]` in the dir; prove
-   `grant_img`/`ack_img`/`mfb_img`/`dfb_img`/`d_exact`/`d_room` with one
-   client (at most 4 role-slots per set). The beat ladder does not disappear -- it
-   moves from the MSHRs into the directory's one sequencer -- but the cache-side
-   deletions (ladders, `slot_img`, `fbuf_img_*` -> `mfb_img`) all land here.
-3. **Second CPU**: duplicate the cache isolate, second channel set, dir arbiter,
+2. **single-client directory, no SWMR**: Introduce, in isolation, the directory. Don't connect this to the cache yet. Connect it to the
+memory controller. Disconnect the cache from the memory controller.
+Support grants (and the data guarantee), don't
+implement invalidates yet. Do support dirty evictions from the
+client. Make a copy of the cache and/or move it to a separate file.
+
+`cache_owns` is still a thing. At this point, the directory should
+prove an invariant that `~cache_owns(A) -> dir(A) = img(A)`, where 
+`dir : Addr -> word` is the abstract image of memory that
+the directory + memory controller present. Add exported mock actions
+that issues writebacks over the wire (and set `cache_owns(A)` to false)
+along with requests for data (and sets `cache_owns(A)` as well)
+
+
+3. **Hook up cache to directory**: introduce `cache_line`, modify
+  the MSHR in the cache accordingly, and hook up the cache to the
+    directory instead of the memory controller. The cache should
+    retain the same guarantee of providing a unified interface.
+    Invalidating non-dirty entries should still be silent. 
+4. **Define the weaker specification, and reprove the model against it**
+5. **Implement invalidates and prove SWMR in the directory**: 
+    this should involve implementing explicit eviction in the cache,
+    and having the directory ask the other sharers of a line for eviction. 
+
+    It is likely that you will need to prove an invariant that if 
+    an entry is not in the directory, then it is not in any of the 
+    caches. 
+
+6. **Second CPU**: duplicate the cache isolate, second channel set, dir arbiter,
    per-line German backbone invariants, per-CPU staged + parked ghosts, second LSQ port
    at top. This is where the coherence proof actually closes.
-4. **Later, out of scope now**: `ivy_to_rtl` export sanity (all scans already
+7. **Later, out of scope now**: `ivy_to_rtl` export sanity (all scans already
    hand-wired) and a Verilator testbench in the style of `one_cache/`.
 
 ## Risks

@@ -1,0 +1,14 @@
+#lang ivy1.8
+
+# Segmented bus protocol
+
+type msg
+type node
+type msgtype = {read, write}
+
+# Does the node have a message?
+relation hasMsg(N : node, M : msg)
+
+function sender(M : msg) : node
+function typ(M : msg) : msgtype
+

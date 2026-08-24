@@ -1,0 +1,1309 @@
+#lang ivy1.8
+
+include numbers
+include order
+
+type word
+type line
+
+type store_idx
+type load_idx
+
+type addr
+type woffset
+
+# ---- the address functions in a form that can be synthesized to RTL.
+# Kept separate from the address theory so that using them in the
+# datapath does not pull the theory into the datapath's queries. ----
+wire hw_concatbv3(H : line, O : woffset) : addr
+wire hw_high(A : addr) : line
+wire hw_low(A : addr) : woffset
+
+# ---- the queue index types.  Interpreted where every isolate can see
+# them: three bits wide, so a quantifier over one costs the solver
+# nothing, and the queue arithmetic is mod-8 by construction. ----
+isolate basis = {
+    interpret store_idx -> bv[3]
+    interpret load_idx -> bv[3]
+}
+
+function concatbv3(H : line, O : woffset) : addr
+function high(A : addr) : line
+function low(A : addr) : woffset
+
+# ------------------------------------------------------------------
+# The operation trace.
+#
+# `tag` indexes an arbitrary, fixed sequence of memory operations: the
+# operation at index T reads or writes one word address, and a write
+# also carries the datum it stores.  These functions are never assigned,
+# so they stand for ANY sequence of operations over ANY initial memory
+# image, and the proof holds for all of them.  Index 0 is the reset
+# point, not an operation.
+#
+# An operation names its address as a (line, offset) PAIR; `op_addr` is
+# built from that pair in `addr_thy` below.  The port carries the line
+# and the offset separately, so tying a request back to the operation
+# means going from the halves to the whole -- which, built from a pair,
+# is free: `p_highfull` and `p_lowfull` are all it takes.
+# ------------------------------------------------------------------
+
+instance tag : unbounded_sequence
+
+function op_wen(T : tag)   : bool    # write if true, read if false
+function op_h(T : tag)     : line    # the line it touches ...
+function op_o(T : tag)     : woffset # ... and the word within that line
+function op_addr(T : tag)  : addr    # the two, concatenated (see addr_thy)
+function op_wdata(T : tag) : word    # the datum a write stores
+
+function init_mem(A : addr) : word   # the power-on memory image
+
+# ---- the same image, indexed by the (line, offset) PAIR.  The memory's
+# array is powered on from THIS one; `p_initimg` ties it back to
+# `init_mem` for the LSQ, which is where the trace's own image comes in,
+# and makes the base case of `img_ctag` syntactic. ----
+function init_img(H : line, O : woffset) : word
+
+isolate addr_thy = {
+    interpret woffset -> bv[3]
+
+    definition op_addr(T) = concatbv3(op_h(T), op_o(T))
+
+    property [p_full_inj] forall H1 : line, O1 : woffset, H2 : line, O2 : woffset. (concatbv3(H1, O1) = concatbv3(H2, O2)) -> (H1 = H2 & O1 = O2)
+    property [p_highfull] forall H : line, O : woffset. high(concatbv3(H, O)) = H
+    property [p_lowfull]  forall H : line, O : woffset. low(concatbv3(H, O)) = O
+
+    property [p_hw_high] forall A : addr. hw_high(A) = high(A)
+    property [p_hw_low]  forall A : addr. hw_low(A) = low(A)
+    property [p_hw_cat3] forall H : line, O : woffset. hw_concatbv3(H, O) = concatbv3(H, O)
+
+    # ---- the pair-indexed power-on image agrees with the flat one.
+    # Exported because the LSQ needs it: the trace's initial state is
+    # `init_mem`, the memory's array is `init_img`, and this bridges them
+    # at time zero. ----
+    property [p_initimg] forall H : line, O : woffset.
+        init_img(H, O) = init_mem(concatbv3(H, O))
+
+    implementation {
+        interpret addr -> bv[64]
+        interpret line -> bv[61]
+        definition high(A) = bfe[3][63](A)
+        definition low(A) = bfe[0][2](A)
+        definition concatbv3(H, O) = H :: O
+
+        property [p_recon] forall A : addr. concatbv3(high(A), low(A)) = A
+
+        definition init_img(H, O) = init_mem(concatbv3(H, O))
+        definition hw_high(A) = bfe[3][63](A)
+        definition hw_low(A)  = bfe[0][2](A)
+        definition hw_concatbv3(H, O) = H :: O
+    }
+} with this, basis
+
+export action posedge
+
+# ------------------------------------------------------------------
+# The ISA reference: a memory that executes the operation trace, one
+# operation per `step`.  `mnow` is the index of the last operation it
+# executed.  A read leaves the architectural state alone -- the datum
+# it returns is recorded by the trace, not held here.
+# ------------------------------------------------------------------
+
+isolate abs_memory = {
+    # ---- The reference is proof state only: it is the ISA the LSQ is
+    # verified against, not hardware.  Wrapping it in `specification`
+    # keeps `tag` -- an unbounded sequence, which has no bit width -- out
+    # of the hardware description. ----
+    specification {
+        function mem(A : addr) : word
+        var mnow : tag
+
+        after init {
+            mem(A) := init_mem(A);
+            mnow   := 0;
+        }
+
+        # ---- execute the next operation in the trace ----
+        action step = {
+            mnow := mnow.next;
+            if op_wen(mnow) {
+                mem(op_addr(mnow)) := op_wdata(mnow);
+            };
+        }
+    }
+
+    isolate iso = this with this, basis
+}
+
+# ------------------------------------------------------------------
+# The trace: the history of what the reference actually did.  `st(T)` is
+# the memory image reached after operation T, together with the datum
+# operation T returned if it was a read.  `now` is the index of the last
+# operation executed and `nxt` the index of the next one; entries above
+# `now` are unwritten.
+#
+# The whole isolate is specification: the invariants below are what the
+# LSQ proof reasons with, so they have to be visible outside it.
+# ------------------------------------------------------------------
+
+isolate trace = {
+    specification {
+        type state_t = struct {
+            mem(A : addr) : word,   # memory image after the operation
+            rdata : word            # datum a read returned
+        }
+
+        var now : tag
+        var nxt : tag
+        var st(T : tag) : state_t
+
+        # ---- operation T has been executed ----
+        relation done(T : tag)
+        definition done(T) = 0 < T & T <= now
+
+        after init {
+            now := 0;
+            nxt := now.next;
+            st(T).mem(A : addr) := init_mem(A);
+        }
+
+        # ---- execute the next operation and record what happened ----
+        action step = {
+            now := nxt;
+            nxt := nxt.next;
+            call abs_memory.step;
+            st(now).mem(A : addr) := abs_memory.mem(A);
+            if ~op_wen(now) {
+                st(now).rdata := abs_memory.mem(op_addr(now));
+            };
+        }
+
+        # ==============================================================
+        # The trace is an execution of the abstract memory model: the
+        # reference stands at st(now), and any two consecutive recorded
+        # states are related by one step of it -- a write installs its
+        # datum and changes nothing else, a read returns the image it
+        # started from.
+        #
+        # Coherence -- every read returns the datum of the last write to
+        # the same address -- follows from these by induction along the
+        # trace, so it is not stated separately.  Stating it would also
+        # take the isolate out of EPR: "no write to A between W and R" is
+        # a universal over the operations in between, and in hypothesis
+        # position that skolemizes to a function from the address back to
+        # a tag, closing a tag -> addr -> tag cycle in the instantiation
+        # graph.  The LSQ proof below never needs it: `tr_step` and `tr_rd`
+        # here relate CONSECUTIVE images only, and the LSQ's tag skeleton
+        # walks the trace one operation at a time on top of them.
+        # ==============================================================
+
+        invariant [ref_now] abs_memory.mnow = now
+        invariant [ref_nxt] tag.succ(now, nxt)
+        invariant [ref_mem] abs_memory.mem(A) = st(now).mem(A)
+        invariant [tr_step] (tag.succ(T,U) & done(U)) ->
+            st(U).mem(A) = (op_wdata(U) if (op_wen(U) & A = op_addr(U))
+                            else st(T).mem(A))
+        invariant [tr_rd] (tag.succ(T,U) & done(U) & ~op_wen(U)) ->
+            st(U).rdata = st(T).mem(op_addr(U))
+    }
+} with this, abs_memory
+
+object mem_subsys = {
+
+    # Input wires from CPU 
+    import wire cpu_req_addr  : addr
+    import wire cpu_req_wen   : bool
+    import wire cpu_req_wdata : word
+
+    # ---- the request enable.  Deliberately UNDRIVEN: unlike the three
+    # above it is not read off the trace.  A disabled edge has no
+    # observable content -- no address, no datum, no response -- so an
+    # `op_en(trace.nxt)` field would only stop consecutive queue tags
+    # being `tag.succ`-adjacent, which is what `cov`, `nogap_*` and
+    # `newest_l` are built on, and would buy no behaviour for it.  Left
+    # free it covers every enable waveform, and an edge with `ready &
+    # ~en` is state-identical to the `~ready` edge the induction already
+    # carries. ----
+    import wire cpu_req_en : bool
+
+    definition cpu_req_addr  = op_addr(trace.nxt)
+    definition cpu_req_wen   = op_wen(trace.nxt)
+    definition cpu_req_wdata = op_wdata(trace.nxt)
+
+    # Output wires from LSQ to CPU
+
+    export wire cpu_valid     : bool
+    export wire cpu_resp_addr : addr
+    export wire cpu_data      : word
+    export wire cpu_ready     : bool
+
+    # ==================================================================
+    # The load-store queue.
+    #
+    #   * The cpu hands over at most one operation per clock edge; the LSQ
+    #     calls `trace.step` when it takes one, so `trace.now` is the tag of
+    #     the last operation accepted.
+    #
+    #   * Every queue entry carries the tag of its operation (`stag`,
+    #     `ltag`), and `ctag` is the tag of the last operation to have *left*
+    #     the LSQ -- the point the cache's memory image stands at.  The
+    #     operations held in the LSQ are then exactly `ctag+1 .. now`
+    #     (`cov` together with `nogap_*`).
+    #
+    #   * The cache is irrelevant to this proof.  Its implementation is
+    #     hidden, so `cache_to_lsq_creq_ready` and the whole response
+    #     channel are free inputs here, and the only thing assumed about
+    #     them is `cache_correct` below.
+    #
+    # The correctness statement is `resp` at the bottom: whenever the LSQ
+    # hands a datum back to the cpu, the address and the datum are those of
+    # the corresponding operation in the trace.
+    # ==================================================================
+
+    isolate lsq_body = {
+
+        # ---- cpu request channel: driven by the enclosing object off the
+        # top-level port.  An operation is taken on an edge where the LSQ
+        # is ready AND the cpu enables the request, so `cpu_to_lsq_req_en`
+        # low is a do-nothing edge. ----
+        wire cpu_to_lsq_req_en    : bool
+        wire cpu_to_lsq_req_addr  : addr
+        wire cpu_to_lsq_req_wen   : bool
+        wire cpu_to_lsq_req_wdata : word
+
+        # ---- cpu response channel: all driven here ----
+        wire lsq_to_cpu_valid     : bool
+        wire lsq_to_cpu_resp_addr : addr
+        wire lsq_to_cpu_data      : word
+        wire lsq_to_cpu_ready     : bool
+
+        # ---- cache request channel ----
+        wire lsq_to_cache_req_en     : bool
+        wire lsq_to_cache_req_h      : line
+        wire lsq_to_cache_req_o      : woffset
+        wire lsq_to_cache_req_wen    : bool
+        wire lsq_to_cache_req_wdata  : word
+        wire lsq_to_cache_req_idx    : load_idx
+        wire cache_to_lsq_creq_ready : bool
+
+        # ---- cache response channel ----
+        wire cache_to_lsq_resp_valid : bool
+        wire cache_to_lsq_resp_h     : line
+        wire cache_to_lsq_resp_o     : woffset
+        wire cache_to_lsq_resp_data  : word
+        wire cache_to_lsq_resp_idx   : load_idx
+
+        # ---- liveness statement 4 (plan.md): justice, assumed of the
+        # environment -- nothing to prove here.  Within this isolate the
+        # whole channel is free; the liveness argument assumes the cache
+        # accepts the port (`cache_to_lsq_creq_ready`) infinitely often
+        # and eventually answers every load it has taken -- a response
+        # carrying the entry's own index AND echoed address, since that
+        # is what the capture guards (and `ld_capture`) test; bare
+        # `resp_valid` recurring forever would leave a sent load
+        # unanswered.  The `memory` isolate below discharges it by
+        # construction: `creq_ready` is constantly true and a load taken
+        # this edge is answered on the next. ----
+
+        # ---- proof observation port.  The specification below watches the
+        # datapath through these wires instead of reading its registers
+        # directly.  It has to: `lsq_body`'s specification is visible in every
+        # isolate that closes `with this`, so a register named there becomes
+        # an interference symbol, and the datapath monitor -- hidden in those
+        # isolates -- is then seen writing visible state.  A wire is exempt,
+        # because its value is frozen at the pre-edge state for the whole
+        # action and its defining equation stays inside `implementation`. ----
+        wire ld_ans  : bool              # the head load is answered this edge
+        wire st_go   : bool              # the cache takes the store on the port
+        wire ld_capture : bool           # a cache response is captured this edge
+        wire ld_head : load_idx          # the load queue's pointers, pre-edge
+        wire ld_tail : load_idx
+        wire st_head : store_idx         # the store queue's pointers, pre-edge
+        wire st_tail : store_idx
+
+        specification {
+            function stag(J : store_idx) : tag  # tag of store-queue entry J
+            function ltag(K : load_idx)  : tag  # tag of load-queue entry K
+            # ---- the "what arrived in between?" ghosts.  All three are
+            # written only at a bare wire index (`st_tail`/`ld_tail`) or
+            # are 0-ary: an array write at a COMPUTED index (the obvious
+            # `store_after_load(ld_tail - 1)`) is the wire-indexed-write
+            # shape that neutralises the transition (see the note on `img`
+            # at the cache's monitor), and it costs every query in the
+            # isolate.
+            #
+            # `st_after_nl`: a store has arrived since the last load
+            # arrival.  Reset when a load arrives, set when a store does.
+            #
+            # `store_since_prev_load(K)`: a store arrived between load K
+            # and the load before it -- `st_after_nl` sampled the edge K
+            # arrived and frozen.  `~store_since_prev_load(K+1)` is the
+            # drift-free residue of the old `load_mark(K+1) = load_mark(K)`
+            # (loads adjacent in program order); `~st_after_nl` plays
+            # `load_mark(K) = store_tail` (no store after the newest
+            # load).  Both count DEPARTED stores too, which a mark
+            # comparison in a circular queue cannot.
+            #
+            # `store_departed_past(K)`: some store YOUNGER than load K has
+            # already departed past it.  This is the slot-free residue of
+            # the old `dep_le`: a departing store's tag is absorbed into
+            # `ctag` on its departure edge, so `store_departed_past(K)`
+            # comes with `ltag(K) < ctag` (`dep_ctag` below), and
+            # `~store_departed_past(K)` certifies that every store after K
+            # is still PENDING -- which is what lets the nogap guards over
+            # pending slots speak for the whole trace. ----
+            #
+            # `mark_offset(J)`: store J's mark, measured as an OFFSET from
+            # the CURRENT `load_head` -- the ghost twin of `store_mark(J) -
+            # load_head`.  The subtraction itself is what the invariants
+            # must not say: an arithmetic term over a FUNCTION value mints
+            # a fresh term for every quantifier instantiation, and any
+            # invariant that couples such terms to tag order sends z3 off
+            # the cliff (measured: the baseline file with only `cross_s`/
+            # `cross_l` restated that way diverges).  So the ghost keeps
+            # the offset as a plain function value -- written at enqueue,
+            # shifted down one when the load head retires past an entry --
+            # and `mark_offset_def` below is the one arithmetic-only
+            # bridge to the datapath's registers. ----
+            var st_after_nl : bool
+            function store_since_prev_load(K : load_idx) : bool
+            function store_departed_past(K : load_idx) : bool
+            function mark_offset(J : store_idx) : load_idx
+            # ---- the liveness ranking's pre-edge samples (plan.md),
+            # frozen at the TOP of the monitor below, before any ghost
+            # write -- `mark_offset` in particular is still unshifted (the
+            # retire arm shifts it at the bottom).  The liveness statements
+            # are INVARIANTS at the bottom of `implementation`: evaluated
+            # in the post-edge state, where a register reads post-edge and
+            # these samples still carry the edge's starting point, so a
+            # single-state invariant relates the two sides of the edge.
+            # (A trailing monitor with `assert`/`ensure` cannot do the
+            # job: `posedge` is global, neither verified nor present in
+            # this isolate, and `ivy_isolate.py` downgrades every
+            # assertion in monitors of such an action to an assumption.)
+            # ----
+            function loads_not_ready_before_pre(K : load_idx, L : load_idx) : bool
+            function stores_not_ready_before_pre(K : load_idx, J : store_idx) : bool
+            var lh_pre : load_idx            # ld_head, sampled
+            var lt_pre : load_idx            # ld_tail, sampled
+            var sh_pre : store_idx           # st_head, sampled
+            var st_go_pre : bool             # st_go, sampled
+            var ld_capture_pre : bool        # ld_capture, sampled
+            var resp_idx_pre : load_idx      # cache_to_lsq_resp_idx, sampled
+
+            # Oldest load after `ctag`
+            var cw : load_idx
+            var cpu_tag_r : tag                 # tag the response port answers
+
+            # ---- ground the sampled events at reset: the liveness
+            # invariants are guarded by them, and before the first edge no
+            # sample has been taken. ----
+            after init {
+                lh_pre := 0; lt_pre := 0; sh_pre := 0;
+                st_go_pre := false; ld_capture_pre := false;
+                resp_idx_pre := 0;
+            }
+
+
+            # ==============================================================
+            # Ghost bookkeeping: the reference tags and the `trace.step` call.
+            # These exist only for the proof, so they live in their own
+            # monitor and the datapath monitor is free of them.
+            #
+            # This block sits in `specification`, which is declared *before*
+            # `implementation`, so it runs first and every test here reads the
+            # pre-edge datapath state -- exactly the state the matching
+            # datapath test reads.  The order is also what makes `forward`
+            # provable: the datapath calls it in step 4, after step 2 has
+            # absorbed the head store, and its loop invariants are stated
+            # against the `ctag` that this block has already advanced past
+            # that store.
+            # ==============================================================
+            after posedge {
+
+                # ---- sample the liveness ranking and its events before
+                # anything moves: below this line `mark_offset` is shifted
+                # and `ctag` advances.  The wires are frozen pre-edge
+                # anyway; the registers behind the relations are not,
+                # hence the snapshot here. ----
+                loads_not_ready_before_pre(X, Y)  := loads_not_ready_before(X, Y);
+                stores_not_ready_before_pre(X, Y) := stores_not_ready_before(X, Y);
+                lh_pre := ld_head;
+                lt_pre := ld_tail;
+                sh_pre := st_head;
+                st_go_pre := st_go;
+                ld_capture_pre := ld_capture;
+                resp_idx_pre := cache_to_lsq_resp_idx;
+
+                if ld_ans {
+                    cpu_tag_r := ltag(ld_head);     # the tag the port answers
+                    if memory.ctag < ltag(ld_head) {
+                        memory.ctag := ltag(ld_head);
+                        cw := ld_head + 1;
+                    };
+                };
+
+                if st_go & memory.ctag < stag(st_head) {
+                    memory.ctag := stag(st_head);
+                    cw := store_mark(st_head);
+                    # ---- the departing store passes every pending load
+                    # younger than itself; mark them.  `mark_offset` is
+                    # the tag order (`cross_l`): K is younger exactly when
+                    # its offset sits below the store's mark offset. ----
+                    store_departed_past(X) := store_departed_past(X)
+                        | ((X - ld_head) < (ld_tail - ld_head)
+                           & (X - ld_head) < mark_offset(st_head));
+                };
+
+                # ---------- the cpu hands over an operation ----------
+                # The wires carry the PRE-edge pointers, and with the
+                # queues circular the datapath enqueues at exactly those:
+                # there is no recycle step left to mirror, so the entry
+                # always lands in slot `st_tail`/`ld_tail`.  A wrapped slot
+                # may hold a stale tag from a departed entry; every
+                # invariant reading a slot is guarded by pendingness (or,
+                # where a departed neighbour matters, by the ghost bits), and
+                # this write refills the slot the same edge the datapath does.
+                if lsq_to_cpu_ready & cpu_to_lsq_req_en {
+                    call trace.step;                # the reference runs it
+                    if cpu_to_lsq_req_wen {
+                        stag(st_tail) := trace.now;
+                        st_after_nl := true;
+                        mark_offset(st_tail) := ld_tail - ld_head;
+                    } else {
+                        ltag(ld_tail) := trace.now;
+                        store_since_prev_load(ld_tail) := st_after_nl;
+                        store_departed_past(ld_tail) := false;
+                        st_after_nl := false;
+                        if tag.succ(memory.ctag, trace.now) {
+                            cw := ld_tail;
+                        };
+                    };
+                };
+
+                # ---- the retire arm shifted `load_head` up one, so every
+                # mark sits one closer to it.  Runs AFTER the accept block:
+                # a store enqueued this same edge wrote `mark_offset` off the
+                # PRE-edge wires, and its mark needs the same shift. ----
+                if ld_ans {
+                    mark_offset(X) := mark_offset(X) - 1;
+                };
+            }
+        }
+
+        # The direct memory image corresponds to the trace frontier.
+        private {
+            invariant [img_ctag]
+                trace.st(memory.ctag).mem(concatbv3(H, O)) = memory.img(H, O)
+        }
+
+        implementation {
+
+            # ============ datapath state ============
+
+            # ---- the store queue.  One array per former struct field:
+            # an Ivy array has to be one-dimensional and a struct sort has
+            # no bit width, so a queue of records is a record of queues. ----
+            var store_addr(J : store_idx) : addr
+            var store_data(J : store_idx) : word
+            var store_mark(J : store_idx) : load_idx   # load_tail when it arrived
+            var store_head : store_idx
+            var store_tail : store_idx
+
+            # ---- the load queue.  `load_rdy(K)` means entry K already holds
+            # its datum -- forwarded when the operation was accepted, or
+            # captured off the cache response later -- and is waiting only for
+            # its turn to retire in program order.  Capturing and retiring are
+            # separate events, which is what `lsq.md`'s `ready(A)` is about;
+            # while they were one event the datum had nowhere to sit. ----
+            var load_addr(K : load_idx)  : addr
+            var load_rdy(K : load_idx)   : bool    # datum captured
+            var load_data(K : load_idx)  : word    # ... and this is it
+            # ---- (no `load_mark` here: stores may depart past a pending
+            # load, so `store_head` drifts arbitrarily far past the mark a
+            # load took at arrival, and a mod-8 comparison against it means
+            # nothing.  Every former use is restated as the dual fact over
+            # `store_mark`, which for a PENDING store never leaves the load
+            # window -- see the marks section below.) ----
+            var load_head : load_idx
+            var load_tail : load_idx
+
+            # ---- the request held on the cache port until the cache takes it ----
+            var req_en_r    : bool
+            var req_addr_r  : addr
+            var req_wen_r   : bool
+            var req_wdata_r : word
+            var req_idx_r   : load_idx
+
+            # ---- which entries the cache still owes an answer for: entry K
+            # has gone to the cache and its datum has not come back.  This was
+            # a single `load_out` bit, and "the head load is out" also said
+            # "at most one load is out, ever" -- per entry it says neither, so
+            # the queue may have as many reads in flight as the cache will
+            # take.  Cleared on capture and again when the slot is reused. ----
+            var load_sent(K : load_idx) : bool
+
+            # ---- the response port back to the cpu ----
+            var cpu_valid_r : bool
+            var cpu_addr_r  : addr
+            var cpu_data_r  : word
+            var cpu_ready_r : bool
+
+            after init {
+                store_head := 0; store_tail := 0;
+                load_head  := 0; load_tail  := 0;
+                store_mark(J) := 0;
+                load_rdy(K)   := false;
+                req_en_r    := false;
+                load_sent(K) := false;
+                cpu_valid_r := false;
+                cpu_ready_r := true;
+            }
+
+            relation store_pending(J : store_idx)
+            definition store_pending(J) = (J - store_head) < (store_tail - store_head)
+            relation load_pending(K : load_idx)
+            definition load_pending(K) = (K - load_head) < (load_tail - load_head)
+            # ---- `load_pending`'s body restated over the SAMPLED
+            # pointers: in the liveness invariants below -- evaluated
+            # post-edge -- this is the pre-edge extension. ----
+            relation load_pending_pre(K : load_idx)
+            definition load_pending_pre(K) = (K - lh_pre) < (lt_pre - lh_pre)
+
+            # ---- Consistency.  A load may be answered only once every store
+            # that arrived before it has gone to the cache, so loads still
+            # retire in program order against stores.  A store, however, no
+            # longer waits for its older loads to RETIRE -- it may depart
+            # past a load that is answered (`load_rdy`: the datum is pinned
+            # in the entry, so a younger write cannot disturb it) and past
+            # one that is sent-but-unanswered, PROVIDED their addresses
+            # differ -- the cache will answer that load out of `img`, so a
+            # same-address store absorbed first would hand it a value from
+            # the future.  Older UNSENT loads still block the store.  The
+            # disequality is only needed against outstanding loads the store
+            # is passing: an `~rdy` load aliases no OLDER pending store
+            # already (`l_gap` -- it would have forwarded), and a sent load
+            # is older than every pending store (`load_elig` via `cross_l`),
+            # so with this one test a departing store aliases no `~rdy` load
+            # at all. ----
+            relation store_elig(J : store_idx)
+            definition store_elig(J) =
+                forall K : load_idx.
+                    ((K - load_head) < (load_tail - load_head)
+                     & (K - load_head) < mark_offset(J))
+                    -> (load_rdy(K)
+                        | (load_sent(K) & load_addr(K) ~= store_addr(J)))
+            relation load_elig(K : load_idx)
+            definition load_elig(K) =
+                store_head = store_tail
+                | (K - load_head) < mark_offset(store_head)
+
+            # ---- the liveness ranking (plan.md).  For a pending load K,
+            # delta(K) is the pair of these relations' extensions at K,
+            # ordered componentwise by inclusion: the loads ahead of K that
+            # are not yet answered, and the stores older than K -- a
+            # pending store is never "ready", it leaves only by departing,
+            # so every older pending store counts.  `store_elig` is NOT the
+            # load arm's dual: it lets a sent-but-unanswered load ahead
+            # pass on an address test, and the ranking must keep that load,
+            # because the cache still owes it.
+            #
+            # `stores_not_ready_before(K, store_head)` is `~load_elig(K)`
+            # for a pending K -- `elig_zero` below -- which is what lets
+            # the store arm inherit the existing mark/tag facts. ----
+            relation loads_not_ready_before(K : load_idx, L : load_idx)
+            definition loads_not_ready_before(K, L) =
+                load_pending(L) & ~load_rdy(L)
+                & (L - load_head) < (K - load_head)
+            relation stores_not_ready_before(K : load_idx, J : store_idx)
+            definition stores_not_ready_before(K, J) =
+                store_pending(J) & mark_offset(J) <= (K - load_head)
+
+            # ============ output wires ============
+
+            definition lsq_to_cache_req_en    = req_en_r
+            definition lsq_to_cache_req_h     = hw_high(req_addr_r)
+            definition lsq_to_cache_req_o     = hw_low(req_addr_r)
+            definition lsq_to_cache_req_wen   = req_wen_r
+            definition lsq_to_cache_req_wdata = req_wdata_r
+            definition lsq_to_cache_req_idx   = req_idx_r
+
+            definition lsq_to_cpu_valid     = cpu_valid_r
+            definition lsq_to_cpu_resp_addr = cpu_addr_r
+            definition lsq_to_cpu_data      = cpu_data_r
+            definition lsq_to_cpu_ready     = cpu_ready_r
+
+            # ---- the proof observation port ----
+            # ---- `load_elig` is written out rather than applied.  It is a
+            # defined relation, and `ivy_to_rtl` refuses an application of
+            # one in the datapath: unlike a wire it is re-evaluated as the
+            # state it reads is updated, so it has no combinational
+            # meaning.  The relations survive for the invariants below,
+            # where nothing is translated. ----
+            definition ld_ans  = load_head ~= load_tail
+                & (store_head = store_tail | store_mark(store_head) ~= load_head)
+                & load_rdy(load_head)
+            definition st_go   = req_en_r & cache_to_lsq_creq_ready & req_wen_r
+            definition ld_head = load_head
+            definition ld_tail = load_tail
+            definition st_head = store_head
+            definition st_tail = store_tail
+
+            # Was a load filled by the cache?
+            definition ld_capture =
+                  (load_sent(load_head) & 0 < load_tail - load_head
+                   & ~load_rdy(load_head)
+                   & cache_to_lsq_resp_valid
+                   & cache_to_lsq_resp_idx = load_head
+                   & cache_to_lsq_resp_h = hw_high(load_addr(load_head))
+                   & cache_to_lsq_resp_o = hw_low(load_addr(load_head)))
+                | (load_sent(load_head + 1) & 1 < load_tail - load_head
+                   & ~load_rdy(load_head + 1)
+                   & cache_to_lsq_resp_valid
+                   & cache_to_lsq_resp_idx = load_head + 1
+                   & cache_to_lsq_resp_h = hw_high(load_addr(load_head + 1))
+                   & cache_to_lsq_resp_o = hw_low(load_addr(load_head + 1)))
+                | (load_sent(load_head + 2) & 2 < load_tail - load_head
+                   & ~load_rdy(load_head + 2)
+                   & cache_to_lsq_resp_valid
+                   & cache_to_lsq_resp_idx = load_head + 2
+                   & cache_to_lsq_resp_h = hw_high(load_addr(load_head + 2))
+                   & cache_to_lsq_resp_o = hw_low(load_addr(load_head + 2)))
+                | (load_sent(load_head + 3) & 3 < load_tail - load_head
+                   & ~load_rdy(load_head + 3)
+                   & cache_to_lsq_resp_valid
+                   & cache_to_lsq_resp_idx = load_head + 3
+                   & cache_to_lsq_resp_h = hw_high(load_addr(load_head + 3))
+                   & cache_to_lsq_resp_o = hw_low(load_addr(load_head + 3)))
+
+            # ==============================================================
+            # The datapath.  No ghost state is read or written here.
+            # ==============================================================
+            after posedge {
+
+
+                # ---------- 1. retire the head load to the cpu ----------
+                # It carries its own datum now, so this step no longer reads
+                # the cache at all: `ld_ans` is "the head entry is ready and
+                # its turn has come", and the response channel is step 1b's
+                # business.
+                cpu_valid_r := false;
+                if ld_ans {
+                    cpu_valid_r := true;
+                    cpu_addr_r  := load_addr(load_head);
+                    cpu_data_r  := load_data(load_head);
+                    load_head := load_head + 1;
+                };
+
+                # ---------- Cache response logic ------.
+                if load_sent(load_head) & 0 < load_tail - load_head
+                        & ~load_rdy(load_head)
+                        & cache_to_lsq_resp_valid
+                        & cache_to_lsq_resp_idx = load_head
+                        & cache_to_lsq_resp_h = hw_high(load_addr(load_head))
+                        & cache_to_lsq_resp_o = hw_low(load_addr(load_head)) {
+                    load_rdy(load_head)  := true;
+                    load_data(load_head) := cache_to_lsq_resp_data;
+                    load_sent(load_head) := false;
+                };
+                if load_sent(load_head + 1) & 1 < load_tail - load_head
+                        & ~load_rdy(load_head + 1)
+                        & cache_to_lsq_resp_valid
+                        & cache_to_lsq_resp_idx = load_head + 1
+                        & cache_to_lsq_resp_h = hw_high(load_addr(load_head + 1))
+                        & cache_to_lsq_resp_o = hw_low(load_addr(load_head + 1)) {
+                    load_rdy(load_head + 1)  := true;
+                    load_data(load_head + 1) := cache_to_lsq_resp_data;
+                    load_sent(load_head + 1) := false;
+                };
+                if load_sent(load_head + 2) & 2 < load_tail - load_head
+                        & ~load_rdy(load_head + 2)
+                        & cache_to_lsq_resp_valid
+                        & cache_to_lsq_resp_idx = load_head + 2
+                        & cache_to_lsq_resp_h = hw_high(load_addr(load_head + 2))
+                        & cache_to_lsq_resp_o = hw_low(load_addr(load_head + 2)) {
+                    load_rdy(load_head + 2)  := true;
+                    load_data(load_head + 2) := cache_to_lsq_resp_data;
+                    load_sent(load_head + 2) := false;
+                };
+                if load_sent(load_head + 3) & 3 < load_tail - load_head
+                        & ~load_rdy(load_head + 3)
+                        & cache_to_lsq_resp_valid
+                        & cache_to_lsq_resp_idx = load_head + 3
+                        & cache_to_lsq_resp_h = hw_high(load_addr(load_head + 3))
+                        & cache_to_lsq_resp_o = hw_low(load_addr(load_head + 3)) {
+                    load_rdy(load_head + 3)  := true;
+                    load_data(load_head + 3) := cache_to_lsq_resp_data;
+                    load_sent(load_head + 3) := false;
+                };
+
+                # ---------- 2. the cache takes the request on the port ----------
+                if req_en_r & cache_to_lsq_creq_ready {
+                    req_en_r := false;
+                    if st_go {
+                        store_head := store_head + 1;
+                    } else {
+                        load_sent(req_idx_r) := true;
+                    };
+                };
+
+                # ---------- 3. present the next request to the cache ----------
+                # `lsq.md` rules 1 and 2: the oldest load that has not been
+                # sent goes first, and the head store goes only when no load
+                # wants the port.  The two guards are no longer mutually
+                # exclusive -- a store may now be eligible while unsent loads
+                # exist behind it -- so loads-first is a genuine arbitration
+                # choice: it keeps read latency down and it is what lets the
+                # older loads a store must pass become sent in the first
+                # place.
+                #
+                # The store guard is `store_elig(store_head)` written out per
+                # occupied offset (a defined relation cannot be applied in
+                # the datapath): every older pending load is answered, or
+                # sent to a DIFFERENT address.  See the note at `store_elig`.
+                #
+                # The scan is written out over the four offsets, largest
+                # offset FIRST, so the smallest match survives and the oldest
+                # unsent load is the one presented -- under a wrapped window
+                # the SLOT order means nothing, the OFFSET order is age.  It
+                # is not a loop: `ivy_to_rtl` drops a loop silently, and the
+                # emitted LSQ would have issued nothing.  Note `laddr :=
+                # load_addr(load_head + 3)` rather than `load_addr(lidx)` --
+                # every array read keeps a register-addressed index, and the
+                # chosen index travels on as data into `req_idx_r`.
+                if ~req_en_r {
+                    var lsel  : bool     := false;
+                    var laddr : addr     := 0;
+                    var lidx  : load_idx := 0;
+                    if 3 < load_tail - load_head
+                            & ~load_rdy(load_head + 3) & ~load_sent(load_head + 3)
+                            & (store_head = store_tail
+                               | 3 < store_mark(store_head) - load_head) {
+                        lsel := true; laddr := load_addr(load_head + 3);
+                        lidx := load_head + 3;
+                    };
+                    if 2 < load_tail - load_head
+                            & ~load_rdy(load_head + 2) & ~load_sent(load_head + 2)
+                            & (store_head = store_tail
+                               | 2 < store_mark(store_head) - load_head) {
+                        lsel := true; laddr := load_addr(load_head + 2);
+                        lidx := load_head + 2;
+                    };
+                    if 1 < load_tail - load_head
+                            & ~load_rdy(load_head + 1) & ~load_sent(load_head + 1)
+                            & (store_head = store_tail
+                               | 1 < store_mark(store_head) - load_head) {
+                        lsel := true; laddr := load_addr(load_head + 1);
+                        lidx := load_head + 1;
+                    };
+                    if 0 < load_tail - load_head
+                            & ~load_rdy(load_head) & ~load_sent(load_head)
+                            & (store_head = store_tail
+                               | 0 < store_mark(store_head) - load_head) {
+                        lsel := true; laddr := load_addr(load_head);
+                        lidx := load_head;
+                    };
+                    if lsel {
+                        req_en_r   := true;
+                        req_wen_r  := false;
+                        req_addr_r := laddr;
+                        req_idx_r  := lidx;
+                    } else { if store_head ~= store_tail
+                                & (~(0 < load_tail - load_head
+                                     & 0 < store_mark(store_head) - load_head)
+                                   | load_rdy(load_head)
+                                   | (load_sent(load_head)
+                                      & load_addr(load_head) ~= store_addr(store_head)))
+                                & (~(1 < load_tail - load_head
+                                     & 1 < store_mark(store_head) - load_head)
+                                   | load_rdy(load_head + 1)
+                                   | (load_sent(load_head + 1)
+                                      & load_addr(load_head + 1) ~= store_addr(store_head)))
+                                & (~(2 < load_tail - load_head
+                                     & 2 < store_mark(store_head) - load_head)
+                                   | load_rdy(load_head + 2)
+                                   | (load_sent(load_head + 2)
+                                      & load_addr(load_head + 2) ~= store_addr(store_head)))
+                                & (~(3 < load_tail - load_head
+                                     & 3 < store_mark(store_head) - load_head)
+                                   | load_rdy(load_head + 3)
+                                   | (load_sent(load_head + 3)
+                                      & load_addr(load_head + 3) ~= store_addr(store_head))) {
+                        req_en_r    := true;
+                        req_wen_r   := true;
+                        req_addr_r  := store_addr(store_head);
+                        req_wdata_r := store_data(store_head);
+                    } };
+                };
+
+                # ---------- 4. accept the next operation from the cpu ----------
+                #
+                # Store-to-load forwarding: the datum of the NEWEST pending
+                # store to the address, if there is one.  The queue holds at
+                # most four entries, so the search is written out over the
+                # four offsets from `store_head`, oldest first, so the LATEST
+                # match survives -- under a wrapped window the offset order
+                # is the age order, which is what makes the survivor the
+                # newest.  It was a `while` loop; `ivy_to_rtl` drops a loop
+                # silently, so the emitted LSQ would have forwarded nothing
+                # at all.
+                #
+                # The scan runs here, in step 4, so it reads the pointers
+                # step 2 has already moved past the absorbed store -- the
+                # same state the ghost monitor's `ctag` stands at.
+                # ---- the guard is the datapath's twin of the ghost
+                # monitor's, textually: the two have to agree on the accept
+                # event or every tag-placement invariant loses its anchor. ----
+                if lsq_to_cpu_ready & cpu_to_lsq_req_en {
+                    if cpu_to_lsq_req_wen {
+                        store_addr(store_tail) := cpu_to_lsq_req_addr;
+                        store_data(store_tail) := cpu_to_lsq_req_wdata;
+                        store_mark(store_tail) := load_tail;
+                        store_tail := store_tail + 1;
+                    } else {
+                        var fhit : bool := false;
+                        # ---- the datum is a don't-care when nothing
+                        # matched (`l_val` is guarded by `load_rdy`), but an
+                        # uninitialised local has no net to read in RTL. ----
+                        var fdat : word := 0;
+                        if 0 < store_tail - store_head
+                                & store_addr(store_head) = cpu_to_lsq_req_addr {
+                            fhit := true; fdat := store_data(store_head);
+                        };
+                        if 1 < store_tail - store_head
+                                & store_addr(store_head + 1) = cpu_to_lsq_req_addr {
+                            fhit := true; fdat := store_data(store_head + 1);
+                        };
+                        if 2 < store_tail - store_head
+                                & store_addr(store_head + 2) = cpu_to_lsq_req_addr {
+                            fhit := true; fdat := store_data(store_head + 2);
+                        };
+                        if 3 < store_tail - store_head
+                                & store_addr(store_head + 3) = cpu_to_lsq_req_addr {
+                            fhit := true; fdat := store_data(store_head + 3);
+                        };
+                        load_addr(load_tail)  := cpu_to_lsq_req_addr;
+                        load_rdy(load_tail)   := fhit;
+                        load_data(load_tail)  := fdat;
+                        load_tail := load_tail + 1;
+                    };
+                };
+
+                # ---------- 6. room for another operation next cycle ----------
+                # ---- depth 2 rather than 4: `since_prev_wit`'s posedge
+                # check diverges on this machine at depth 4 (it does so on
+                # the unmodified file too).  The offset-2/3 arms of the
+                # unrolled scans above go dead under `q_l`; nothing else
+                # names the depth. ----
+                cpu_ready_r := store_tail - store_head < 2 & load_tail - load_head < 2;
+            }
+
+            # Liveness
+            
+            invariant [conserve_l] load_pending_pre(K) ->
+                  load_rdy(K)
+                | (loads_not_ready_before(K, L)
+                   -> loads_not_ready_before_pre(K, L))
+            invariant [conserve_s] load_pending_pre(K) ->
+                  load_rdy(K)
+                | (stores_not_ready_before(K, J)
+                   -> stores_not_ready_before_pre(K, J))
+            
+            # The justice condition is that a memory operation is answered. In that case that that occurs,
+            # explicitly state that the operation is no longer pending before. 
+            invariant [reduce_l] load_pending_pre(K) & ld_capture_pre
+                & (resp_idx_pre - lh_pre) < (K - lh_pre) ->
+                  loads_not_ready_before_pre(K, resp_idx_pre)
+                & ~loads_not_ready_before(K, resp_idx_pre)
+            invariant [reduce_s] load_pending_pre(K) & st_go_pre
+                & stores_not_ready_before_pre(K, sh_pre) ->
+                  ~stores_not_ready_before(K, sh_pre)
+
+            # ==============================================================
+            # Queue structure.
+            # ==============================================================
+
+            invariant [q_s] store_tail - store_head <= 2
+            invariant [q_l] load_tail - load_head <= 2
+            invariant [q_rdy] cpu_ready_r ->
+                store_tail - store_head < 2 & load_tail - load_head < 2
+
+            # ==============================================================
+            # Basic tag properties
+            # ==============================================================
+
+            invariant [c_now] memory.ctag <= trace.now
+            invariant [s_range] store_pending(J) ->
+                memory.ctag < stag(J) & stag(J) <= trace.now
+            invariant [l_range] load_pending(K) -> ltag(K) <= trace.now
+            invariant [s_mono] store_pending(J1) & store_pending(J2)
+                & (J1 - store_head) < (J2 - store_head) ->
+                stag(J1) < stag(J2)
+            invariant [l_mono] load_pending(K1) & load_pending(K2)
+                & (K1 - load_head) < (K2 - load_head) ->
+                ltag(K1) < ltag(K2)
+
+            # Tags are accurate to entries in the trace
+            invariant [s_kind] store_pending(J) ->
+                  op_wen(stag(J))
+                & op_addr(stag(J))  = store_addr(J)
+                & op_wdata(stag(J)) = store_data(J)
+            invariant [l_kind] load_pending(K) ->
+                  ~op_wen(ltag(K))
+                & op_addr(ltag(K)) = load_addr(K)
+
+            # Basic invariants for `mark_offset`. `mark_offset` is the same
+            # as `store_mark` except stated relative to `load_head`
+            invariant [mark_offset_def] store_pending(J) ->
+                mark_offset(J) = store_mark(J) - load_head
+            invariant [m_s] store_pending(J) ->
+                mark_offset(J) <= (load_tail - load_head)
+            invariant [m_mono] store_pending(J1) & store_pending(J2)
+                & (J1 - store_head) <= (J2 - store_head) ->
+                mark_offset(J1) <= mark_offset(J2)
+            invariant [cross_s] store_pending(J) & load_pending(K) ->
+                (stag(J) < ltag(K) <-> (K - load_head) >= mark_offset(J))
+            invariant [cross_l] store_pending(J) & load_pending(K) ->
+                (ltag(K) < stag(J) <-> (K - load_head) < mark_offset(J))
+            # ---- the bridge from the liveness ranking's store arm to
+            # `load_elig`: for a pending K they are complementary at
+            # `store_head`, so the liveness statements can be read in the
+            # vocabulary the arbiter (`pres_l`, `outst`) is stated in, and
+            # the store arm inherits the mark/tag facts above. ----
+            invariant [elig_zero] load_pending(K) ->
+                (load_elig(K) <-> ~stores_not_ready_before(K, store_head))
+
+            # `store_departed_past` means what it says it means
+            invariant [dep_ctag] load_pending(K) & store_departed_past(K) ->
+                ltag(K) < memory.ctag
+            invariant [snl_wit] st_after_nl & load_head ~= load_tail ->
+                  store_departed_past(load_tail - 1)
+                | (store_pending(store_tail - 1)
+                   & mark_offset(store_tail - 1) = (load_tail - load_head))
+            # ---- the witness was `exists J : store_idx. store_pending(J) &
+            # mark_offset(J) = (K - load_head)`; the skolemized existential
+            # sends z3 off the cliff in this invariant's own posedge check.
+            # At depth 2 (`q_s`) a pending store sits in `store_head` or
+            # `store_head + 1`, so the disjunction IS the existential,
+            # wired out by hand. ----
+            invariant [since_prev_wit] load_pending(K)
+                & 0 < (K - load_head) & store_since_prev_load(K) ->
+                  store_departed_past(K - 1)
+                | (store_pending(store_head)
+                   & mark_offset(store_head) = (K - load_head))
+                | (store_pending(store_head + 1)
+                   & mark_offset(store_head + 1) = (K - load_head))
+
+            # There is nothing between `ctag` and what's in the LSQ
+            invariant [cov] memory.ctag < trace.now ->
+                  (store_pending(store_head) & tag.succ(memory.ctag, stag(store_head)))
+                | (load_pending(cw) & tag.succ(memory.ctag, ltag(cw)))
+            invariant [hd_succ] load_head ~= load_tail & load_rdy(load_head)
+                & (store_head = store_tail | store_mark(store_head) ~= load_head)
+                & memory.ctag < ltag(load_head) ->
+                tag.succ(memory.ctag, ltag(load_head))
+
+            invariant [newest_l] load_pending(K)
+                & (K - load_head) + 1 = (load_tail - load_head)
+                & ~st_after_nl ->
+                ltag(K) = trace.now
+
+            # Entries across the load and store queues form a consecutive
+            # chain in the trace
+            invariant [nogap_ss] store_pending(J)
+                & (J - store_head) + 1 < (store_tail - store_head)
+                & store_mark(J + 1) = store_mark(J) ->
+                tag.succ(stag(J), stag(J + 1))
+            invariant [nogap_sl] store_pending(J)
+                & mark_offset(J) < (load_tail - load_head)
+                & ((J - store_head) + 1 >= (store_tail - store_head)
+                   | mark_offset(J) < mark_offset(J + 1)) ->
+                tag.succ(stag(J), ltag(store_mark(J)))
+            invariant [nogap_s0] store_pending(J) & stag(J) < trace.now ->
+                  ((J - store_head) + 1 < (store_tail - store_head)
+                   & store_mark(J + 1) = store_mark(J))
+                | mark_offset(J) < (load_tail - load_head)
+            invariant [nogap_ll] load_pending(K)
+                & (K - load_head) + 1 < (load_tail - load_head)
+                & ~store_since_prev_load(K + 1) ->
+                tag.succ(ltag(K), ltag(K + 1))
+            invariant [nogap_ls] load_pending(K) & ~store_departed_past(K)
+                & store_pending(J) & mark_offset(J) = (K - load_head) + 1
+                & (J = store_head | mark_offset(J - 1) <= (K - load_head)) ->
+                tag.succ(ltag(K), stag(J))
+
+            # If a load has data, then the data is accurate.
+            invariant [l_val] load_pending(K) & load_rdy(K) ->
+                load_data(K) = trace.st(ltag(K)).rdata
+
+            # Younger stores do not alias pending loads. This is necessary for 
+            # load-to-store forwarding
+            invariant [l_gap] load_pending(K) & ~load_rdy(K)
+                & store_pending(J)
+                & mark_offset(J) <= (K - load_head) ->
+                store_addr(J) ~= load_addr(K)
+
+            # If the load is in the queue and doesn't have data, then we could
+            # not forward a prior store. Thus, the load's data must be in 
+            # cache or memory
+            invariant [l_rdata] load_pending(K) & ~load_rdy(K) ->
+                trace.st(ltag(K)).rdata = trace.st(memory.ctag).mem(load_addr(K))
+
+            # ==============================================================
+            # The request on the cache port, and the outstanding loads.
+            #
+            # `pres_l` is stated against `req_idx_r` rather than against
+            # `load_head`, because the presented load is whichever slot step 3
+            # selected and that is no longer the head.  `outst` is stated per
+            # entry for the same reason, and it has lost the `~req_en_r`
+            # conjunct that used to serialise the seam to one in-flight
+            # request ever: several entries may be sent at once, and the port
+            # may hold a further one while they are owed.
+            #
+            # A store absorption and a load retire MAY now land on the same
+            # edge -- a store departs past answered loads, and one of them
+            # can be retiring that very cycle.  The ghost monitor's two
+            # `ctag` arms are each guarded to move the frontier only
+            # forward, so whichever of the two operations is younger wins
+            # and the order the arms run in does not matter.
+            # ==============================================================
+
+            invariant [pres_s] req_en_r & req_wen_r ->
+                  store_pending(store_head)
+                & store_elig(store_head)
+                & req_addr_r  = store_addr(store_head)
+                & req_wdata_r = store_data(store_head)
+            # ---- the depart-side walk, cached.  While a store sits
+            # presented on the port, the reference image at ITS tag is the
+            # frontier image with its own word written: everything strictly
+            # between `ctag` and `stag(store_head)` is a read (departed
+            # stores are absorbed into `ctag`, pending ones are younger),
+            # and reads preserve memory.  `img_ctag` then takes a store
+            # departure in ONE step -- the ghost sets `ctag :=
+            # stag(store_head)` on the same edge the memory commits the
+            # request into `img`, and this invariant is the memory content of
+            # that jump -- instead of re-deriving the walk under the whole
+            # memory context, which is where z3 diverged.  Maintained
+            # one-step itself: while the request is held, only loads can
+            # retire under it (`hd_succ` + `tr_rd`), and the walk proper is
+            # re-done only on the edge a new store is latched. ----
+            invariant [pres_mem] req_en_r & req_wen_r ->
+                trace.st(stag(store_head)).mem(concatbv3(H, O)) =
+                    (req_wdata_r
+                     if (H = hw_high(req_addr_r) & O = hw_low(req_addr_r))
+                     else trace.st(memory.ctag).mem(concatbv3(H, O)))
+            invariant [pres_l] req_en_r & ~req_wen_r ->
+                  load_pending(req_idx_r)
+                & req_addr_r = load_addr(req_idx_r)
+                & load_elig(req_idx_r)
+                & ~load_rdy(req_idx_r)
+                & ~load_sent(req_idx_r)
+            # ---- a sent bit belongs to a pending entry.  Set only under
+            # `pres_l`'s pendingness; a retiring head is ready, hence not
+            # sent, by `outst`.  This is what lets step 4 reuse a wrapped
+            # slot without clearing `load_sent` there -- the slot at
+            # `load_tail` is not pending, so its bit is already clear;
+            # without this invariant a stale bit on a not-yet-pending slot
+            # satisfies every other invariant and breaks `outst` the edge
+            # the slot is re-enqueued with a forwarding hit. ----
+            invariant [sent_pend] load_sent(K) -> load_pending(K)
+
+            invariant [outst] load_pending(K) & load_sent(K) ->
+                  load_elig(K)
+                & ~load_rdy(K)
+
+            # ---- liveness statement 1 (plan.md): enabledness at the
+            # bottom of the ranking.  When delta(K) is empty -- no unready
+            # load ahead (the explicit forall) and no older pending store
+            # (`load_elig`, via `elig_zero`) -- and K itself still wants
+            # the port, K matches step 3's scan guard and every smaller
+            # offset fails it, so with the port free (`~req_en_r`) the
+            # scan presents K: the guards run largest offset first, so the
+            # smallest match survives.  Stated in the datapath's own
+            # vocabulary (`store_mark`, not `mark_offset`), which is what
+            # the scan tests. ----
+            invariant [enab] load_pending(K) & load_elig(K)
+                & (forall L : load_idx. ~loads_not_ready_before(K, L))
+                & ~load_rdy(K) & ~load_sent(K) & ~req_en_r ->
+                  (store_head = store_tail
+                   | (K - load_head) < store_mark(store_head) - load_head)
+                & (forall L : load_idx.
+                    (L - load_head) < (K - load_head) ->
+                    ~((L - load_head) < (load_tail - load_head)
+                      & ~load_rdy(L) & ~load_sent(L)
+                      & (store_head = store_tail
+                         | (L - load_head) < store_mark(store_head) - load_head)))
+
+            # ==============================================================
+            # The correctness statements.
+            #
+            # `resp`: a datum handed back to the cpu is the datum the
+            # reference's read returned, at the address the reference read.
+            # For a forwarded load that is `l_fwd`.  For one the memory
+            # answered it is the whole seam, drawn at capture time out of
+            # pre-edge facts: the memory's datum is `img` at the address it
+            # echoes (the `resp_img` assumption), the capture guard accepts
+            # only when that address is entry K's own, and `img_ctag` equates
+            # that image with `st(memory.ctag).mem`; `l_rdata` then turns the
+            # captured datum into the one the reference's read returned.
+            #
+            # `consistency`: the responses come back in program order.  A load
+            # sits in the load queue exactly while its response is owed -- it
+            # is enqueued when the cpu hands it over and leaves at the edge its
+            # datum goes out -- so "no older response is still outstanding" is
+            # exactly "every load left in the queue is younger than the one
+            # being answered".
+            # ==============================================================
+
+            invariant [consistency] cpu_valid_r & load_pending(K) ->
+                cpu_tag_r < ltag(K)
+        }
+
+        # The ultimate theorem tying memory subsystem to the trace.
+        specification {
+            invariant [resp] lsq_to_cpu_valid ->
+                  ~op_wen(cpu_tag_r)
+                & cpu_tag_r <= trace.now
+                & lsq_to_cpu_resp_addr = op_addr(cpu_tag_r)
+                & lsq_to_cpu_data      = trace.st(cpu_tag_r).rdata
+        }
+    } with this, memory, trace, abs_memory, tag, addr_thy, basis
+
+    # ==================================================================
+    # The memory.
+    #
+    # The LSQ is wired straight to this -- no cache and no memory
+    # controller sit between them.  It holds the reference image `img`,
+    # indexed by (line, word-offset) and word-granular -- the granularity
+    # the LSQ's request/response channel already moves -- and the frontier
+    # tag `ctag`, the tag of the youngest operation to have left the LSQ.
+    # `ctag` is DECLARED here, beside the image it indexes, but ADVANCED by
+    # `lsq_body`'s ghost monitor off the queues' own tags, so every isolate
+    # that presents this specification must present `lsq_body`'s too.
+    #
+    # A store handshake writes `img` on the same edge that `lsq_body`
+    # advances `ctag`, so the image always represents the trace frontier
+    # directly.  The only memory-data contract needed by the LSQ is
+    # `resp_img`: a response carries `img` at the address it echoes.
+    # ==================================================================
+    isolate memory = {
+
+        # ---- the LSQ channel.  The wire names are carried over from the
+        # cache era: `lsq_body`'s port and `plan.md`'s liveness argument
+        # both name them.  Connected at the interconnect below. ----
+        wire lsq_to_cache_req_en     : bool
+        wire lsq_to_cache_req_h      : line
+        wire lsq_to_cache_req_o      : woffset
+        wire lsq_to_cache_req_wen    : bool
+        wire lsq_to_cache_req_wdata  : word
+        wire lsq_to_cache_req_idx    : load_idx
+        wire cache_to_lsq_creq_ready : bool
+        wire cache_to_lsq_resp_valid : bool
+        wire cache_to_lsq_resp_h     : line
+        wire cache_to_lsq_resp_o     : woffset
+        wire cache_to_lsq_resp_data  : word
+        wire cache_to_lsq_resp_idx   : load_idx
+
+        specification {
+            function img(H : line, O : woffset) : word
+
+            # ---- the frontier, advanced by `lsq_body`'s ghost monitor ----
+            var ctag : tag
+
+            after init {
+                img(H, O)   := init_img(H, O);
+                ctag        := 0;
+            }
+
+            # ---- commit an accepted store directly into `img` ----
+            after posedge {
+                if lsq_to_cache_req_en
+                        & cache_to_lsq_creq_ready
+                        & lsq_to_cache_req_wen {
+                    img(H, O) := (lsq_to_cache_req_wdata
+                                  if (H = lsq_to_cache_req_h
+                                      & O = lsq_to_cache_req_o)
+                                  else img(H, O));
+                };
+            }
+
+            # `resp_img`: the datum handed back is the image at the address
+            # the response echoes -- true by construction (`resp_data` is
+            # defined as that read below).
+            invariant [resp_img] cache_to_lsq_resp_valid ->
+                cache_to_lsq_resp_data = img(cache_to_lsq_resp_h,
+                                             cache_to_lsq_resp_o)
+        }
+
+        implementation {
+            # ---- the registered load-response port.  A load taken this
+            # edge is answered the next, carrying the CURRENT image at its
+            # address (`resp_data` reads `img` now, not a snapshot -- the
+            # LSQ's `l_gap` keeps that word stable while the load is owed). ----
+            var rsp_valid_r : bool
+            var rsp_h_r     : line
+            var rsp_o_r     : woffset
+            var rsp_idx_r   : load_idx
+
+            after init {
+                rsp_valid_r := false;
+                rsp_h_r := 0; rsp_o_r := 0; rsp_idx_r := 0;
+            }
+
+            # ---- direct memory accepts every request ----
+            definition cache_to_lsq_creq_ready = true
+
+            definition cache_to_lsq_resp_valid = rsp_valid_r
+            definition cache_to_lsq_resp_h     = rsp_h_r
+            definition cache_to_lsq_resp_o     = rsp_o_r
+            definition cache_to_lsq_resp_idx   = rsp_idx_r
+            definition cache_to_lsq_resp_data  = img(rsp_h_r, rsp_o_r)
+
+            after posedge {
+                rsp_valid_r := false;
+                if lsq_to_cache_req_en
+                        & cache_to_lsq_creq_ready
+                        & ~lsq_to_cache_req_wen {
+                    rsp_valid_r := true;
+                    rsp_h_r   := lsq_to_cache_req_h;
+                    rsp_o_r   := lsq_to_cache_req_o;
+                    rsp_idx_r := lsq_to_cache_req_idx;
+                };
+            }
+        }
+    } with this, lsq_body, trace, abs_memory, tag, addr_thy, basis
+
+    # ------------------------------------------------------------------
+    # Wire the LSQ and the memory together.  Each isolate declares the
+    # wires on both sides of the channel; the connections are made here, so
+    # no isolate can see the logic that drives its inputs.
+    # ------------------------------------------------------------------
+
+    # ---- the LSQ's request port drives the memory's ----
+    definition memory.lsq_to_cache_req_en    = lsq_body.lsq_to_cache_req_en
+    definition memory.lsq_to_cache_req_h     = lsq_body.lsq_to_cache_req_h
+    definition memory.lsq_to_cache_req_o     = lsq_body.lsq_to_cache_req_o
+    definition memory.lsq_to_cache_req_wen   = lsq_body.lsq_to_cache_req_wen
+    definition memory.lsq_to_cache_req_wdata = lsq_body.lsq_to_cache_req_wdata
+    definition memory.lsq_to_cache_req_idx   = lsq_body.lsq_to_cache_req_idx
+
+    # ---- the memory's response port drives the LSQ's ----
+    definition lsq_body.cache_to_lsq_creq_ready = memory.cache_to_lsq_creq_ready
+    definition lsq_body.cache_to_lsq_resp_valid = memory.cache_to_lsq_resp_valid
+    definition lsq_body.cache_to_lsq_resp_h     = memory.cache_to_lsq_resp_h
+    definition lsq_body.cache_to_lsq_resp_o     = memory.cache_to_lsq_resp_o
+    definition lsq_body.cache_to_lsq_resp_data  = memory.cache_to_lsq_resp_data
+    definition lsq_body.cache_to_lsq_resp_idx   = memory.cache_to_lsq_resp_idx
+
+    # ---- the top-level request port drives the LSQ's, and the LSQ's
+    # response port drives the top-level one ----
+    definition lsq_body.cpu_to_lsq_req_en    = cpu_req_en
+    definition lsq_body.cpu_to_lsq_req_addr  = cpu_req_addr
+    definition lsq_body.cpu_to_lsq_req_wen   = cpu_req_wen
+    definition lsq_body.cpu_to_lsq_req_wdata = cpu_req_wdata
+
+    definition cpu_valid     = lsq_body.lsq_to_cpu_valid
+    definition cpu_resp_addr = lsq_body.lsq_to_cpu_resp_addr
+    definition cpu_data      = lsq_body.lsq_to_cpu_data
+    definition cpu_ready     = lsq_body.lsq_to_cpu_ready
+}

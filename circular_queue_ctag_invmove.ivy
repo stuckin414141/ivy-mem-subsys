@@ -529,10 +529,49 @@ object mem_subsys = {
             function store_since_prev_load(K : load_idx) : bool
             function store_departed_past(K : load_idx) : bool
             function mark_offset(J : store_idx) : load_idx
-
-            # Oldest load after `ctag`
+            # ---- `cw`: the slot of `cov`'s load-side witness.  `cov`'s
+            # old conclusion was an EXISTENTIAL over the slots, and z3
+            # diverges synthesising the witness under the updated arrays
+            # every edge; the ghost knows exactly who the witness is, so
+            # it names it and the conclusion is ground.  Set wherever the
+            # frontier moves: past a retiring load, the next operation can
+            # only be the load behind it; past a departing store, the
+            # first load after that store sits at the slot its mark names;
+            # and when a load arrives right at the frontier, it is its own
+            # witness. ----
             var cw : load_idx
             var cpu_tag_r : tag                 # tag the response port answers
+
+            # ==============================================================
+            # THE FRONTIER CHANNEL: LSQ -> cache, ghost and spec-only.
+            #
+            # `cachemem.ctag` is the cache's state and is advanced by the
+            # cache's OWN monitor, off these three wires.  Everything the
+            # two arms need to know about the queue crosses here:
+            #
+            #   * the store arm needs no event of its own -- the cache's
+            #     accept guard IS the departure -- so only the departing
+            #     store's tag crosses (`lsq_to_cache_req_tag`);
+            #   * the load arm has no cache-side event at all, so it
+            #     brings both (`lsq_to_cache_ret_en`, `_ret_tag`).
+            #
+            # Declared in `specification`, not at the bare level beside the
+            # observation port, and NOT mirrored into `cachemem`: `tag` has
+            # no bit width, so neither these wires nor an interconnect
+            # equation for them may reach the RTL.  `cachemem` reads them
+            # under their own names, which also makes each side's wire
+            # literally the same symbol -- there is no alias to identify.
+            #
+            # The defining equations sit here in `specification`, unlike
+            # `st_go`'s in `implementation`, so `cachemem` sees the
+            # equations rather than three free wires. ----
+            # ==============================================================
+            wire lsq_to_cache_req_tag : tag   # the departing store's tag
+            wire lsq_to_cache_ret_en  : bool  # a load retires this edge ...
+            wire lsq_to_cache_ret_tag : tag   # ... and this is its tag
+            definition lsq_to_cache_req_tag = stag(st_head)
+            definition lsq_to_cache_ret_en  = ld_ans
+            definition lsq_to_cache_ret_tag = ltag(ld_head)
 
 
             # ==============================================================
@@ -543,24 +582,28 @@ object mem_subsys = {
             # This block sits in `specification`, which is declared *before*
             # `implementation`, so it runs first and every test here reads the
             # pre-edge datapath state -- exactly the state the matching
-            # datapath test reads.  The order is also what makes `forward`
-            # provable: the datapath calls it in step 4, after step 2 has
-            # absorbed the head store, and its loop invariants are stated
-            # against the `ctag` that this block has already advanced past
-            # that store.
+            # datapath test reads.
+            #
+            # It no longer moves the frontier: `cachemem`'s own monitor
+            # does that, off the channel above.  What is left here is the
+            # witness bookkeeping, whose guards are the twins of that
+            # monitor's -- and they read the PRE-edge `cachemem.ctag`,
+            # because this block runs first.  The two readings agree: when
+            # both arms fire the retiring load is older than the departing
+            # store (`ld_ans` forbids `store_mark(store_head) = load_head`,
+            # so `cross_l` puts the head load below the head store), so the
+            # load arm never lifts the frontier past the store's tag.
             # ==============================================================
             after posedge {
 
                 if ld_ans {
                     cpu_tag_r := ltag(ld_head);     # the tag the port answers
                     if cachemem.ctag < ltag(ld_head) {
-                        cachemem.ctag := ltag(ld_head);
                         cw := ld_head + 1;
                     };
                 };
 
                 if st_go & cachemem.ctag < stag(st_head) {
-                    cachemem.ctag := stag(st_head);
                     cw := store_mark(st_head);
                     # ---- the departing store passes every pending load
                     # younger than itself; mark them.  `mark_offset` is
@@ -605,17 +648,79 @@ object mem_subsys = {
                     mark_offset(X) := mark_offset(X) - 1;
                 };
             }
-        }
 
-        # The logical view of memory presented by the cache + memory controller corresponds to the trace.
-        private {
-            invariant [img_ctag_s] cachemem.stage_store ->
-                trace.st(cachemem.ctag).mem(
-                    concatbv3(cachemem.stage_h_g, cachemem.stage_o_g))
-                = cachemem.stage_d_g
-            invariant [img_ctag] ~(cachemem.stage_store
-                    & H = cachemem.stage_h_g & O = cachemem.stage_o_g) ->
-                trace.st(cachemem.ctag).mem(concatbv3(H, O)) = cachemem.img(H, O)
+            # ==============================================================
+            # THE SEAM, LSQ side.  `img_ctag*` live in `cachemem` now,
+            # beside the frontier and the images they speak about.  Down
+            # there the queue is invisible -- `store_head`, the request
+            # registers and `pres_mem` are all in this isolate's
+            # implementation -- so the two facts the frontier's arms need
+            # are restated here over the channel wires and exported.
+            #
+            # `ivy_check` hands a specification invariant to every isolate
+            # that presents this one as an assumption on `posedge`, which
+            # is where `cachemem` needs these.  There is no such hand-over
+            # at init, and none is needed: at init `img` is `init_img`,
+            # `ctag` is 0, nothing is staged, and `p_initimg` bridges the
+            # array to `init_mem`.
+            #
+            # `ex_mem` is `pres_mem` over the wires -- the reference image
+            # one step past the frontier is the frontier's with the
+            # departing store's word written.  That is the whole content of
+            # a store departure, in one step.
+            #
+            # `ex_ld` is `hd_succ` over the retire wire, plus the kind of
+            # the operation retired: the load arm lifts the frontier by
+            # exactly one operation and that operation is a READ, so
+            # `tr_step` carries the image across it unchanged.
+            #
+            # `c_now` moved up here from `implementation` for the same
+            # reason -- `cachemem` needs the frontier at or behind
+            # `trace.now`, or `trace.step` could be seen overwriting the
+            # very state `img_ctag*` name.
+            # ==============================================================
+            invariant [c_now] cachemem.ctag <= trace.now
+            invariant [ex_mem] lsq_to_cache_req_en & lsq_to_cache_req_wen ->
+                trace.st(lsq_to_cache_req_tag).mem(concatbv3(H, O)) =
+                    (lsq_to_cache_req_wdata
+                     if (H = lsq_to_cache_req_h & O = lsq_to_cache_req_o)
+                     else trace.st(cachemem.ctag).mem(concatbv3(H, O)))
+            # ---- the frontier is strictly BEHIND a departing store, so
+            # the cache's store arm always fires its guard and the two
+            # facts above always speak about the tag the frontier takes.
+            # `s_range` at the head entry says it; without it `cachemem`
+            # must consider an accept whose tag is already absorbed, where
+            # the frontier stands still and the stage latches anyway. ----
+            invariant [ex_lt] lsq_to_cache_req_en & lsq_to_cache_req_wen ->
+                cachemem.ctag < lsq_to_cache_req_tag
+            # ---- ground instance of `ex_mem` at the departing store's own
+            # word: the same fact with no quantifier to instantiate. ----
+            invariant [ex_s] lsq_to_cache_req_en & lsq_to_cache_req_wen ->
+                trace.st(lsq_to_cache_req_tag).mem(
+                    concatbv3(lsq_to_cache_req_h, lsq_to_cache_req_o))
+                = lsq_to_cache_req_wdata
+            invariant [ex_ld] lsq_to_cache_ret_en
+                & cachemem.ctag < lsq_to_cache_ret_tag ->
+                  tag.succ(cachemem.ctag, lsq_to_cache_ret_tag)
+                & ~op_wen(lsq_to_cache_ret_tag)
+            # ---- the retired operation has been EXECUTED: `tr_step` is
+            # guarded by `done`, which is `0 < T & T <= trace.now`, and the
+            # frontier's load arm has to walk the image across `ret_tag`.
+            # `l_range` at the head entry says it. ----
+            invariant [ex_ret_now] lsq_to_cache_ret_en ->
+                lsq_to_cache_ret_tag <= trace.now
+            # ---- when BOTH arms fire the retiring load is older than the
+            # departing store, so the store arm wins and the frontier lands
+            # on the store's tag.  Without this `cachemem` must consider a
+            # retire that lifts the frontier PAST the store being taken,
+            # where the store arm's guard fails and the stage latches a
+            # store the frontier has already gone by.  `ld_ans` forbids
+            # `store_mark(store_head) = load_head`, so `mark_offset` of the
+            # head store is non-zero and `cross_l` puts the head load below
+            # it. ----
+            invariant [ex_ord] lsq_to_cache_ret_en & lsq_to_cache_req_en
+                    & lsq_to_cache_req_wen ->
+                lsq_to_cache_ret_tag < lsq_to_cache_req_tag
         }
 
         implementation {
@@ -994,7 +1099,6 @@ object mem_subsys = {
             # Basic tag properties
             # ==============================================================
 
-            invariant [c_now] cachemem.ctag <= trace.now
             invariant [s_range] store_pending(J) ->
                 cachemem.ctag < stag(J) & stag(J) <= trace.now
             invariant [l_range] load_pending(K) -> ltag(K) <= trace.now
@@ -1028,7 +1132,15 @@ object mem_subsys = {
             invariant [cross_l] store_pending(J) & load_pending(K) ->
                 (ltag(K) < stag(J) <-> (K - load_head) < mark_offset(J))
 
-            # `store_departed_past` means what it says it means
+            # ---- `store_departed_past` comes with the absorbed tag, and
+            # the arrival bits come with witnesses: a bare ghost bit says
+            # nothing on its own, so each one is tied to the queue entry
+            # (or the `ctag` fact) that justifies it.  `snl_wit`: if a
+            # store arrived after the newest load, then the newest STORE
+            # is such a store -- still pending with its mark at the load
+            # tail, or already departed past the newest load.
+            # `since_prev_wit`: a store between loads K-1 and K is pending
+            # with its mark at K, or departed past K-1. ----
             invariant [dep_ctag] load_pending(K) & store_departed_past(K) ->
                 ltag(K) < cachemem.ctag
             invariant [snl_wit] st_after_nl & load_head ~= load_tail ->
@@ -1041,10 +1153,25 @@ object mem_subsys = {
                 | (exists J : store_idx. store_pending(J)
                    & mark_offset(J) = (K - load_head))
 
-            # There is nothing between `ctag` and what's in the LSQ
+            # ---- the load witness is named by the ghost (`cw`) rather
+            # than bound by an existential: the head load may itself have
+            # been passed by a departing store (it then sits at or below
+            # `ctag`), and the operation right after the frontier can be
+            # any later pending load -- but the ghost always knows which,
+            # so the conclusion stays ground. ----
             invariant [cov] cachemem.ctag < trace.now ->
                   (store_pending(store_head) & tag.succ(cachemem.ctag, stag(store_head)))
                 | (load_pending(cw) & tag.succ(cachemem.ctag, ltag(cw)))
+
+            # ---- the retire arm's witness, stated as a GROUND fact so the
+            # queries that watch `ctag` move (`img_ctag*`, `c_now`, `cov`
+            # itself) take it in one step instead of re-deriving it through
+            # `cov`+`l_mono`+`cross_l`: when the head load is answered and
+            # its turn has come (the `ld_ans` test, spelled out) and the
+            # frontier still sits below it, the head load is the very next
+            # operation.  Everything older is absorbed: older loads retired
+            # (head is the oldest pending), and the eligibility conjunct
+            # says every older store departed. ----
             invariant [hd_succ] load_head ~= load_tail & load_rdy(load_head)
                 & (store_head = store_tail | store_mark(store_head) ~= load_head)
                 & cachemem.ctag < ltag(load_head) ->
@@ -1070,6 +1197,7 @@ object mem_subsys = {
                   ((J - store_head) + 1 < (store_tail - store_head)
                    & store_mark(J + 1) = store_mark(J))
                 | mark_offset(J) < (load_tail - load_head)
+
             invariant [nogap_ll] load_pending(K)
                 & (K - load_head) + 1 < (load_tail - load_head)
                 & ~store_since_prev_load(K + 1) ->
@@ -1079,7 +1207,40 @@ object mem_subsys = {
                 & (J = store_head | mark_offset(J - 1) <= (K - load_head)) ->
                 tag.succ(ltag(K), stag(J))
 
-            # If a load has data, then the data is accurate.
+            # ---- The datum in a ready entry is the datum the reference's read
+            # returned.  This is `lsq.md`'s `Stmt`, and it is one-step
+            # inductive in both of the ways an entry becomes ready:
+            #
+            #   * forwarded at accept -- the store chain is walked through
+            #     `tr_step` at the queue's own tags, down to the newest
+            #     pending store at the address, and `st(T)` never changes
+            #     once T is recorded, so nothing has to be re-established
+            #     afterwards;
+            #   * captured off the cache -- `l_rdata` below is what the
+            #     response has to match, and it is maintained while the entry
+            #     is NOT ready, which is exactly when a response can arrive.
+            #
+            # `l_gap` is the anti-aliasing side condition, and it is the one
+            # place the "no store to this address" fact appears.  Note the
+            # direction: it quantifies over QUEUE INDICES, with the address
+            # only ever under `store_addr(J)`/`load_addr(K)`.  There is no
+            # function from an address back to an index, so no Skolem cycle
+            # and no matching loop -- both queues are `bv[3]`-indexed and the
+            # quantifier costs an expansion over eight slots.  `store_mark(J)
+            # - load_head <= K - load_head` is "older than K" in pure offset
+            # arithmetic, by `cross_l`; it needs no tag comparison.
+            #
+            # `l_gap` exists only to carry `l_rdata` across a single store
+            # absorption: `tr_step` at `stag(store_head)` gives
+            # `st(stag(store_head)).mem(a) = st(ctag).mem(a)` whenever
+            # `store_addr(store_head) ~= a`, and `l_gap` at `J = store_head`
+            # supplies exactly that side condition.
+            #
+            # `l_rdata` is stated in the `.rdata` form rather than as
+            # `.mem(addr)` because `.rdata` is a syntactic match for `resp`
+            # below, so the top-level goal closes without re-deriving the
+            # predecessor tag.  The `.mem(addr)` form is not carried beside
+            # it: `l_rdata` alone is what the capture needs. ----
             invariant [l_val] load_pending(K) & load_rdy(K) ->
                 load_data(K) = trace.st(ltag(K)).rdata
 
@@ -1090,9 +1251,6 @@ object mem_subsys = {
                 & mark_offset(J) <= (K - load_head) ->
                 store_addr(J) ~= load_addr(K)
 
-            # If the load is in the queue and doesn't have data, then we could
-            # not forward a prior store. Thus, the load's data must be in 
-            # cache or memory
             invariant [l_rdata] load_pending(K) & ~load_rdy(K) ->
                 trace.st(ltag(K)).rdata = trace.st(cachemem.ctag).mem(load_addr(K))
 
@@ -1306,11 +1464,14 @@ object mem_subsys = {
             function img(H : line, O : woffset) : word
 
             # ---- the frontier: the tag of the youngest operation to
-            # have left the LSQ.  Declared HERE, beside the images it
-            # indexes, but ADVANCED by `lsq_body`'s ghost monitor, off
-            # the queues' own tags -- so every isolate that presents this
-            # specification must present `lsq_body`'s too, or the arms
-            # that move it are invisible writers of visible state. ----
+            # have left the LSQ.  Declared here, beside the images it
+            # indexes, and ADVANCED HERE, by the monitor below, off the
+            # LSQ's ghost channel (`lsq_body.lsq_to_cache_*`).  It used to
+            # be written by `lsq_body`'s ghost monitor, which made every
+            # isolate presenting this specification present the LSQ's too
+            # -- otherwise the arms that move it were invisible writers of
+            # visible state.  The state and its updates are one object
+            # again; what crosses the seam is three wires. ----
             var ctag : tag
 
             # Specifies what lines are owned by the cache
@@ -1365,6 +1526,29 @@ object mem_subsys = {
             # implementations, which leaves them free -- and a guard on a
             # free wire fires. ----
             after posedge {
+
+                # ---- THE FRONTIER.  Both arms are the cache's own, read
+                # off the LSQ's ghost channel.  Each lifts the frontier
+                # only forward, so on an edge that both retires a load and
+                # takes a store the younger operation wins and the order
+                # of the two arms does not matter.
+                #
+                # The store arm's guard is the stage arm's accept guard
+                # below, textually -- one event, one guard, in one monitor.
+                # It used to be `st_go` in the LSQ's ghost monitor twinned
+                # by hand against this conjunction, with the LSQ's wire
+                # definition hidden from the isolate that had to trust it. ----
+                if lsq_body.lsq_to_cache_ret_en
+                        & ctag < lsq_body.lsq_to_cache_ret_tag {
+                    ctag := lsq_body.lsq_to_cache_ret_tag;
+                };
+
+                if lsq_to_cache_req_en
+                        & cache_to_lsq_creq_ready
+                        & lsq_to_cache_req_wen
+                        & ctag < lsq_body.lsq_to_cache_req_tag {
+                    ctag := lsq_body.lsq_to_cache_req_tag;
+                };
 
                 # ---- CLEAR ownership at a command-beat landing, BEFORE
                 # the drain arm below: on the one edge where a store to a
@@ -1422,6 +1606,26 @@ object mem_subsys = {
                     stage_d_g := lsq_to_cache_req_wdata;
                 };
             }
+
+            # ==============================================================
+            # THE SEAM, cache side.  The logical view of memory the cache
+            # presents corresponds to the trace at the frontier.
+            #
+            # `img_ctag` is that correspondence minus one word -- a store
+            # that has left the LSQ but has not yet reached the array --
+            # and `img_ctag_s` carries the datum at the hole.  Proved here,
+            # where the frontier and the array are, off `lsq_body`'s
+            # exported `ex_mem`/`ex_ld`/`c_now` and `cache_body`'s
+            # `rdy_drain` (which is what says the hole is empty when a new
+            # store is taken); `lsq_body` reads the pair back as the bridge
+            # its load-capture argument ends on.
+            # ==============================================================
+            invariant [img_ctag_s] stage_store ->
+                trace.st(ctag).mem(concatbv3(stage_h_g, stage_o_g))
+                = stage_d_g
+            invariant [img_ctag] ~(stage_store
+                    & H = stage_h_g & O = stage_o_g) ->
+                trace.st(ctag).mem(concatbv3(H, O)) = img(H, O)
         }
 
         # ==================================================================
@@ -2743,7 +2947,14 @@ object mem_subsys = {
         definition mem_wr_addr = mc_body.mem_wr_addr
         definition mem_wr_data = mc_body.mem_wr_data
         definition mc_body.mem_rdata = mem_rdata
-    } with this, lsq_body, trace, abs_memory, tag, addr_thy, basis, data_impl
+    # ---- `cache_body` is presented here, unlike before the frontier
+    # moved in: `rdy_drain` is what says the staged word is already
+    # draining when a second store is taken, and without it `img_ctag`'s
+    # exception would have to cover two stores at once.  Only invariants
+    # of isolates NAMED here are handed to this one as assumptions --
+    # nesting does not do it. ----
+    } with this, lsq_body, cachemem.cache_body, trace, abs_memory, tag,
+          addr_thy, basis, data_impl
 
     # ---- the interconnect.  It sits at the object's bare level, not in an
     # `implementation` block, so each child can see that the wire on its own

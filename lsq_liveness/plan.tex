@@ -1,0 +1,306 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[strings]{underscore}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\setlist[itemize]{topsep=4pt, itemsep=4pt, parsep=3pt}
+\setlist[enumerate]{topsep=4pt, itemsep=6pt, parsep=3pt}
+
+\title{Proving Liveness of Load-Store Queue}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+Follow the \emph{relational ranking} approach of McMillan, \emph{Toward
+Liveness Proofs at Scale}, CAV 2024 (Rules~6 and~8). Fix \texttt{e} to be
+an arbitrary entry of the load queue, at slot \texttt{K}.
+
+There needs to be some sort of statement that infinitely often the LSQ accepts
+requests. 
+
+
+
+\section{In queue entails will be sent}
+Rule 6, instantiations:
+\begin{itemize}
+\item \texttt{p}: \texttt{e} is in the queue --- \texttt{load_pending(K)}
+\item \texttt{q}: \texttt{e} is answered in the queue --- \texttt{load_rdy(K)}
+\item \texttt{r}: The memory system responds to an entry before \texttt{e}
+\item Liveness invariant \texttt{phi}: \texttt{true}. It isn't needed.
+\item Ranking relation \texttt{delta}: the things ahead of \texttt{e}, in
+  \emph{both} queues, that are not ready --- the \emph{set}, not its
+  cardinality.
+\end{itemize}
+
+This yields the following 4 invariants to prove:
+\begin{itemize}
+\item 
+\end{itemize}
+
+\subsection{The ranking relation}
+
+For a pending load slot \texttt{K}, with \texttt{off(X) = X - load_head},
+\texttt{delta(K)} has one arm per queue:
+
+{\small
+\begin{verbatim}
+loads_not_ready_before(K, L) =
+    load_pending(L) & ~load_rdy(L) & off(L) < off(K)
+
+stores_not_ready_before(K, J) =
+    store_pending(J) & mark_offset(J) <= off(K)
+\end{verbatim}
+}
+
+\texttt{delta(K)} is the pair, ordered componentwise: it is
+\emph{conserved} when neither arm gains an element and \emph{reduced}
+when one arm loses one and neither gains. Two arms rather than one
+because the two queues are indexed by different sorts, \texttt{load_idx}
+and \texttt{store_idx}; the paper's Definition~1 admits exactly this ---
+a ranking is an indexed set of relations, ``each predicate may be over a
+different sort''. This is the same split the two summands of a numeric
+measure would have had, minus the addition.
+
+\texttt{mark_offset(J) <= off(K)} is ``store \texttt{J} is older than load
+\texttt{K}'' in pure offset arithmetic (\texttt{cross_s}, \texttt{cross_l})
+--- the same idiom \texttt{store_elig} and
+\texttt{l_gap} already use, so no new tag reasoning enters. A pending
+store is never \emph{ready}; it leaves only by departing, so every older
+pending store counts, which is what makes the second arm the store
+queue's share of the ranking.
+
+Both arms are indexed off a register (\texttt{load_pending}/\texttt{store_pending}
+compare against \texttt{load_head}/\texttt{store_head}), so no unrolling
+over the four offsets is needed and no \texttt{while} appears: as
+relations they are stated once, universally, and the solver instantiates
+them at the slots it needs. This is the second thing the relational form
+buys --- the numeric version had to be written out four times per arm to
+be summable.
+
+\subsection{Reused relations}
+
+The ranking needs three things and two of them already exist.
+
+\begin{itemize}
+\item \texttt{stores_not_ready_before(K, store_head)} \textbf{is}
+  \texttt{\textasciitilde{}load_elig(K)} for a
+  pending \texttt{K}: \texttt{load_elig}'s body says either the store
+  queue is empty --- so \texttt{store_pending(store_head)} is false ---
+  or \texttt{store_head}'s mark sits strictly above \texttt{off(K)}.
+  Worth stating once, since statements~1 and~3 both lean on it:
+
+  {\small
+  \begin{verbatim}
+invariant [elig_zero] load_pending(K) ->
+    (load_elig(K) <-> ~stores_not_ready_before(K, store_head))
+\end{verbatim}
+  }
+
+  It is also the bridge that lets the store arm inherit the existing
+  tag-order facts (\texttt{cross_s}, \texttt{cross_l}) rather than
+  needing new ones. Note what is \emph{not} needed: the numeric
+  version had to turn ``the counted set is non-empty'' into
+  ``\texttt{store_head} is in it'', which is \texttt{m_mono}. A
+  relation is reduced by exhibiting a
+  witness, and statement~3 names \texttt{st_head} as the witness in its
+  own hypothesis, so \texttt{m_mono} no longer has to carry that step.
+\item \texttt{store_pending} and \texttt{load_pending} are the window
+  guards in the two arms; \texttt{load_pending_pre} is just the
+  latter's body restated over the pointer wires.
+\item \texttt{store_elig} is \emph{not} reusable for the
+  load arm, though it reads close to it. Its body lets a load ahead be
+  sent-but-unanswered provided the addresses differ; the ranking has to
+  include that load, because it is not ready and the cache still owes
+  it. So \texttt{loads_not_ready_before} is the one genuinely new
+  relation here.
+\end{itemize}
+
+Why this ranking and not ``the entries before \texttt{e}'':
+
+{\small
+\begin{tabular}{@{} L{0.34\linewidth} L{0.60\linewidth} @{}}
+\toprule
+event & effect on \texttt{delta(K)} \\
+\midrule
+response captured at an offset \texttt{< off(K)} & \textbf{loses \texttt{cache_to_lsq_resp_idx}} \\
+response captured at \texttt{K} & \texttt{q} reached \\
+response captured after \texttt{K} & conserved \\
+store departs (\texttt{st_go}) and was older than \texttt{K} & \textbf{loses \texttt{st_head}} \\
+store arrives & conserved --- its mark lands at \texttt{off(ld_tail)}, younger than \texttt{K} \\
+load arrives & conserved --- it lands at the tail \\
+head load retires (\texttt{ld_ans}) & conserved --- the retired head was ready, so it was never in \texttt{delta} \\
+port grant to a load & conserved \\
+\bottomrule
+\end{tabular}
+\par}
+
+The plain ``entries before \texttt{e}'' relation loses an element only on
+a retire, which is not what the cache's justice condition delivers; this
+one loses one on exactly the two events the cache is fair about.
+
+Note the retire row. Both arms are stated in \emph{offsets} from
+\texttt{load_head}, and a retire shifts \texttt{load_head} and
+\texttt{mark_offset} together, so every membership is
+preserved across the shift. As a set of \emph{slots} the extension does
+not move at all, which is what ``conserved'' has to mean.
+
+\section{The four statements}
+
+\begin{enumerate}
+\item \textbf{Enabledness at the bottom of the ranking.} In the rule
+  this premise is \texttt{phi -> En(tau)}, a \emph{single-state} formula
+  --- note the absence of any \texttt{_pre} --- so it is a plain
+  \texttt{invariant} in \texttt{implementation} next to \texttt{outst}
+  and \texttt{pres_l}, evaluated in one state rather than paired across
+  an edge, and it needs no sample and no new wire:
+
+  {\small
+  \begin{verbatim}
+load_pending(K) & load_elig(K)
+    & (forall L. ~loads_not_ready_before(K, L))
+    & ~load_rdy(K) & ~load_sent(K) & ~req_en_r
+    -> <the arbiter presents K on the port>
+\end{verbatim}
+  }
+
+  Written with \texttt{load_elig} rather than an empty store arm: by
+  \texttt{elig_zero} those say the same thing, and \texttt{load_elig} is
+  the vocabulary the arbiter's own guard, \texttt{pres_l}, and
+  \texttt{outst} are already stated in. What remains, the empty load
+  arm, is the whole content of the statement: every slot ahead of
+  \texttt{K} is ready, so none of them satisfies the arbiter's guard,
+  so \texttt{K} wins the priority chain --- which resolves
+  lowest-offset-last, hence lowest-offset-wins.
+
+  The bottom of the ranking is needed here. Above it the helpful
+  transition is not \texttt{K}'s at all but whatever removes an element
+  ahead of it, and \texttt{K}'s own request is genuinely blocked:
+  \texttt{load_elig(K)} fails while an older store is pending, and a
+  lower-offset unready load outranks \texttt{K}.
+  Justice on \texttt{creq_ready} then takes \texttt{K} off the port.
+
+\item \textbf{The ranking is conserved.} This is \texttt{conserves delta},
+  i.e.\ \texttt{forall x. delta'(x) -> delta(x)}, one conjunct per arm:
+
+  {\small
+  \begin{verbatim}
+load_pending_pre(K)
+    -> load_rdy(K)
+     | ( (loads_not_ready_before(K, L)  -> loads_not_ready_before_pre(K, L))
+       & (stores_not_ready_before(K, J) -> stores_not_ready_before_pre(K, J)) )
+\end{verbatim}
+  }
+
+  No comparison and no arithmetic on the ranking: the unprimed
+  relations are read post-edge and the \texttt{_pre} ones are the
+  pre-edge samples. The \texttt{load_rdy} disjunct absorbs the retire
+  case, where \texttt{off(K)} wraps to 7. It is sound there: the
+  retiring slot cannot be re-enqueued on the same edge, because
+  \texttt{cpu_ready_r} is low whenever the queue is already at capacity
+  (\texttt{q_l}, \texttt{q_rdy}), so \texttt{load_rdy(K)} still holds
+  post-edge.
+
+\item \textbf{The helpful step reduces it.} \texttt{reduces delta} is
+  \texttt{exists x. delta(x) \& \textasciitilde{}delta'(x)}, and in both
+  halves the witness is already available, so it can be named rather
+  than quantified. Two halves, because \texttt{cache_to_lsq_resp_valid}
+  on its own reduces nothing --- the response may be for a slot after
+  \texttt{K}, or match no sent entry at all; nothing in \texttt{lsq_body}
+  constrains \texttt{resp_idx}, the whole channel is a free input.
+
+  {\small
+  \begin{verbatim}
+load_pending_pre(K) & ld_capture_pre
+    & (resp_idx_pre - lh_pre) < (K - lh_pre)
+    -> loads_not_ready_before_pre(K, resp_idx_pre)
+     & ~loads_not_ready_before(K, resp_idx_pre)
+
+load_pending_pre(K) & st_go_pre & stores_not_ready_before_pre(K, sh_pre)
+    -> ~stores_not_ready_before(K, sh_pre)
+\end{verbatim}
+  }
+
+  The load half's witness is \texttt{resp_idx_pre}, the response index
+  sampled at the start of the edge: whichever of \texttt{ld_capture}'s
+  four per-offset guards fired, that slot is exactly the one the
+  sample recorded, so the existential witness is already in hand.
+  \texttt{ld_capture} itself is new only as the disjunction of those
+  four guards, each already the datapath's own capture condition,
+  restated.
+
+  The store half's hypothesis,
+  \texttt{stores_not_ready_before_pre(K, sh_pre)}, is the pre-edge form
+  of \texttt{\textasciitilde{}load_elig(K)} (\texttt{elig_zero} again)
+  and is simultaneously the witness the conclusion discharges. It is
+  carried as a sample because \texttt{load_elig} reads
+  \texttt{mark_offset}, which by the time this invariant is checked a
+  same-edge retire may already have shifted.
+
+\item \textbf{Justice.} An assumption on the environment, with nothing
+  to prove: the cache accepts the port (\texttt{cache_to_lsq_creq_ready})
+  infinitely often, and answers every load it has taken. Documented as
+  a comment where the freeness of the cache channel is already
+  described. This is stronger than ``the cache responds infinitely
+  often'': the capture guard tests \texttt{resp_idx} \emph{and} the
+  echoed address, so bare \texttt{resp_valid} liveness would leave a
+  sent load unanswered forever.
+\end{enumerate}
+
+\section{Soundness}
+
+\texttt{delta} is a relation over \texttt{load_idx} and \texttt{store_idx},
+which \texttt{basis} interprets as \texttt{bv[3]}.
+Inclusion on subsets of a finite set is well-founded, so no order needs
+axiomatising and no induction axiom needs instantiating --- which is the
+property the paper is buying, and the reason it replaces the numeric
+rank.
+
+Finiteness, premises F1/F2 of Rule~5, is therefore free: the paper needs
+that rule only for rankings over infinite sorts, and it discharges it by
+showing each transition adds boundedly many elements. Here the sorts are
+finite by construction, so \texttt{delta} is finite in every state
+whatever it contains. Even taking the obligation at face value it is
+immediate: one edge enqueues at most one entry, a load or a store, never
+both --- the accept step is guarded by \texttt{lsq_to_cpu_ready} and
+branches on \texttt{cpu_to_lsq_req_wen} --- so \texttt{delta} can gain
+at most that one entry --- and the offset
+guards exclude it, since a new entry lands at the tail, younger than the
+pending \texttt{K}. That is the row-by-row content of the event table
+above, and it is what makes statement~2 provable rather than merely
+true.
+
+The argument the four statements feed is Rule~6, with the two halves of
+statement~3 standing for the two justice conditions of Rule~8 under the
+priority scheduler the paper describes: \texttt{psi_store} is ``an older
+store is still pending'', i.e.\ \texttt{stores_not_ready_before(K, st_head)},
+and \texttt{psi_load} is its negation. Both are stable in the paper's
+sense --- a pending store leaves only by departing (\texttt{st_go}),
+and once no older store is pending none can appear, since a new store's
+mark lands at \texttt{off(ld_tail)} --- and their disjunction is
+\texttt{true}, so some justice condition is always scheduled.
+Statement~1 discharges the empty ranking, statement~3 says a non-empty
+one is left strictly smaller by the scheduled condition, statement~2
+says nothing in between undoes that, and statement~4 is what forces the
+reducing step to actually be taken rather than merely stay possible.
+
+\section{Not covered}
+
+This proves \texttt{load_pending(e) -> eventually load_rdy(e)}. Reaching
+\emph{``the cpu sees the response''} additionally needs
+\texttt{load_rdy(e) -> eventually ld_ans} at \texttt{e}, which is the
+``entries before \texttt{e}'' relation with the retire as the helpful
+step --- a second, much smaller ranking argument on top of this one.
+
+\end{document}
