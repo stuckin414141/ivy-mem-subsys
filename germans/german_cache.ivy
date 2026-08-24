@@ -41,6 +41,59 @@
 # directory is built once in its final shape.
 # ============================================================================
 
+# ============================================================================
+# PLAN PHASE 5: shared grants, invalidates, and SWMR.
+#
+# Two caches (8 sets x 2 ways, 2 MSHRs, whole-line data) over German's three
+# channels into one home node, over the memory controller, unchanged:
+#
+#            cache0_body        cache1_body
+#          ch1 / ch2 / ch3    ch1 / ch2 / ch3
+#                  dir_body                     (grants Shared or Exclusive,
+#                four_words beats                invalidates, dirty writebacks)
+#                  mc_body                      (UNCHANGED)
+#                mem_* top-level wires
+#
+# What phase 5 adds on top of the exclusive-only directory:
+#
+#   Permissions.  `tag_exc` beside `tag_occ`/`tag_dty`.  A load hits on
+#   presence, a store only on presence AND write permission, and
+#   `[dirty_excl]` keeps the dirty bit inside the exclusive one.  A store to
+#   a Shared line SELF-DOWNGRADES: it surrenders that clean copy on channel 3
+#   through the normal victim path and re-requests the line Exclusive.
+#
+#   Invalidates.  One held slot per cache, alongside the grant slot rather
+#   than sharing it (`gaps.md`: a shared slot brings back the
+#   `~(invalidate & grantShared)` mutual-exclusion invariants and buys
+#   nothing).  The arm has array and channel-3 priority over everything the
+#   cache does, and it answers for a resident copy or for either MSHR's
+#   post-grant window -- an invalidate that names a line an MSHR was granted
+#   but has not installed bounces that MSHR back to `m_req` with its request
+#   still parked, and the reply is clean because a parked store applies only
+#   at replay.
+#
+#   SWMR, per permission.  `[swmr0]`/`[swmr1]`: an exclusive holder excludes
+#   every copy in the other cache.  Shared holders coexist -- that is the
+#   point -- so the property is no longer "at most one holder" but "at most
+#   one WRITER, and no reader beside him".
+#
+# The directory tracks sharers as one bit per line per CPU plus one exclusive
+# bit, and the owner is `dex(H) & dshC(H)` rather than a stored index.  This
+# is NOT the plan's 8 sets x 8 ways of entries, and the reason is measured,
+# not aesthetic: the sizing argument needs `[d_exact]` in the direction
+# "line H has no entry -> H is in no cache", which sends a quantified line
+# through `hash` into the entry array and back out through the tag, and
+# `ivy_check` rejects that verification condition as outside FAU.  The
+# admissible direction quantifies the SET index and derives the line from the
+# array -- which requires the holder ghosts themselves to be set-indexed, a
+# redesign of the `cachemem` ghost layer.  Deferred, deliberately, exactly as
+# the exclusive-only directory deferred it.
+#
+# Deliberately NOT here: liveness of any kind (an invalidate racing a cache's
+# own eviction of the same line can wedge a slot; safety is unaffected), the
+# entry array above, and everything in `plan.md`'s non-goals.
+# ============================================================================
+
 include numbers
 include order
 
@@ -418,15 +471,23 @@ export action posedge
         wire c0_gr_line   : line
         wire c0_gr_data   : cache_line
         wire c0_gr_taken  : bool
+        wire c0_ack_en    : bool
+        wire c0_ack_line  : line
+        wire c0_ack_dty   : bool
+        wire c0_ack_dat   : cache_line
+        wire c0_inv_valid : bool
+        wire c0_inv_line  : line
+        wire c0_inv_taken : bool
         wire c0_ack_taken : bool
         wire c0_st_en     : bool
         wire c0_st_h      : line
         wire c0_st_o      : woffset
         wire c0_st_d      : word
-        wire c0_gv_en     : bool
-        wire c0_gv_l      : line
-        wire c0_gv_d      : bool
-        wire c0_gv_dat    : cache_line
+        # 
+        wire c0_give_en   : bool
+        wire c0_give_line : line
+        wire c0_give_dty  : bool
+        wire c0_give_dat  : cache_line
         wire c1_req_en    : bool
         wire c1_req_line  : line
         wire c1_req_excl  : bool
@@ -436,30 +497,42 @@ export action posedge
         wire c1_gr_line   : line
         wire c1_gr_data   : cache_line
         wire c1_gr_taken  : bool
+        wire c1_ack_en    : bool
+        wire c1_ack_line  : line
+        wire c1_ack_dty   : bool
+        wire c1_ack_dat   : cache_line
+        wire c1_inv_valid : bool
+        wire c1_inv_line  : line
+        wire c1_inv_taken : bool
         wire c1_ack_taken : bool
         wire c1_st_en     : bool
         wire c1_st_h      : line
         wire c1_st_o      : woffset
         wire c1_st_d      : word
-        wire c1_gv_en     : bool
-        wire c1_gv_l      : line
-        wire c1_gv_d      : bool
-        wire c1_gv_dat    : cache_line
+        wire c1_give_en   : bool
+        wire c1_give_line : line
+        wire c1_give_dty  : bool
+        wire c1_give_dat  : cache_line
 
         specification {
 
             # ---- the ONE memory the two caches jointly present ----
             function img(H : line, O : woffset) : word
 
-            # ---- ownership, split per CPU.  A cache can only ever vouch for
-            # the words IT dirtied, and its half of the old `[unowned]` has
-            # to be provable with no protocol assumptions at all -- that is
-            # what keeps the rely-guarantee chain acyclic (the directory
-            # consumes these to return SWMR, so they must not depend on
-            # SWMR).  The controller needs both halves clear before it can
-            # claim DRAM is the image. ----
-            function owns0(H : line, O : woffset) : bool
-            function owns1(H : line, O : woffset) : bool
+            # ---- write debt, split per CPU: `dirtiedC(H,O)` says cache C
+            # committed a store to word (H,O) that DRAM has not yet
+            # absorbed -- set at the store commit, cleared when the
+            # writeback beat lands.  NOT permission (that is `exclusiveC`)
+            # and not possession (`holdsC`): exclusive-clean lines exist,
+            # and a dirtied word outlives its line's eviction while the ack
+            # is in flight.  Each half is that cache's part of the old
+            # `[unowned]` and has to be provable with no protocol
+            # assumptions at all -- that is what keeps the rely-guarantee
+            # chain acyclic (the directory consumes these to return SWMR,
+            # so they must not depend on SWMR).  The controller needs both
+            # halves clear before it can claim DRAM is the image. ----
+            function dirtied0(H : line, O : woffset) : bool
+            function dirtied1(H : line, O : woffset) : bool
 
             # ==============================================================
             # What each cache holds, and its channel 3, kept HERE.
@@ -472,8 +545,12 @@ export action posedge
             # seam it would be a wire the environment may re-drive.
             # (Measured: the query does not fail, it diverges.)
             # ==============================================================
-            function hold_g0(H : line) : bool
-            function hold_g1(H : line) : bool
+            function holds0(H : line) : bool
+            function holds1(H : line) : bool
+            # ---- permission is tracked beside possession.  Shared copies
+            # may coexist; an exclusive copy excludes every other holder. ----
+            function exclusive0(H : line) : bool
+            function exclusive1(H : line) : bool
 
             var ack0_g_en   : bool
             var ack0_g_line : line
@@ -485,11 +562,13 @@ export action posedge
             var ack1_g_data : cache_line
 
             after init {
-                img(H, O)   := init_img(H, O);
-                owns0(H, O) := false;
-                owns1(H, O) := false;
-                hold_g0(H)  := false;
-                hold_g1(H)  := false;
+                img(H, O)     := init_img(H, O);
+                dirtied0(H, O)   := false;
+                dirtied1(H, O)   := false;
+                holds0(H)     := false;
+                holds1(H)     := false;
+                exclusive0(H) := false;
+                exclusive1(H) := false;
                 ack0_g_en := false; ack0_g_line := 0;
                 ack0_g_dty := false; ack0_g_data := 0;
                 ack1_g_en := false; ack1_g_line := 0;
@@ -498,20 +577,20 @@ export action posedge
 
             after posedge {
 
-                # ---- CLEAR ownership at a command-beat landing, BEFORE the
+                # ---- CLEAR dirtied words at a command-beat landing, BEFORE the
                 # store arms below.  BOTH halves clear: the beat that lands
                 # is accurate to `img` (`[wb_img]`), so after it DRAM agrees
                 # with the image at those words no matter which cache had
                 # been holding them. ----
                 if mc_body.cmd_en & mc_body.cmd_wen {
-                    owns0(H, O) := (false
+                    dirtied0(H, O) := (false
                                     if (H = high(mc_body.cmd_addr)
                                         & beat_of(O) = beat_of(low(mc_body.cmd_addr)))
-                                    else owns0(H, O));
-                    owns1(H, O) := (false
+                                    else dirtied0(H, O));
+                    dirtied1(H, O) := (false
                                     if (H = high(mc_body.cmd_addr)
                                         & beat_of(O) = beat_of(low(mc_body.cmd_addr)))
-                                    else owns1(H, O));
+                                    else dirtied1(H, O));
                 };
 
                 # ---- a load answer is BINDING on the image.  With
@@ -541,66 +620,57 @@ export action posedge
                     img(H, O) := (c0_st_d
                                   if (H = c0_st_h & O = c0_st_o)
                                   else img(H, O));
-                    owns0(H, O) := (true
+                    dirtied0(H, O) := (true
                                     if (H = c0_st_h & O = c0_st_o)
-                                    else owns0(H, O));
+                                    else dirtied0(H, O));
                 };
                 if c1_st_en {
                     img(H, O) := (c1_st_d
                                   if (H = c1_st_h & O = c1_st_o)
                                   else img(H, O));
-                    owns1(H, O) := (true
+                    dirtied1(H, O) := (true
                                     if (H = c1_st_h & O = c1_st_o)
-                                    else owns1(H, O));
+                                    else dirtied1(H, O));
                 };
 
                 # ---- channel 3, per CPU: retire first, post second ----
                 if c0_ack_taken { ack0_g_en := false; };
-                if c0_gv_en {
+                if c0_give_en {
                     ack0_g_en   := true;
-                    ack0_g_line := c0_gv_l;
-                    ack0_g_dty  := c0_gv_d;
-                    ack0_g_data := c0_gv_dat;
+                    ack0_g_line := c0_give_line;
+                    ack0_g_dty  := c0_give_dty;
+                    ack0_g_data := c0_give_dat;
                 };
                 if c1_ack_taken { ack1_g_en := false; };
-                if c1_gv_en {
+                if c1_give_en {
                     ack1_g_en   := true;
-                    ack1_g_line := c1_gv_l;
-                    ack1_g_dty  := c1_gv_d;
-                    ack1_g_data := c1_gv_dat;
+                    ack1_g_line := c1_give_line;
+                    ack1_g_dty  := c1_give_dty;
+                    ack1_g_data := c1_give_dat;
                 };
 
-                # ---- and the lines each cache holds ----
-                if c0_gv_en {
-                    hold_g0(H) := (false if H = c0_gv_l else hold_g0(H));
+                # ---- possession and permission follow accepted grants and
+                # every channel-3 surrender, including invalidate replies. ----
+                if c0_give_en {
+                    holds0(H) := (false if H = c0_give_line else holds0(H));
+                    exclusive0(H) := (false if H = c0_give_line else exclusive0(H));
                 };
                 if c0_gr_valid & c0_gr_taken {
-                    hold_g0(H) := (true if H = c0_gr_line else hold_g0(H));
+                    holds0(H) := (true if H = c0_gr_line else holds0(H));
+                    exclusive0(H) := (c0_gr_excl if H = c0_gr_line else exclusive0(H));
                 };
-                if c1_gv_en {
-                    hold_g1(H) := (false if H = c1_gv_l else hold_g1(H));
+                if c1_give_en {
+                    holds1(H) := (false if H = c1_give_line else holds1(H));
+                    exclusive1(H) := (false if H = c1_give_line else exclusive1(H));
                 };
                 if c1_gr_valid & c1_gr_taken {
-                    hold_g1(H) := (true if H = c1_gr_line else hold_g1(H));
+                    holds1(H) := (true if H = c1_gr_line else holds1(H));
+                    exclusive1(H) := (c1_gr_excl if H = c1_gr_line else exclusive1(H));
                 };
             }
         }
         # ==================================================================
         # CPU 0's cache.  8 sets x 2 ways, 2 MSHRs, whole-line data.
-        #
-        # The beat machinery is gone from this side entirely: a line is
-        # fetched in ONE grant and written back in ONE ack, so the two-beat
-        # ladder that used to live in the MSHR now lives once, in the
-        # directory's memory-facing sequencer.  What is left of an MSHR is
-        # `m_req -> m_wait -> m_fill -> m_replay`: hold channel 1, latch the
-        # grant into a whole-line fill buffer, clear a way for it, then serve
-        # the request that missed against the array.
-        #
-        # ONE array action per edge.  The arbiter takes the staged request if
-        # its gate is open and otherwise steps the first MSHR that wants the
-        # array, and that is what lets a single `c_st_*` net carry both
-        # commit shapes -- the store-hit drain and the replay store-apply --
-        # without them ever racing.
         #
         # EVERY eviction is non-silent (plan decision 1): clean or dirty,
         # the victim goes out on channel 3, so the directory's sharer bit is
@@ -633,6 +703,20 @@ export action posedge
             wire req_line  : line
             wire req_excl  : bool
             wire gr_taken  : bool
+            wire inv_taken : bool
+
+            # ---- channel 3 as REAL hardware, held by its producer (plan
+            # decision 2).  `cachemem` keeps a ghost copy of the same slot --
+            # the directory's `[wb_*]` invariants are claims about the
+            # POST-state and need a symbol the environment cannot re-drive --
+            # and `[ack_sync_*]` pins the two together, the `ae_r` pattern
+            # widened from the enable bit to the whole payload.  Without these
+            # registers the directory's datapath reads specification state and
+            # `ivy_to_rtl` emits a dangling wire. ----
+            wire ack_en    : bool
+            wire ack_line  : line
+            wire ack_dty   : bool
+            wire ack_dat   : cache_line
 
             # ---- the pending-store view the LSQ contract is stated over.
             # A store is accepted at the port one edge before it reaches the
@@ -656,14 +740,14 @@ export action posedge
             wire in_progress(H : line) : bool
 
             # ---- proof observation ports ----
-            wire st_en  : bool
-            wire st_h   : line
-            wire st_o   : woffset
-            wire st_d   : word
-            wire gv_en  : bool
-            wire gv_l   : line
-            wire gv_d   : bool
-            wire gv_dat : cache_line
+            wire st_en     : bool
+            wire st_h      : line
+            wire st_o      : woffset
+            wire st_d      : word
+            wire give_en   : bool
+            wire give_line : line
+            wire give_dty  : bool
+            wire give_dat  : cache_line
 
             # ==============================================================
             # The contract.
@@ -679,27 +763,16 @@ export action posedge
             # line to a set: a line under request is not held and has no ack
             # outstanding; a store only ever lands in a held line; a give-up
             # does not collide with a live ack or with a store; and -- the
-            # cache's half of the old `[unowned]` -- an owned word belongs to
-            # a held line or to the dirty ack carrying it.
+            # cache's half of the old `[unowned]` -- a dirtied word lives in
+            # a held line or in the dirty ack carrying it.
             # ==============================================================
             specification {
-                # ---- the LSQ contract, in the two halves the plan calls
-                # for.  On a QUIET line the answer is exactly the image.  On
-                # a line with a store in progress it may be the image or any
-                # value a pending store is about to write -- and `cachemem`'s
-                # monitor then writes the answer back into `img`, so
-                # observation is binding and later loads linearise after it.
-                #
-                # The implementation satisfies the stronger `[resp_img_int_p0]`
-                # unconditionally -- every answer comes out of the array and
-                # `[c_img_p0]` pins the array to `img` -- so the image-update
-                # arm is provably a no-op and the weak pair follows.  The
-                # slack is for the LSQ seam and store-forwarding: with it,
-                # neither has to reopen this contract. ----
+                # TODO: why does this stronger invariant hold?
                 invariant [resp_img_int_p0] cache_to_lsq_resp_valid0 ->
                     cache_to_lsq_resp_data0 = img(cache_to_lsq_resp_h0,
                                                  cache_to_lsq_resp_o0)
 
+                # the data we give to the LSQ is valid. 
                 invariant [resp_quiet_p0] cache_to_lsq_resp_valid0
                     & ~in_progress(cache_to_lsq_resp_h0) ->
                     cache_to_lsq_resp_data0 = img(cache_to_lsq_resp_h0,
@@ -719,36 +792,65 @@ export action posedge
                        & p1_o = cache_to_lsq_resp_o0
                        & cache_to_lsq_resp_data0 = p1_d)
 
-                # ---- an advertised ready empties the stage of any staged
-                # store this very edge.  Near-tautological from the
-                # definitions, but it must be STATED to be usable outside:
-                # it is what lets the LSQ conclude that the edge a load's
-                # handshake fires, no store of its own remains staged. ----
-                invariant [rdy_drain_p0] cache_to_lsq_creq_ready0 & ps_v -> stage_go
+                
+                # The cache only surrenders lines it holds
+                invariant [ca_gv_hold_p0] c0_give_en -> holds0(c0_give_line)
+                # Guarantee to the directory that if we don't hold, then
+                # not exclusive
+                invariant [ca_excl_hold_p0] exclusive0(H) -> holds0(H)
 
-                invariant [ca_gv_hold_p0] c0_gv_en -> hold_g0(c0_gv_l)
+                # Storing a line implies that we have exclusive perms
+                invariant [ca_st_excl_p0] c0_st_en -> exclusive0(c0_st_h)
 
-                invariant [ca_st_line_p0] c0_st_en -> hold_g0(c0_st_h)
+                # Cache only takes the invalidate line if it has a line to invalidate
+                invariant [ca_inv_reply_p0] c0_inv_taken ->
+                    c0_give_en & c0_give_line = c0_inv_line
 
-                invariant [ca_gv_nodouble_p0] c0_gv_en -> ~ack0_g_en
+                invariant [ca_gv_nodouble_p0] c0_give_en -> ~ack0_g_en
 
-                invariant [ca_gv_nost_p0] c0_gv_en -> ~c0_st_en
+                invariant [ca_gv_nost_p0] c0_give_en -> ~c0_st_en
 
-                invariant [ca_gv_clean_p0] c0_gv_en & ~c0_gv_d ->
-                    ~owns0(c0_gv_l, O)
+                # A clean surrender carries no write debt: no word of the
+                # line is dirtied, so the directory may keep trusting its
+                # own copy of it.
+                invariant [ca_gv_clean_p0] c0_give_en & ~c0_give_dty ->
+                    ~dirtied0(c0_give_line, O)
+                # A dirty surrender is believable as the whole image only
+                # under SWMR: dirty implies the copy was Exclusive.
+                invariant [ca_gv_dirty_excl_p0] c0_give_en & c0_give_dty ->
+                    exclusive0(c0_give_line)
 
-                invariant [ca_owns_p0]
-                      ~hold_g0(H)
+                # Write debt never floats unaccounted: a word is dirtied
+                # only while its line is held or while the dirty ack
+                # carrying it is in flight.
+                invariant [ca_dirtied_p0]
+                      ~holds0(H)
                     & ~(ack0_g_en & ack0_g_dty & ack0_g_line = H)
-                    -> ~owns0(H, O)
+                    -> ~dirtied0(H, O)
+                invariant [ca_dirtied_excl_p0] dirtied0(H, O) ->
+                      exclusive0(H)
+                    | (ack0_g_en & ack0_g_dty & ack0_g_line = H)
 
+                # A clean ack vouches for nothing: no word of its line is dirtied.
                 invariant [ca_clean_ack_p0] ack0_g_en & ~ack0_g_dty ->
-                    ~owns0(ack0_g_line, O)
+                    ~dirtied0(ack0_g_line, O)
 
-                invariant [ca_ack_idle_p0] ack0_g_en -> ~hold_g0(ack0_g_line)
+                # If we send an invalidate acknowledgement, then we don't hold the line
+                invariant [ca_ack_idle_p0] ack0_g_en -> ~holds0(ack0_g_line)
 
+                # Data we send as part of the invalidate is valid
+                # TODO: how does this work w/ consistency model?
                 invariant [ack_img_p0] ack0_g_en & ack0_g_dty ->
                     lsel(ack0_g_data, O) = img(ack0_g_line, O)
+
+                # ---- the hardware slot and the ghost slot are the same slot ----
+                invariant [ack_sync_en_p0] c0_ack_en = ack0_g_en
+                invariant [ack_sync_line_p0] ack0_g_en ->
+                    c0_ack_line = ack0_g_line
+                invariant [ack_sync_dty_p0] ack0_g_en ->
+                    c0_ack_dty = ack0_g_dty
+                invariant [ack_sync_dat_p0] ack0_g_en ->
+                    c0_ack_dat = ack0_g_data
             }
 
             implementation {
@@ -764,8 +866,16 @@ export action posedge
                 # took two writes to the same memory on every hit, which the
                 # translator merges into a single port.
                 # ==========================================================
+                # `tag_exc` is written at a fill, off the grant's kind, and
+                # RE-ASSERTED on the two store paths.  The re-assert is
+                # provably idempotent -- a store only commits where the
+                # permission already is -- but stating it syntactically is
+                # what keeps `[ca_gv_clean_*]` inductive: without it the
+                # solver has to rediscover the permission through the hit
+                # test, and the query stops coming back.
                 var tag_occ(S : cache_slot) : bool
                 var tag_dty(S : cache_slot) : bool
+                var tag_exc(S : cache_slot) : bool
                 var tag_ln(S : cache_slot)  : line
                 var set_lru(K : key)        : bit
                 var dat(S : cache_slot)     : cache_line
@@ -776,6 +886,8 @@ export action posedge
                 definition occupied(K, W) = tag_occ(cidx(K, W))
                 function dirty(K : key, W : way) : bool
                 definition dirty(K, W) = tag_dty(cidx(K, W))
+                function exclusive(K : key, W : way) : bool
+                definition exclusive(K, W) = tag_exc(cidx(K, W))
                 function ltag(K : key, W : way) : line
                 definition ltag(K, W) = tag_ln(cidx(K, W))
                 function val(K : key, W : way, O : woffset) : word
@@ -856,9 +968,12 @@ export action posedge
                 # one, so a guard phrased over `ack0_g_en` would be read there
                 # at its old value and re-read here at its new one. ----
                 var ae_r : bool
+                var ae_line : line
+                var ae_dty  : bool
+                var ae_dat  : cache_line
 
                 after init {
-                    tag_occ(S) := false; tag_dty(S) := false; tag_ln(S) := 0;
+                    tag_occ(S) := false; tag_dty(S) := false; tag_exc(S) := false; tag_ln(S) := 0;
                     set_lru(K) := 0; dat(S) := 0;
                     s0_m_state := 0; s0_m_base := 0; s0_m_excl := false;
                     s0_m_vway := 0; s0_mvline := 0; s0_mfb := 0;
@@ -874,6 +989,7 @@ export action posedge
                     ev_ans := false; ev_ans_h := 0; ev_ans_o := 0;
                     ev_ans_d := 0; ev_ans_idx := 0;
                     ae_r := false;
+                    ae_line := 0; ae_dty := false; ae_dat := 0;
                 }
 
                 # ==========================================================
@@ -890,14 +1006,75 @@ export action posedge
                 # a load answer never share an edge, so `[resp_img]` cannot
                 # be overtaken by an image move.
                 # ==========================================================
-                wire arb0     : bool
-                wire arb1     : bool
+                # ---- presence and permission are separate.  Loads hit any
+                # resident copy; stores hit only an Exclusive copy. ----
+                wire p_present : bool
+                wire p_hit     : bool
+                wire p_hway    : way
+                wire p_hexcl   : bool
+                wire p_slot    : cache_slot
+                definition p_present =
+                      (tag_occ(hw_cidx(hw_hash(p_h), 1)) & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h)
+                    | (tag_occ(hw_cidx(hw_hash(p_h), 0)) & tag_ln(hw_cidx(hw_hash(p_h), 0)) = p_h)
+                definition p_hway =
+                    (1 if (tag_occ(hw_cidx(hw_hash(p_h), 1))
+                           & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h) else 0)
+                definition p_slot = hw_cidx(hw_hash(p_h), p_hway)
+                definition p_hexcl = p_present & tag_exc(p_slot)
+                definition p_hit = p_present & (~p_wen | p_hexcl)
+                wire arb0 : bool
+                wire arb1 : bool
+
+                # ---- invalidates use a separate held slot and have array and
+                # channel-3 priority.  An invalidate is answered for a
+                # resident copy AND for either MSHR's post-grant window,
+                # where the line is held but not yet installed: that MSHR
+                # bounces back to `m_req` with its request still parked, and
+                # the reply is clean because the parked store applies only at
+                # replay.  At most one of the three can match: `[c_uniq]`
+                # keeps a line in one way and `[mshr_distinct_p0]` keeps the
+                # two MSHRs off each other's line. ----
+                wire inv_hit    : bool
+                wire inv_hway   : way
+                wire inv_slot   : cache_slot
+                wire inv_mshr0  : bool
+                wire inv_mshr1  : bool
+                wire inv_act    : bool
+                definition inv_hit =
+                      (tag_occ(hw_cidx(hw_hash(c0_inv_line), 1)) & tag_ln(hw_cidx(hw_hash(c0_inv_line), 1)) = c0_inv_line)
+                    | (tag_occ(hw_cidx(hw_hash(c0_inv_line), 0)) & tag_ln(hw_cidx(hw_hash(c0_inv_line), 0)) = c0_inv_line)
+                definition inv_hway =
+                    (1 if (tag_occ(hw_cidx(hw_hash(c0_inv_line), 1))
+                           & tag_ln(hw_cidx(hw_hash(c0_inv_line), 1)) = c0_inv_line) else 0)
+                definition inv_slot = hw_cidx(hw_hash(c0_inv_line), inv_hway)
+                definition inv_mshr0 = (s0_m_state = m_fill | s0_m_state = m_replay)
+                    & s0_m_base = c0_inv_line
+                definition inv_mshr1 = (s1_m_state = m_fill | s1_m_state = m_replay)
+                    & s1_m_base = c0_inv_line
+                definition inv_act = c0_inv_valid & (inv_hit | inv_mshr0 | inv_mshr1)
+                definition inv_taken = inv_act & ~ae_r
+
+                # ---- the stage-movable gate, back to its two-MSHR shape:
+                # the staged request enters only when its line aliases no
+                # active MSHR, no MSHR wants the array this edge, and an MSHR
+                # is free to take a miss -- plus, new here, channel 3 is free
+                # if the request is a store that has to self-downgrade a
+                # Shared copy first.  Otherwise the first MSHR that wants the
+                # array gets it, and an invalidate outranks all of them. ----
                 definition stage_go = p_valid
+                    & ~inv_act
                     & ~(s0_m_state ~= m_idle & s0_m_base = p_h)
                     & ~(s1_m_state ~= m_idle & s1_m_base = p_h)
                     & ~(s0_m_state = m_fill | s0_m_state = m_replay)
                     & ~(s1_m_state = m_fill | s1_m_state = m_replay)
                     & (s0_m_state = m_idle | s1_m_state = m_idle)
+                    & (~p_wen | ~p_present | p_hexcl | ~ae_r)
+                definition arb0 = ~stage_go & ~inv_act
+                    & (s0_m_state = m_fill | s0_m_state = m_replay)
+                definition arb1 = ~stage_go & ~inv_act
+                    & ~(s0_m_state = m_fill | s0_m_state = m_replay)
+                    & (s1_m_state = m_fill | s1_m_state = m_replay)
+
                 definition ps_v = p_valid & p_wen
                 definition ps_h = p_h
                 definition ps_o = p_o
@@ -915,45 +1092,37 @@ export action posedge
                     | (s0_rq_valid & s0_rq_wen & s0_m_base = H)
                     | (s1_rq_valid & s1_rq_wen & s1_m_base = H)
 
-                definition arb0 = ~stage_go
-                    & (s0_m_state = m_fill | s0_m_state = m_replay)
-                definition arb1 = ~stage_go
-                    & ~(s0_m_state = m_fill | s0_m_state = m_replay)
-                    & (s1_m_state = m_fill | s1_m_state = m_replay)
-
-                # ---- the hit test on the staged line, written out over the
-                # two ways ----
-                wire p_hit : bool
-                wire p_hway : way
-                definition p_hit =
-                      (tag_occ(hw_cidx(hw_hash(p_h), 1)) & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h)
-                    | (tag_occ(hw_cidx(hw_hash(p_h), 0)) & tag_ln(hw_cidx(hw_hash(p_h), 0)) = p_h)
-                definition p_hway =
-                    (1 if (tag_occ(hw_cidx(hw_hash(p_h), 1))
-                           & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h) else 0)
-
                 # ---- the victim slot each MSHR is aiming at ----
                 wire v0 : cache_slot
                 wire v1 : cache_slot
                 definition v0 = hw_cidx(hw_hash(s0_m_base), s0_m_vway)
                 definition v1 = hw_cidx(hw_hash(s1_m_base), s1_m_vway)
 
-                # ---- a give-up: an `m_fill` MSHR whose victim way is still
-                # occupied, and whose victim can go this edge -- always for a
-                # clean line, and for a dirty one only with channel 3 free.
-                # `ae_r` and not `ack0_g_en`, for the reason given above. ----
+                # ---- channel 3 has four producers now: the invalidate
+                # reply, the store's self-downgrade, and each MSHR's
+                # fill-eviction.  They are one-hot because the invalidate
+                # outranks everything and `stage_go`, `arb0`, `arb1` are
+                # mutually exclusive. ----
                 wire gv0 : bool
                 wire gv1 : bool
+                wire ugv : bool
                 definition gv0 = (s0_m_state = m_fill) & tag_occ(v0) & ~ae_r
                 definition gv1 = (s1_m_state = m_fill) & tag_occ(v1) & ~ae_r
+                definition ugv = stage_go & p_wen & p_present & ~p_hexcl
 
-                definition gv_en  = (arb0 & gv0) | (arb1 & gv1)
-                definition gv_l   = (s0_mvline if arb0 else s1_mvline)
-                definition gv_d   = (tag_dty(v0) if arb0 else tag_dty(v1))
-                definition gv_dat = (dat(v0) if arb0 else dat(v1))
+                definition give_en = inv_taken | ugv | (arb0 & gv0) | (arb1 & gv1)
+                definition give_line = (c0_inv_line if inv_taken else
+                                        (p_h if ugv else
+                                         (s0_mvline if arb0 else s1_mvline)))
+                definition give_dty = ((tag_dty(inv_slot) if inv_hit else false) if inv_taken else
+                                       (tag_dty(p_slot) if ugv else
+                                        (tag_dty(v0) if arb0 else tag_dty(v1))))
+                definition give_dat = ((dat(inv_slot) if inv_hit else 0) if inv_taken else
+                                       (dat(p_slot) if ugv else
+                                        (dat(v0) if arb0 else dat(v1))))
 
-                # ---- a store commits on the stage's hit path or on an
-                # MSHR's replay ----
+                # ---- a store commits on the stage's Exclusive-hit path or on
+                # an MSHR's replay ----
                 definition st_en = (stage_go & p_wen & p_hit)
                     | (arb0 & s0_m_state = m_replay & s0_rq_valid & s0_rq_wen)
                     | (arb1 & s1_m_state = m_replay & s1_rq_valid & s1_rq_wen)
@@ -973,11 +1142,19 @@ export action posedge
                                        else s1_m_excl)
 
                 # ---- a grant is consumed the edge it matches a waiting
-                # MSHR: `gr_line = m_base` is unambiguous because the two
-                # MSHRs never fetch the same line (`[mshr_distinct_p0]`) ----
-                definition gr_taken = c0_gr_valid
-                    & ((s0_m_state = m_wait & s0_m_base = c0_gr_line)
-                       | (s1_m_state = m_wait & s1_m_base = c0_gr_line))
+                # MSHR, and only if its kind covers what that MSHR parked:
+                # `gr_line = m_base` is unambiguous because the two MSHRs
+                # never fetch the same line (`[mshr_distinct_p0]`) ----
+                definition gr_taken = c0_gr_valid & ~c0_inv_valid
+                    & ((s0_m_state = m_wait & s0_m_base = c0_gr_line
+                        & (~s0_rq_wen | c0_gr_excl))
+                       | (s1_m_state = m_wait & s1_m_base = c0_gr_line
+                          & (~s1_rq_wen | c0_gr_excl)))
+
+                definition ack_en   = ae_r
+                definition ack_line = ae_line
+                definition ack_dty  = ae_dty
+                definition ack_dat  = ae_dat
 
                 definition cache_to_lsq_creq_ready0 = ~p_valid | stage_go
 
@@ -994,19 +1171,22 @@ export action posedge
                     var h  : line    := p_h;
                     var o  : woffset := p_o;
                     var rs : key     := hw_hash(h);
-                    var hit  : bool  := false;
-                    var hway : way   := 1;
+                    var present : bool := false;
+                    var hit     : bool := false;
+                    var hway    : way  := 1;
                     p_valid := false;
                     if tag_occ(hw_cidx(rs, 1)) & tag_ln(hw_cidx(rs, 1)) = h {
-                        hit := true; hway := 1;
+                        present := true; hway := 1;
                     } else { if tag_occ(hw_cidx(rs, 0)) & tag_ln(hw_cidx(rs, 0)) = h {
-                        hit := true; hway := 0;
+                        present := true; hway := 0;
                     } };
+                    hit := present & (~p_wen | tag_exc(hw_cidx(rs, hway)));
                     if hit {
                         if p_wen {
                             dat(hw_cidx(rs, hway)) :=
                                 hw_lins(dat(hw_cidx(rs, hway)), o, p_wdata);
                             tag_dty(hw_cidx(rs, hway)) := true;
+                            tag_exc(hw_cidx(rs, hway)) := true;
                         } else {
                             ev_ans     := true;
                             ev_ans_h   := h;
@@ -1017,10 +1197,17 @@ export action posedge
                         };
                         if hway = 1 { set_lru(rs) := 0; } else { set_lru(rs) := 1; };
                     } else {
+                        # A store to Shared surrenders that clean copy before
+                        # requesting Exclusive.  `stage_go` waited for ch3.
+                        if present {
+                            ae_r := true;
+                            ae_line := h;
+                            ae_dty  := tag_dty(hw_cidx(rs, hway));
+                            ae_dat  := dat(hw_cidx(rs, hway));
+                            tag_occ(hw_cidx(rs, hway)) := false;
+                        };
                         # ---- allocate.  Under the gate one MSHR is idle, so
-                        # the else arm is closed by construction.  The victim
-                        # way is picked HERE, off the set's LRU bit and away
-                        # from whatever the other MSHR is already aiming at.
+                        # the else arm is closed by construction. ----
                         if s0_m_state = m_idle {
                             s0_m_state := m_req;
                             s0_m_base  := h;
@@ -1044,12 +1231,16 @@ export action posedge
                         if tag_occ(v0) {
                             if ~ae0 {
                                 ae_r := true;
+                                ae_line := s0_mvline;
+                                ae_dty  := tag_dty(v0);
+                                ae_dat  := dat(v0);
                                 tag_occ(v0) := false;
                             };
                         } else {
                             dat(v0)     := s0_mfb;
                             tag_ln(v0)  := s0_m_base;
                             tag_dty(v0) := false;
+                            tag_exc(v0) := s0_m_excl;
                             tag_occ(v0) := true;
                             if s0_m_vway = 1 { set_lru(hw_hash(s0_m_base)) := 0; }
                             else { set_lru(hw_hash(s0_m_base)) := 1; };
@@ -1059,6 +1250,7 @@ export action posedge
                         if s0_rq_valid & s0_rq_wen {
                             dat(v0) := hw_lins(dat(v0), s0_rq_off, s0_rq_wdata);
                             tag_dty(v0) := true;
+                            tag_exc(v0) := true;
                             s0_rq_valid := false;
                             s0_m_state  := m_idle;
                         } else { if s0_rq_valid {
@@ -1083,12 +1275,16 @@ export action posedge
                         if tag_occ(v1) {
                             if ~ae0 {
                                 ae_r := true;
+                                ae_line := s1_mvline;
+                                ae_dty  := tag_dty(v1);
+                                ae_dat  := dat(v1);
                                 tag_occ(v1) := false;
                             };
                         } else {
                             dat(v1)     := s1_mfb;
                             tag_ln(v1)  := s1_m_base;
                             tag_dty(v1) := false;
+                            tag_exc(v1) := s1_m_excl;
                             tag_occ(v1) := true;
                             if s1_m_vway = 1 { set_lru(hw_hash(s1_m_base)) := 0; }
                             else { set_lru(hw_hash(s1_m_base)) := 1; };
@@ -1098,6 +1294,7 @@ export action posedge
                         if s1_rq_valid & s1_rq_wen {
                             dat(v1) := hw_lins(dat(v1), s1_rq_off, s1_rq_wdata);
                             tag_dty(v1) := true;
+                            tag_exc(v1) := true;
                             s1_rq_valid := false;
                             s1_m_state  := m_idle;
                         } else { if s1_rq_valid {
@@ -1119,30 +1316,62 @@ export action posedge
 
                 after posedge {
                     var ae0 : bool := ae_r;
+                    # ---- the PRE-edge control states.  Channel 1's handshake
+                    # has to be resolved against the states the directory
+                    # sampled, not against the ones an invalidate bounce
+                    # produced on this same edge: a bounce manufactures a
+                    # fresh `m_req`, and advancing THAT slot would hand it a
+                    # grant the other slot asked for. ----
+                    var q0 : mstate := s0_m_state;
+                    var q1 : mstate := s1_m_state;
 
                     port_used := false;
                     ev_ans    := false;
 
-                    # ---- THE array action, exactly one ----
-                    if p_valid
+                    # ---- THE array action, exactly one.  Invalidation
+                    # outranks the stage and both MSHRs: a
+                    # granted-but-unreplayed line is clean, so bouncing it
+                    # keeps the parked request and simply re-requests. ----
+                    if inv_act & ~ae_r {
+                        ae_r := true;
+                        ae_line := c0_inv_line;
+                        ae_dty  := (tag_dty(inv_slot) if inv_hit else false);
+                        ae_dat  := (dat(inv_slot) if inv_hit else 0);
+                        if inv_hit {
+                            tag_occ(inv_slot) := false;
+                        };
+                        if (s0_m_state = m_fill | s0_m_state = m_replay)
+                                & s0_m_base = c0_inv_line {
+                            s0_m_state := m_req;
+                        };
+                        if (s1_m_state = m_fill | s1_m_state = m_replay)
+                                & s1_m_base = c0_inv_line {
+                            s1_m_state := m_req;
+                        };
+                    } else { if p_valid & ~inv_act
                             & ~(s0_m_state ~= m_idle & s0_m_base = p_h)
                             & ~(s1_m_state ~= m_idle & s1_m_base = p_h)
                             & ~(s0_m_state = m_fill | s0_m_state = m_replay)
                             & ~(s1_m_state = m_fill | s1_m_state = m_replay)
-                            & (s0_m_state = m_idle | s1_m_state = m_idle) {
+                            & (s0_m_state = m_idle | s1_m_state = m_idle)
+                            & (~p_wen | ~p_present | p_hexcl | ~ae_r) {
                         call serve_stage;
-                    } else { if s0_m_state = m_fill | s0_m_state = m_replay {
+                    } else { if ~inv_act
+                                      & (s0_m_state = m_fill | s0_m_state = m_replay) {
                         call step_0(ae0);
-                    } else { if s1_m_state = m_fill | s1_m_state = m_replay {
+                    } else { if ~inv_act
+                                      & (s1_m_state = m_fill | s1_m_state = m_replay) {
                         call step_1(ae0);
-                    } } };
+                    } } } };
 
-                    # ---- channel 2: latch a matching grant and pick this
-                    # MSHR's victim way, away from whatever the other one is
-                    # aiming at in the same set ----
-                    if s0_m_state = m_wait & c0_gr_valid & c0_gr_valid
-                            & s0_m_base = c0_gr_line {
+                    # ---- channel 2: latch the matching Shared/Exclusive
+                    # grant and reserve a victim way, away from whatever the
+                    # other MSHR is already aiming at in the same set. ----
+                    if s0_m_state = m_wait & c0_gr_valid & ~c0_inv_valid
+                            & s0_m_base = c0_gr_line
+                            & (~s0_rq_wen | c0_gr_excl) {
                         s0_mfb := c0_gr_data;
+                        s0_m_excl := c0_gr_excl;
                         var w0 : way := 1;
                         if set_lru(hw_hash(s0_m_base)) = 1 { w0 := 0; };
                         if (s1_m_state = m_fill | s1_m_state = m_replay)
@@ -1153,9 +1382,11 @@ export action posedge
                         s0_mvline  := tag_ln(hw_cidx(hw_hash(s0_m_base), w0));
                         s0_m_state := m_fill;
                     };
-                    if s1_m_state = m_wait & c0_gr_valid
-                            & s1_m_base = c0_gr_line {
+                    if s1_m_state = m_wait & c0_gr_valid & ~c0_inv_valid
+                            & s1_m_base = c0_gr_line
+                            & (~s1_rq_wen | c0_gr_excl) {
                         s1_mfb := c0_gr_data;
+                        s1_m_excl := c0_gr_excl;
                         var w1 : way := 1;
                         if set_lru(hw_hash(s1_m_base)) = 1 { w1 := 0; };
                         if (s0_m_state = m_fill | s0_m_state = m_replay)
@@ -1167,11 +1398,11 @@ export action posedge
                         s1_m_state := m_fill;
                     };
 
-                    # ---- channel 1 ----
+                    # ---- channel 1, resolved against the pre-edge states ----
                     if c0_req_taken {
-                        if s0_m_state = m_req {
+                        if q0 = m_req {
                             s0_m_state := m_wait;
-                        } else { if s1_m_state = m_req {
+                        } else { if q1 = m_req {
                             s1_m_state := m_wait;
                         } };
                     };
@@ -1192,24 +1423,23 @@ export action posedge
                 }
 
                 # ==========================================================
-                # 3.1  The array, and what it means.
+                # 3.1  Array data and permissions.
                 # ==========================================================
-
-                # ---- a line sits in its own set, and in one way of it ----
                 invariant [c_set_p0] occupied(K, W) -> hash(ltag(K, W)) = K
                 invariant [c_uniq_p0] occupied(K, W1) & occupied(K, W2)
                     & ltag(K, W1) = ltag(K, W2) -> W1 = W2
-
-                # ---- the resident copy IS the image ----
                 invariant [c_img_p0] occupied(K, W) ->
                     val(K, W, O) = img(ltag(K, W), O)
-
-                # ---- and only a dirty copy can be owned ----
                 invariant [c_clean_p0] occupied(K, W) & ~dirty(K, W) ->
-                    ~owns0(ltag(K, W), O)
+                    ~dirtied0(ltag(K, W), O)
+                invariant [dirty_excl_p0] occupied(K, W) & dirty(K, W) ->
+                    exclusive(K, W)
+                invariant [hold_inf_a_p0] occupied(K, W) -> holds0(ltag(K, W))
+                invariant [excl_inf_a_p0] occupied(K, W) & exclusive(K, W) ->
+                    exclusive0(ltag(K, W))
 
                 # ==========================================================
-                # 3.2  The MSHRs do not alias the array, or each other.
+                # 3.2  The two MSHRs do not alias the array, or each other.
                 # ==========================================================
                 invariant [no_alias_0_p0]
                     (s0_m_state = m_req | s0_m_state = m_wait | s0_m_state = m_fill)
@@ -1239,60 +1469,38 @@ export action posedge
                 invariant [replay_way_1_p0] s1_m_state = m_replay ->
                     tag_occ(v1) & ltag(hash(s1_m_base), s1_m_vway) = s1_m_base
 
-                # ==========================================================
-                # 3.3  The fill buffer.
-                #
-                # `[mfb_img_*]` is the successor of the beat-granular
-                # `fbuf_img` with the holes gone: the line is captured in one
-                # edge, so there is nothing partial to track.  It is stable
-                # while it is held because no store can move `img` at
-                # `m_base` -- `no_alias` says the line is not resident, so a
-                # store-hit cannot be to it, and `mshr_distinct` says the
-                # other MSHR is not replaying into it.
-                # ==========================================================
-                # ---- a line still being filled is not owned: it arrived
-                # unowned (`[gr_clean]`) and nothing can have stored into it
-                # since -- it is not resident (`[no_alias_*]`) and the other
-                # MSHR is not replaying into it (`[mshr_distinct_p0]`).  This is
-                # what lets the fill install a CLEAN tag. ----
-                invariant [fill_clean_0_p0] s0_m_state = m_fill ->
-                    ~owns0(s0_m_base, O)
-                invariant [fill_clean_1_p0] s1_m_state = m_fill ->
-                    ~owns0(s1_m_base, O)
+                # ---- a parked store only ever sits behind an Exclusive
+                # request: that is what makes the replay's write legal ----
+                invariant [rq_store_excl_0_p0] s0_rq_valid & s0_rq_wen -> s0_m_excl
+                invariant [rq_store_excl_1_p0] s1_rq_valid & s1_rq_wen -> s1_m_excl
 
+                # ==========================================================
+                # 3.3  The fill buffers.
+                # ==========================================================
+                invariant [fill_clean_0_p0] s0_m_state = m_fill ->
+                    ~dirtied0(s0_m_base, O)
+                invariant [fill_clean_1_p0] s1_m_state = m_fill ->
+                    ~dirtied0(s1_m_base, O)
                 invariant [mfb_img_0_p0] s0_m_state = m_fill ->
                     lsel(s0_mfb, O) = img(s0_m_base, O)
                 invariant [mfb_img_1_p0] s1_m_state = m_fill ->
                     lsel(s1_mfb, O) = img(s1_m_base, O)
 
-                # ==========================================================
-                # 3.4  The two records at `cachemem`, kept honest.
-                # ==========================================================
-                invariant [ae_sync_p0] ack0_g_en = ae_r
-
-                # ---- everything the cache is sitting on is in `hold_g0`:
-                # every resident line, and every line an MSHR has already
-                # been granted.  Written over (K, W) rather than over the
-                # line, so no query goes from a line through `hash` into the
-                # array and back out to a line. ----
-                invariant [hold_inf_a_p0] occupied(K, W) -> hold_g0(ltag(K, W))
                 invariant [hold_inf_0_p0]
-                    (s0_m_state = m_fill | s0_m_state = m_replay)
-                    -> hold_g0(s0_m_base)
+                    (s0_m_state = m_fill | s0_m_state = m_replay) ->
+                    holds0(s0_m_base)
                 invariant [hold_inf_1_p0]
-                    (s1_m_state = m_fill | s1_m_state = m_replay)
-                    -> hold_g0(s1_m_base)
+                    (s1_m_state = m_fill | s1_m_state = m_replay) ->
+                    holds0(s1_m_base)
+                invariant [excl_inf_0_p0]
+                    (s0_m_state = m_fill | s0_m_state = m_replay) & s0_m_excl ->
+                    exclusive0(s0_m_base)
+                invariant [excl_inf_1_p0]
+                    (s1_m_state = m_fill | s1_m_state = m_replay) & s1_m_excl ->
+                    exclusive0(s1_m_base)
 
-                # ---- the CONVERSE is deliberately absent.  `hold_g0(H) -> H
-                # is resident or reserved` is true -- the record is set on a
-                # grant capture and cleared on the matching give-up -- but
-                # stating it needs `hash(H)` under a quantifier, which sends
-                # the query from a line through `hash` into the array and
-                # back out to a line: `ivy_check` rejects the whole
-                # verification condition as outside FAU.  Nothing needs it.
-                # A stale entry could only make the directory refuse to serve
-                # a line the cache is asking for, which is liveness, and the
-                # directory's own guard is what `[d_notheld]` rests on. ----
+                # ---- the concrete channel-3 register mirrors cachemem. ----
+                invariant [ae_sync_p0] ack0_g_en = ae_r
 
             }
 
@@ -1345,6 +1553,20 @@ export action posedge
             wire req_line  : line
             wire req_excl  : bool
             wire gr_taken  : bool
+            wire inv_taken : bool
+
+            # ---- channel 3 as REAL hardware, held by its producer (plan
+            # decision 2).  `cachemem` keeps a ghost copy of the same slot --
+            # the directory's `[wb_*]` invariants are claims about the
+            # POST-state and need a symbol the environment cannot re-drive --
+            # and `[ack_sync_*]` pins the two together, the `ae_r` pattern
+            # widened from the enable bit to the whole payload.  Without these
+            # registers the directory's datapath reads specification state and
+            # `ivy_to_rtl` emits a dangling wire. ----
+            wire ack_en    : bool
+            wire ack_line  : line
+            wire ack_dty   : bool
+            wire ack_dat   : cache_line
 
             # ---- the pending-store view the LSQ contract is stated over.
             # A store is accepted at the port one edge before it reaches the
@@ -1368,14 +1590,14 @@ export action posedge
             wire in_progress(H : line) : bool
 
             # ---- proof observation ports ----
-            wire st_en  : bool
-            wire st_h   : line
-            wire st_o   : woffset
-            wire st_d   : word
-            wire gv_en  : bool
-            wire gv_l   : line
-            wire gv_d   : bool
-            wire gv_dat : cache_line
+            wire st_en     : bool
+            wire st_h      : line
+            wire st_o      : woffset
+            wire st_d      : word
+            wire give_en   : bool
+            wire give_line : line
+            wire give_dty  : bool
+            wire give_dat  : cache_line
 
             # ==============================================================
             # The contract.
@@ -1391,27 +1613,16 @@ export action posedge
             # line to a set: a line under request is not held and has no ack
             # outstanding; a store only ever lands in a held line; a give-up
             # does not collide with a live ack or with a store; and -- the
-            # cache's half of the old `[unowned]` -- an owned word belongs to
-            # a held line or to the dirty ack carrying it.
+            # cache's half of the old `[unowned]` -- a dirtied word lives in
+            # a held line or in the dirty ack carrying it.
             # ==============================================================
             specification {
-                # ---- the LSQ contract, in the two halves the plan calls
-                # for.  On a QUIET line the answer is exactly the image.  On
-                # a line with a store in progress it may be the image or any
-                # value a pending store is about to write -- and `cachemem`'s
-                # monitor then writes the answer back into `img`, so
-                # observation is binding and later loads linearise after it.
-                #
-                # The implementation satisfies the stronger `[resp_img_int_p1]`
-                # unconditionally -- every answer comes out of the array and
-                # `[c_img_p1]` pins the array to `img` -- so the image-update
-                # arm is provably a no-op and the weak pair follows.  The
-                # slack is for the LSQ seam and store-forwarding: with it,
-                # neither has to reopen this contract. ----
+                # TODO: why does this stronger invariant hold?
                 invariant [resp_img_int_p1] cache_to_lsq_resp_valid1 ->
                     cache_to_lsq_resp_data1 = img(cache_to_lsq_resp_h1,
                                                  cache_to_lsq_resp_o1)
 
+                # the data we give to the LSQ is valid. 
                 invariant [resp_quiet_p1] cache_to_lsq_resp_valid1
                     & ~in_progress(cache_to_lsq_resp_h1) ->
                     cache_to_lsq_resp_data1 = img(cache_to_lsq_resp_h1,
@@ -1431,36 +1642,65 @@ export action posedge
                        & p1_o = cache_to_lsq_resp_o1
                        & cache_to_lsq_resp_data1 = p1_d)
 
-                # ---- an advertised ready empties the stage of any staged
-                # store this very edge.  Near-tautological from the
-                # definitions, but it must be STATED to be usable outside:
-                # it is what lets the LSQ conclude that the edge a load's
-                # handshake fires, no store of its own remains staged. ----
-                invariant [rdy_drain_p1] cache_to_lsq_creq_ready1 & ps_v -> stage_go
+                
+                # The cache only surrenders lines it holds
+                invariant [ca_gv_hold_p1] c1_give_en -> holds1(c1_give_line)
+                # Guarantee to the directory that if we don't hold, then
+                # not exclusive
+                invariant [ca_excl_hold_p1] exclusive1(H) -> holds1(H)
 
-                invariant [ca_gv_hold_p1] c1_gv_en -> hold_g1(c1_gv_l)
+                # Storing a line implies that we have exclusive perms
+                invariant [ca_st_excl_p1] c1_st_en -> exclusive1(c1_st_h)
 
-                invariant [ca_st_line_p1] c1_st_en -> hold_g1(c1_st_h)
+                # Cache only takes the invalidate line if it has a line to invalidate
+                invariant [ca_inv_reply_p1] c1_inv_taken ->
+                    c1_give_en & c1_give_line = c1_inv_line
 
-                invariant [ca_gv_nodouble_p1] c1_gv_en -> ~ack1_g_en
+                invariant [ca_gv_nodouble_p1] c1_give_en -> ~ack1_g_en
 
-                invariant [ca_gv_nost_p1] c1_gv_en -> ~c1_st_en
+                invariant [ca_gv_nost_p1] c1_give_en -> ~c1_st_en
 
-                invariant [ca_gv_clean_p1] c1_gv_en & ~c1_gv_d ->
-                    ~owns1(c1_gv_l, O)
+                # A clean surrender carries no write debt: no word of the
+                # line is dirtied, so the directory may keep trusting its
+                # own copy of it.
+                invariant [ca_gv_clean_p1] c1_give_en & ~c1_give_dty ->
+                    ~dirtied1(c1_give_line, O)
+                # A dirty surrender is believable as the whole image only
+                # under SWMR: dirty implies the copy was Exclusive.
+                invariant [ca_gv_dirty_excl_p1] c1_give_en & c1_give_dty ->
+                    exclusive1(c1_give_line)
 
-                invariant [ca_owns_p1]
-                      ~hold_g1(H)
+                # Write debt never floats unaccounted: a word is dirtied
+                # only while its line is held or while the dirty ack
+                # carrying it is in flight.
+                invariant [ca_dirtied_p1]
+                      ~holds1(H)
                     & ~(ack1_g_en & ack1_g_dty & ack1_g_line = H)
-                    -> ~owns1(H, O)
+                    -> ~dirtied1(H, O)
+                invariant [ca_dirtied_excl_p1] dirtied1(H, O) ->
+                      exclusive1(H)
+                    | (ack1_g_en & ack1_g_dty & ack1_g_line = H)
 
+                # A clean ack vouches for nothing: no word of its line is dirtied.
                 invariant [ca_clean_ack_p1] ack1_g_en & ~ack1_g_dty ->
-                    ~owns1(ack1_g_line, O)
+                    ~dirtied1(ack1_g_line, O)
 
-                invariant [ca_ack_idle_p1] ack1_g_en -> ~hold_g1(ack1_g_line)
+                # If we send an invalidate acknowledgement, then we don't hold the line
+                invariant [ca_ack_idle_p1] ack1_g_en -> ~holds1(ack1_g_line)
 
+                # Data we send as part of the invalidate is valid
+                # TODO: how does this work w/ consistency model?
                 invariant [ack_img_p1] ack1_g_en & ack1_g_dty ->
                     lsel(ack1_g_data, O) = img(ack1_g_line, O)
+
+                # ---- the hardware slot and the ghost slot are the same slot ----
+                invariant [ack_sync_en_p1] c1_ack_en = ack1_g_en
+                invariant [ack_sync_line_p1] ack1_g_en ->
+                    c1_ack_line = ack1_g_line
+                invariant [ack_sync_dty_p1] ack1_g_en ->
+                    c1_ack_dty = ack1_g_dty
+                invariant [ack_sync_dat_p1] ack1_g_en ->
+                    c1_ack_dat = ack1_g_data
             }
 
             implementation {
@@ -1476,8 +1716,16 @@ export action posedge
                 # took two writes to the same memory on every hit, which the
                 # translator merges into a single port.
                 # ==========================================================
+                # `tag_exc` is written at a fill, off the grant's kind, and
+                # RE-ASSERTED on the two store paths.  The re-assert is
+                # provably idempotent -- a store only commits where the
+                # permission already is -- but stating it syntactically is
+                # what keeps `[ca_gv_clean_*]` inductive: without it the
+                # solver has to rediscover the permission through the hit
+                # test, and the query stops coming back.
                 var tag_occ(S : cache_slot) : bool
                 var tag_dty(S : cache_slot) : bool
+                var tag_exc(S : cache_slot) : bool
                 var tag_ln(S : cache_slot)  : line
                 var set_lru(K : key)        : bit
                 var dat(S : cache_slot)     : cache_line
@@ -1488,6 +1736,8 @@ export action posedge
                 definition occupied(K, W) = tag_occ(cidx(K, W))
                 function dirty(K : key, W : way) : bool
                 definition dirty(K, W) = tag_dty(cidx(K, W))
+                function exclusive(K : key, W : way) : bool
+                definition exclusive(K, W) = tag_exc(cidx(K, W))
                 function ltag(K : key, W : way) : line
                 definition ltag(K, W) = tag_ln(cidx(K, W))
                 function val(K : key, W : way, O : woffset) : word
@@ -1568,9 +1818,12 @@ export action posedge
                 # one, so a guard phrased over `ack1_g_en` would be read there
                 # at its old value and re-read here at its new one. ----
                 var ae_r : bool
+                var ae_line : line
+                var ae_dty  : bool
+                var ae_dat  : cache_line
 
                 after init {
-                    tag_occ(S) := false; tag_dty(S) := false; tag_ln(S) := 0;
+                    tag_occ(S) := false; tag_dty(S) := false; tag_exc(S) := false; tag_ln(S) := 0;
                     set_lru(K) := 0; dat(S) := 0;
                     s0_m_state := 0; s0_m_base := 0; s0_m_excl := false;
                     s0_m_vway := 0; s0_mvline := 0; s0_mfb := 0;
@@ -1586,6 +1839,7 @@ export action posedge
                     ev_ans := false; ev_ans_h := 0; ev_ans_o := 0;
                     ev_ans_d := 0; ev_ans_idx := 0;
                     ae_r := false;
+                    ae_line := 0; ae_dty := false; ae_dat := 0;
                 }
 
                 # ==========================================================
@@ -1602,14 +1856,75 @@ export action posedge
                 # a load answer never share an edge, so `[resp_img]` cannot
                 # be overtaken by an image move.
                 # ==========================================================
-                wire arb0     : bool
-                wire arb1     : bool
+                # ---- presence and permission are separate.  Loads hit any
+                # resident copy; stores hit only an Exclusive copy. ----
+                wire p_present : bool
+                wire p_hit     : bool
+                wire p_hway    : way
+                wire p_hexcl   : bool
+                wire p_slot    : cache_slot
+                definition p_present =
+                      (tag_occ(hw_cidx(hw_hash(p_h), 1)) & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h)
+                    | (tag_occ(hw_cidx(hw_hash(p_h), 0)) & tag_ln(hw_cidx(hw_hash(p_h), 0)) = p_h)
+                definition p_hway =
+                    (1 if (tag_occ(hw_cidx(hw_hash(p_h), 1))
+                           & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h) else 0)
+                definition p_slot = hw_cidx(hw_hash(p_h), p_hway)
+                definition p_hexcl = p_present & tag_exc(p_slot)
+                definition p_hit = p_present & (~p_wen | p_hexcl)
+                wire arb0 : bool
+                wire arb1 : bool
+
+                # ---- invalidates use a separate held slot and have array and
+                # channel-3 priority.  An invalidate is answered for a
+                # resident copy AND for either MSHR's post-grant window,
+                # where the line is held but not yet installed: that MSHR
+                # bounces back to `m_req` with its request still parked, and
+                # the reply is clean because the parked store applies only at
+                # replay.  At most one of the three can match: `[c_uniq]`
+                # keeps a line in one way and `[mshr_distinct_p1]` keeps the
+                # two MSHRs off each other's line. ----
+                wire inv_hit    : bool
+                wire inv_hway   : way
+                wire inv_slot   : cache_slot
+                wire inv_mshr0  : bool
+                wire inv_mshr1  : bool
+                wire inv_act    : bool
+                definition inv_hit =
+                      (tag_occ(hw_cidx(hw_hash(c1_inv_line), 1)) & tag_ln(hw_cidx(hw_hash(c1_inv_line), 1)) = c1_inv_line)
+                    | (tag_occ(hw_cidx(hw_hash(c1_inv_line), 0)) & tag_ln(hw_cidx(hw_hash(c1_inv_line), 0)) = c1_inv_line)
+                definition inv_hway =
+                    (1 if (tag_occ(hw_cidx(hw_hash(c1_inv_line), 1))
+                           & tag_ln(hw_cidx(hw_hash(c1_inv_line), 1)) = c1_inv_line) else 0)
+                definition inv_slot = hw_cidx(hw_hash(c1_inv_line), inv_hway)
+                definition inv_mshr0 = (s0_m_state = m_fill | s0_m_state = m_replay)
+                    & s0_m_base = c1_inv_line
+                definition inv_mshr1 = (s1_m_state = m_fill | s1_m_state = m_replay)
+                    & s1_m_base = c1_inv_line
+                definition inv_act = c1_inv_valid & (inv_hit | inv_mshr0 | inv_mshr1)
+                definition inv_taken = inv_act & ~ae_r
+
+                # ---- the stage-movable gate, back to its two-MSHR shape:
+                # the staged request enters only when its line aliases no
+                # active MSHR, no MSHR wants the array this edge, and an MSHR
+                # is free to take a miss -- plus, new here, channel 3 is free
+                # if the request is a store that has to self-downgrade a
+                # Shared copy first.  Otherwise the first MSHR that wants the
+                # array gets it, and an invalidate outranks all of them. ----
                 definition stage_go = p_valid
+                    & ~inv_act
                     & ~(s0_m_state ~= m_idle & s0_m_base = p_h)
                     & ~(s1_m_state ~= m_idle & s1_m_base = p_h)
                     & ~(s0_m_state = m_fill | s0_m_state = m_replay)
                     & ~(s1_m_state = m_fill | s1_m_state = m_replay)
                     & (s0_m_state = m_idle | s1_m_state = m_idle)
+                    & (~p_wen | ~p_present | p_hexcl | ~ae_r)
+                definition arb0 = ~stage_go & ~inv_act
+                    & (s0_m_state = m_fill | s0_m_state = m_replay)
+                definition arb1 = ~stage_go & ~inv_act
+                    & ~(s0_m_state = m_fill | s0_m_state = m_replay)
+                    & (s1_m_state = m_fill | s1_m_state = m_replay)
+
                 definition ps_v = p_valid & p_wen
                 definition ps_h = p_h
                 definition ps_o = p_o
@@ -1627,45 +1942,37 @@ export action posedge
                     | (s0_rq_valid & s0_rq_wen & s0_m_base = H)
                     | (s1_rq_valid & s1_rq_wen & s1_m_base = H)
 
-                definition arb0 = ~stage_go
-                    & (s0_m_state = m_fill | s0_m_state = m_replay)
-                definition arb1 = ~stage_go
-                    & ~(s0_m_state = m_fill | s0_m_state = m_replay)
-                    & (s1_m_state = m_fill | s1_m_state = m_replay)
-
-                # ---- the hit test on the staged line, written out over the
-                # two ways ----
-                wire p_hit : bool
-                wire p_hway : way
-                definition p_hit =
-                      (tag_occ(hw_cidx(hw_hash(p_h), 1)) & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h)
-                    | (tag_occ(hw_cidx(hw_hash(p_h), 0)) & tag_ln(hw_cidx(hw_hash(p_h), 0)) = p_h)
-                definition p_hway =
-                    (1 if (tag_occ(hw_cidx(hw_hash(p_h), 1))
-                           & tag_ln(hw_cidx(hw_hash(p_h), 1)) = p_h) else 0)
-
                 # ---- the victim slot each MSHR is aiming at ----
                 wire v0 : cache_slot
                 wire v1 : cache_slot
                 definition v0 = hw_cidx(hw_hash(s0_m_base), s0_m_vway)
                 definition v1 = hw_cidx(hw_hash(s1_m_base), s1_m_vway)
 
-                # ---- a give-up: an `m_fill` MSHR whose victim way is still
-                # occupied, and whose victim can go this edge -- always for a
-                # clean line, and for a dirty one only with channel 3 free.
-                # `ae_r` and not `ack1_g_en`, for the reason given above. ----
+                # ---- channel 3 has four producers now: the invalidate
+                # reply, the store's self-downgrade, and each MSHR's
+                # fill-eviction.  They are one-hot because the invalidate
+                # outranks everything and `stage_go`, `arb0`, `arb1` are
+                # mutually exclusive. ----
                 wire gv0 : bool
                 wire gv1 : bool
+                wire ugv : bool
                 definition gv0 = (s0_m_state = m_fill) & tag_occ(v0) & ~ae_r
                 definition gv1 = (s1_m_state = m_fill) & tag_occ(v1) & ~ae_r
+                definition ugv = stage_go & p_wen & p_present & ~p_hexcl
 
-                definition gv_en  = (arb0 & gv0) | (arb1 & gv1)
-                definition gv_l   = (s0_mvline if arb0 else s1_mvline)
-                definition gv_d   = (tag_dty(v0) if arb0 else tag_dty(v1))
-                definition gv_dat = (dat(v0) if arb0 else dat(v1))
+                definition give_en = inv_taken | ugv | (arb0 & gv0) | (arb1 & gv1)
+                definition give_line = (c1_inv_line if inv_taken else
+                                        (p_h if ugv else
+                                         (s0_mvline if arb0 else s1_mvline)))
+                definition give_dty = ((tag_dty(inv_slot) if inv_hit else false) if inv_taken else
+                                       (tag_dty(p_slot) if ugv else
+                                        (tag_dty(v0) if arb0 else tag_dty(v1))))
+                definition give_dat = ((dat(inv_slot) if inv_hit else 0) if inv_taken else
+                                       (dat(p_slot) if ugv else
+                                        (dat(v0) if arb0 else dat(v1))))
 
-                # ---- a store commits on the stage's hit path or on an
-                # MSHR's replay ----
+                # ---- a store commits on the stage's Exclusive-hit path or on
+                # an MSHR's replay ----
                 definition st_en = (stage_go & p_wen & p_hit)
                     | (arb0 & s0_m_state = m_replay & s0_rq_valid & s0_rq_wen)
                     | (arb1 & s1_m_state = m_replay & s1_rq_valid & s1_rq_wen)
@@ -1685,11 +1992,19 @@ export action posedge
                                        else s1_m_excl)
 
                 # ---- a grant is consumed the edge it matches a waiting
-                # MSHR: `gr_line = m_base` is unambiguous because the two
-                # MSHRs never fetch the same line (`[mshr_distinct_p1]`) ----
-                definition gr_taken = c1_gr_valid
-                    & ((s0_m_state = m_wait & s0_m_base = c1_gr_line)
-                       | (s1_m_state = m_wait & s1_m_base = c1_gr_line))
+                # MSHR, and only if its kind covers what that MSHR parked:
+                # `gr_line = m_base` is unambiguous because the two MSHRs
+                # never fetch the same line (`[mshr_distinct_p1]`) ----
+                definition gr_taken = c1_gr_valid & ~c1_inv_valid
+                    & ((s0_m_state = m_wait & s0_m_base = c1_gr_line
+                        & (~s0_rq_wen | c1_gr_excl))
+                       | (s1_m_state = m_wait & s1_m_base = c1_gr_line
+                          & (~s1_rq_wen | c1_gr_excl)))
+
+                definition ack_en   = ae_r
+                definition ack_line = ae_line
+                definition ack_dty  = ae_dty
+                definition ack_dat  = ae_dat
 
                 definition cache_to_lsq_creq_ready1 = ~p_valid | stage_go
 
@@ -1706,19 +2021,22 @@ export action posedge
                     var h  : line    := p_h;
                     var o  : woffset := p_o;
                     var rs : key     := hw_hash(h);
-                    var hit  : bool  := false;
-                    var hway : way   := 1;
+                    var present : bool := false;
+                    var hit     : bool := false;
+                    var hway    : way  := 1;
                     p_valid := false;
                     if tag_occ(hw_cidx(rs, 1)) & tag_ln(hw_cidx(rs, 1)) = h {
-                        hit := true; hway := 1;
+                        present := true; hway := 1;
                     } else { if tag_occ(hw_cidx(rs, 0)) & tag_ln(hw_cidx(rs, 0)) = h {
-                        hit := true; hway := 0;
+                        present := true; hway := 0;
                     } };
+                    hit := present & (~p_wen | tag_exc(hw_cidx(rs, hway)));
                     if hit {
                         if p_wen {
                             dat(hw_cidx(rs, hway)) :=
                                 hw_lins(dat(hw_cidx(rs, hway)), o, p_wdata);
                             tag_dty(hw_cidx(rs, hway)) := true;
+                            tag_exc(hw_cidx(rs, hway)) := true;
                         } else {
                             ev_ans     := true;
                             ev_ans_h   := h;
@@ -1729,10 +2047,17 @@ export action posedge
                         };
                         if hway = 1 { set_lru(rs) := 0; } else { set_lru(rs) := 1; };
                     } else {
+                        # A store to Shared surrenders that clean copy before
+                        # requesting Exclusive.  `stage_go` waited for ch3.
+                        if present {
+                            ae_r := true;
+                            ae_line := h;
+                            ae_dty  := tag_dty(hw_cidx(rs, hway));
+                            ae_dat  := dat(hw_cidx(rs, hway));
+                            tag_occ(hw_cidx(rs, hway)) := false;
+                        };
                         # ---- allocate.  Under the gate one MSHR is idle, so
-                        # the else arm is closed by construction.  The victim
-                        # way is picked HERE, off the set's LRU bit and away
-                        # from whatever the other MSHR is already aiming at.
+                        # the else arm is closed by construction. ----
                         if s0_m_state = m_idle {
                             s0_m_state := m_req;
                             s0_m_base  := h;
@@ -1756,12 +2081,16 @@ export action posedge
                         if tag_occ(v0) {
                             if ~ae0 {
                                 ae_r := true;
+                                ae_line := s0_mvline;
+                                ae_dty  := tag_dty(v0);
+                                ae_dat  := dat(v0);
                                 tag_occ(v0) := false;
                             };
                         } else {
                             dat(v0)     := s0_mfb;
                             tag_ln(v0)  := s0_m_base;
                             tag_dty(v0) := false;
+                            tag_exc(v0) := s0_m_excl;
                             tag_occ(v0) := true;
                             if s0_m_vway = 1 { set_lru(hw_hash(s0_m_base)) := 0; }
                             else { set_lru(hw_hash(s0_m_base)) := 1; };
@@ -1771,6 +2100,7 @@ export action posedge
                         if s0_rq_valid & s0_rq_wen {
                             dat(v0) := hw_lins(dat(v0), s0_rq_off, s0_rq_wdata);
                             tag_dty(v0) := true;
+                            tag_exc(v0) := true;
                             s0_rq_valid := false;
                             s0_m_state  := m_idle;
                         } else { if s0_rq_valid {
@@ -1795,12 +2125,16 @@ export action posedge
                         if tag_occ(v1) {
                             if ~ae0 {
                                 ae_r := true;
+                                ae_line := s1_mvline;
+                                ae_dty  := tag_dty(v1);
+                                ae_dat  := dat(v1);
                                 tag_occ(v1) := false;
                             };
                         } else {
                             dat(v1)     := s1_mfb;
                             tag_ln(v1)  := s1_m_base;
                             tag_dty(v1) := false;
+                            tag_exc(v1) := s1_m_excl;
                             tag_occ(v1) := true;
                             if s1_m_vway = 1 { set_lru(hw_hash(s1_m_base)) := 0; }
                             else { set_lru(hw_hash(s1_m_base)) := 1; };
@@ -1810,6 +2144,7 @@ export action posedge
                         if s1_rq_valid & s1_rq_wen {
                             dat(v1) := hw_lins(dat(v1), s1_rq_off, s1_rq_wdata);
                             tag_dty(v1) := true;
+                            tag_exc(v1) := true;
                             s1_rq_valid := false;
                             s1_m_state  := m_idle;
                         } else { if s1_rq_valid {
@@ -1831,30 +2166,62 @@ export action posedge
 
                 after posedge {
                     var ae0 : bool := ae_r;
+                    # ---- the PRE-edge control states.  Channel 1's handshake
+                    # has to be resolved against the states the directory
+                    # sampled, not against the ones an invalidate bounce
+                    # produced on this same edge: a bounce manufactures a
+                    # fresh `m_req`, and advancing THAT slot would hand it a
+                    # grant the other slot asked for. ----
+                    var q0 : mstate := s0_m_state;
+                    var q1 : mstate := s1_m_state;
 
                     port_used := false;
                     ev_ans    := false;
 
-                    # ---- THE array action, exactly one ----
-                    if p_valid
+                    # ---- THE array action, exactly one.  Invalidation
+                    # outranks the stage and both MSHRs: a
+                    # granted-but-unreplayed line is clean, so bouncing it
+                    # keeps the parked request and simply re-requests. ----
+                    if inv_act & ~ae_r {
+                        ae_r := true;
+                        ae_line := c1_inv_line;
+                        ae_dty  := (tag_dty(inv_slot) if inv_hit else false);
+                        ae_dat  := (dat(inv_slot) if inv_hit else 0);
+                        if inv_hit {
+                            tag_occ(inv_slot) := false;
+                        };
+                        if (s0_m_state = m_fill | s0_m_state = m_replay)
+                                & s0_m_base = c1_inv_line {
+                            s0_m_state := m_req;
+                        };
+                        if (s1_m_state = m_fill | s1_m_state = m_replay)
+                                & s1_m_base = c1_inv_line {
+                            s1_m_state := m_req;
+                        };
+                    } else { if p_valid & ~inv_act
                             & ~(s0_m_state ~= m_idle & s0_m_base = p_h)
                             & ~(s1_m_state ~= m_idle & s1_m_base = p_h)
                             & ~(s0_m_state = m_fill | s0_m_state = m_replay)
                             & ~(s1_m_state = m_fill | s1_m_state = m_replay)
-                            & (s0_m_state = m_idle | s1_m_state = m_idle) {
+                            & (s0_m_state = m_idle | s1_m_state = m_idle)
+                            & (~p_wen | ~p_present | p_hexcl | ~ae_r) {
                         call serve_stage;
-                    } else { if s0_m_state = m_fill | s0_m_state = m_replay {
+                    } else { if ~inv_act
+                                      & (s0_m_state = m_fill | s0_m_state = m_replay) {
                         call step_0(ae0);
-                    } else { if s1_m_state = m_fill | s1_m_state = m_replay {
+                    } else { if ~inv_act
+                                      & (s1_m_state = m_fill | s1_m_state = m_replay) {
                         call step_1(ae0);
-                    } } };
+                    } } } };
 
-                    # ---- channel 2: latch a matching grant and pick this
-                    # MSHR's victim way, away from whatever the other one is
-                    # aiming at in the same set ----
-                    if s0_m_state = m_wait & c1_gr_valid & c1_gr_valid
-                            & s0_m_base = c1_gr_line {
+                    # ---- channel 2: latch the matching Shared/Exclusive
+                    # grant and reserve a victim way, away from whatever the
+                    # other MSHR is already aiming at in the same set. ----
+                    if s0_m_state = m_wait & c1_gr_valid & ~c1_inv_valid
+                            & s0_m_base = c1_gr_line
+                            & (~s0_rq_wen | c1_gr_excl) {
                         s0_mfb := c1_gr_data;
+                        s0_m_excl := c1_gr_excl;
                         var w0 : way := 1;
                         if set_lru(hw_hash(s0_m_base)) = 1 { w0 := 0; };
                         if (s1_m_state = m_fill | s1_m_state = m_replay)
@@ -1865,9 +2232,11 @@ export action posedge
                         s0_mvline  := tag_ln(hw_cidx(hw_hash(s0_m_base), w0));
                         s0_m_state := m_fill;
                     };
-                    if s1_m_state = m_wait & c1_gr_valid
-                            & s1_m_base = c1_gr_line {
+                    if s1_m_state = m_wait & c1_gr_valid & ~c1_inv_valid
+                            & s1_m_base = c1_gr_line
+                            & (~s1_rq_wen | c1_gr_excl) {
                         s1_mfb := c1_gr_data;
+                        s1_m_excl := c1_gr_excl;
                         var w1 : way := 1;
                         if set_lru(hw_hash(s1_m_base)) = 1 { w1 := 0; };
                         if (s0_m_state = m_fill | s0_m_state = m_replay)
@@ -1879,11 +2248,11 @@ export action posedge
                         s1_m_state := m_fill;
                     };
 
-                    # ---- channel 1 ----
+                    # ---- channel 1, resolved against the pre-edge states ----
                     if c1_req_taken {
-                        if s0_m_state = m_req {
+                        if q0 = m_req {
                             s0_m_state := m_wait;
-                        } else { if s1_m_state = m_req {
+                        } else { if q1 = m_req {
                             s1_m_state := m_wait;
                         } };
                     };
@@ -1904,24 +2273,23 @@ export action posedge
                 }
 
                 # ==========================================================
-                # 3.1  The array, and what it means.
+                # 3.1  Array data and permissions.
                 # ==========================================================
-
-                # ---- a line sits in its own set, and in one way of it ----
                 invariant [c_set_p1] occupied(K, W) -> hash(ltag(K, W)) = K
                 invariant [c_uniq_p1] occupied(K, W1) & occupied(K, W2)
                     & ltag(K, W1) = ltag(K, W2) -> W1 = W2
-
-                # ---- the resident copy IS the image ----
                 invariant [c_img_p1] occupied(K, W) ->
                     val(K, W, O) = img(ltag(K, W), O)
-
-                # ---- and only a dirty copy can be owned ----
                 invariant [c_clean_p1] occupied(K, W) & ~dirty(K, W) ->
-                    ~owns1(ltag(K, W), O)
+                    ~dirtied1(ltag(K, W), O)
+                invariant [dirty_excl_p1] occupied(K, W) & dirty(K, W) ->
+                    exclusive(K, W)
+                invariant [hold_inf_a_p1] occupied(K, W) -> holds1(ltag(K, W))
+                invariant [excl_inf_a_p1] occupied(K, W) & exclusive(K, W) ->
+                    exclusive1(ltag(K, W))
 
                 # ==========================================================
-                # 3.2  The MSHRs do not alias the array, or each other.
+                # 3.2  The two MSHRs do not alias the array, or each other.
                 # ==========================================================
                 invariant [no_alias_0_p1]
                     (s0_m_state = m_req | s0_m_state = m_wait | s0_m_state = m_fill)
@@ -1951,60 +2319,38 @@ export action posedge
                 invariant [replay_way_1_p1] s1_m_state = m_replay ->
                     tag_occ(v1) & ltag(hash(s1_m_base), s1_m_vway) = s1_m_base
 
-                # ==========================================================
-                # 3.3  The fill buffer.
-                #
-                # `[mfb_img_*]` is the successor of the beat-granular
-                # `fbuf_img` with the holes gone: the line is captured in one
-                # edge, so there is nothing partial to track.  It is stable
-                # while it is held because no store can move `img` at
-                # `m_base` -- `no_alias` says the line is not resident, so a
-                # store-hit cannot be to it, and `mshr_distinct` says the
-                # other MSHR is not replaying into it.
-                # ==========================================================
-                # ---- a line still being filled is not owned: it arrived
-                # unowned (`[gr_clean]`) and nothing can have stored into it
-                # since -- it is not resident (`[no_alias_*]`) and the other
-                # MSHR is not replaying into it (`[mshr_distinct_p1]`).  This is
-                # what lets the fill install a CLEAN tag. ----
-                invariant [fill_clean_0_p1] s0_m_state = m_fill ->
-                    ~owns1(s0_m_base, O)
-                invariant [fill_clean_1_p1] s1_m_state = m_fill ->
-                    ~owns1(s1_m_base, O)
+                # ---- a parked store only ever sits behind an Exclusive
+                # request: that is what makes the replay's write legal ----
+                invariant [rq_store_excl_0_p1] s0_rq_valid & s0_rq_wen -> s0_m_excl
+                invariant [rq_store_excl_1_p1] s1_rq_valid & s1_rq_wen -> s1_m_excl
 
+                # ==========================================================
+                # 3.3  The fill buffers.
+                # ==========================================================
+                invariant [fill_clean_0_p1] s0_m_state = m_fill ->
+                    ~dirtied1(s0_m_base, O)
+                invariant [fill_clean_1_p1] s1_m_state = m_fill ->
+                    ~dirtied1(s1_m_base, O)
                 invariant [mfb_img_0_p1] s0_m_state = m_fill ->
                     lsel(s0_mfb, O) = img(s0_m_base, O)
                 invariant [mfb_img_1_p1] s1_m_state = m_fill ->
                     lsel(s1_mfb, O) = img(s1_m_base, O)
 
-                # ==========================================================
-                # 3.4  The two records at `cachemem`, kept honest.
-                # ==========================================================
-                invariant [ae_sync_p1] ack1_g_en = ae_r
-
-                # ---- everything the cache is sitting on is in `hold_g1`:
-                # every resident line, and every line an MSHR has already
-                # been granted.  Written over (K, W) rather than over the
-                # line, so no query goes from a line through `hash` into the
-                # array and back out to a line. ----
-                invariant [hold_inf_a_p1] occupied(K, W) -> hold_g1(ltag(K, W))
                 invariant [hold_inf_0_p1]
-                    (s0_m_state = m_fill | s0_m_state = m_replay)
-                    -> hold_g1(s0_m_base)
+                    (s0_m_state = m_fill | s0_m_state = m_replay) ->
+                    holds1(s0_m_base)
                 invariant [hold_inf_1_p1]
-                    (s1_m_state = m_fill | s1_m_state = m_replay)
-                    -> hold_g1(s1_m_base)
+                    (s1_m_state = m_fill | s1_m_state = m_replay) ->
+                    holds1(s1_m_base)
+                invariant [excl_inf_0_p1]
+                    (s0_m_state = m_fill | s0_m_state = m_replay) & s0_m_excl ->
+                    exclusive1(s0_m_base)
+                invariant [excl_inf_1_p1]
+                    (s1_m_state = m_fill | s1_m_state = m_replay) & s1_m_excl ->
+                    exclusive1(s1_m_base)
 
-                # ---- the CONVERSE is deliberately absent.  `hold_g1(H) -> H
-                # is resident or reserved` is true -- the record is set on a
-                # grant capture and cleared on the matching give-up -- but
-                # stating it needs `hash(H)` under a quantifier, which sends
-                # the query from a line through `hash` into the array and
-                # back out to a line: `ivy_check` rejects the whole
-                # verification condition as outside FAU.  Nothing needs it.
-                # A stale entry could only make the directory refuse to serve
-                # a line the cache is asking for, which is liveness, and the
-                # directory's own guard is what `[d_notheld]` rests on. ----
+                # ---- the concrete channel-3 register mirrors cachemem. ----
+                invariant [ae_sync_p1] ack1_g_en = ae_r
 
             }
 
@@ -2067,15 +2413,16 @@ export action posedge
                                        if (H = high(cmd_addr)
                                            & beat_of(O) = beat_of(low(cmd_addr)))
                                        else mmem(H, O));
-                        # (the matching `cache_owns` CLEAR lives in
+                        # (the matching `dirtied0`/`dirtied1` CLEAR lives in
                         # `cachemem`'s monitor, ahead of the store arm, so
                         # a same-edge store-set wins)
                     };
                 }
 
                 # ==========================================================
-                # Wherever nobody owns the word, the DRAM is the reference
-                # image.  Proven HERE, against the controller's own small
+                # Wherever neither cache has dirtied the word, the DRAM is
+                # the reference image.  Proven HERE, against the
+                # controller's own small
                 # transition.  What it needs of its client is `wb_img` --
                 # anything put on the command wire is accurate to `img` --
                 # and that arrives by IMPORT, through `with this`: `cachemem`
@@ -2086,7 +2433,7 @@ export action posedge
                 # closing entirely.
                 # ==========================================================
 
-                invariant [mc_owns_img] ~owns0(H, O) & ~owns1(H, O) ->
+                invariant [mc_owns_img] ~dirtied0(H, O) & ~dirtied1(H, O) ->
                     mmem(H, O) = img(H, O)
 
                 before posedge {
@@ -2211,14 +2558,21 @@ export action posedge
         # finish, one grant outstanding, one writeback at a time; channel 3
         # is per CPU and the sequencer serves CPU 0 first.
         #
-        # EXCLUSIVE-ONLY.  A request is picked only for a line NEITHER cache
-        # has an entry for, so a line is granted to at most one cache at a
-        # time and SWMR is immediate.  That is the coherence property; what
-        # it costs is sharing -- two readers of one line cannot both hold it,
-        # they take turns.  German's `grantShared` and the invalidate flow
-        # that goes with it are the remaining work, and `[d_exact]` is
-        # exactly the invariant they need: a line with no entry is in no
-        # cache, so the directory always knows whom to invalidate.
+        # SHARED AND EXCLUSIVE.  Every request is picked; `d_inv` is what
+        # makes room for it.  An Exclusive request displaces every holder, a
+        # Shared one only the exclusive holder, and both wait for the
+        # REQUESTER's own bit as well -- which can only ever be a stale one,
+        # since a cache never requests a line it holds.  That last clause is
+        # what makes a grant land on a line the directory has no record of
+        # the requester at, and it is what `[gr_notack*]` and `[gr_clean*]`
+        # rest on.
+        #
+        # An invalidate is sent only to a cache with no ack of its own in
+        # flight: a bit backed by an ack already in the channel needs no
+        # invalidate, it clears itself when that ack retires.  With
+        # `[d_back*]` -- no stale bits, modulo an in-flight ack -- that makes
+        # "the directory only ever invalidates a holder" a theorem rather
+        # than a convention.
         # ==================================================================
         isolate dir_body = {
 
@@ -2228,12 +2582,16 @@ export action posedge
             wire gr_excl0   : bool
             wire gr_line0   : line
             wire gr_data0   : cache_line
+            wire inv_valid0 : bool
+            wire inv_line0  : line
             wire ack_taken0 : bool
             wire req_taken1 : bool
             wire gr_valid1  : bool
             wire gr_excl1   : bool
             wire gr_line1   : line
             wire gr_data1   : cache_line
+            wire inv_valid1 : bool
+            wire inv_line1  : line
             wire ack_taken1 : bool
 
             # ---- memory command channel ----
@@ -2262,11 +2620,15 @@ export action posedge
                 function dir(H : line, O : woffset) : word
                 definition dir(H, O) = mc_body.mmem(H, O)
 
-                invariant [dir_img] ~owns0(H, O) & ~owns1(H, O) ->
+                invariant [dir_img] ~dirtied0(H, O) & ~dirtied1(H, O) ->
                     dir(H, O) = img(H, O)
 
-                invariant [swmr] ~(hold_g0(H) & hold_g1(H))
+                # Shared holders may coexist.  Only an Exclusive holder
+                # excludes every copy in the other cache.
+                invariant [swmr0] exclusive0(H) -> ~holds1(H)
+                invariant [swmr1] exclusive1(H) -> ~holds0(H)
 
+                # Granted data is accurate
                 invariant [grant_img_lo0] c0_gr_valid ->
                     lsel(c0_gr_data, concatbv2(0, J)) = img(c0_gr_line, concatbv2(0, J))
                 invariant [grant_img_hi0] c0_gr_valid ->
@@ -2278,42 +2640,69 @@ export action posedge
 
                 invariant [wb_img] cmd_en & cmd_wen ->
                     wsel4(cmd_data, J) =
-                        img(high(cmd_addr),
-                            concatbv2(beat_of(low(cmd_addr)), J))
+                        img(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), J))
 
-                # ---- an ack is not retired until its data is in DRAM ----
                 invariant [wb_done0] c0_ack_taken ->
-                    ~owns0(ack0_g_line, O) & ~owns1(ack0_g_line, O)
+                    ~dirtied0(ack0_g_line, O) & ~dirtied1(ack0_g_line, O)
                 invariant [wb_done1] c1_ack_taken ->
-                    ~owns0(ack1_g_line, O) & ~owns1(ack1_g_line, O)
+                    ~dirtied0(ack1_g_line, O) & ~dirtied1(ack1_g_line, O)
 
-                # ---- a cache is never handed back a line whose own
-                # writeback is still in the channel, and what it is handed is
-                # unowned by anyone ----
                 invariant [gr_notack0] c0_gr_valid ->
                     ~(ack0_g_en & ack0_g_line = c0_gr_line)
                 invariant [gr_notack1] c1_gr_valid ->
                     ~(ack1_g_en & ack1_g_line = c1_gr_line)
                 invariant [gr_clean0] c0_gr_valid ->
-                    ~owns0(c0_gr_line, O) & ~owns1(c0_gr_line, O)
+                    ~dirtied0(c0_gr_line, O) & ~dirtied1(c0_gr_line, O)
                 invariant [gr_clean1] c1_gr_valid ->
-                    ~owns0(c1_gr_line, O) & ~owns1(c1_gr_line, O)
+                    ~dirtied0(c1_gr_line, O) & ~dirtied1(c1_gr_line, O)
 
-                # ---- and it is not handed a line the OTHER cache holds:
-                # this is `[swmr]` at the one edge that could break it ----
-                invariant [gr_excl0i] c0_gr_valid -> ~hold_g1(c0_gr_line)
-                invariant [gr_excl1i] c1_gr_valid -> ~hold_g0(c1_gr_line)
+                invariant [gr_excl0i] c0_gr_valid & c0_gr_excl ->
+                    ~holds1(c0_gr_line)
+                invariant [gr_excl1i] c1_gr_valid & c1_gr_excl ->
+                    ~holds0(c1_gr_line)
+                invariant [gr_shared0i] c0_gr_valid & ~c0_gr_excl ->
+                    ~exclusive1(c0_gr_line)
+                invariant [gr_shared1i] c1_gr_valid & ~c1_gr_excl ->
+                    ~exclusive0(c1_gr_line)
 
-                # ---- a line on its way back from one cache is not in the
-                # other.  This is what keeps each cache's `[ack_img]` stable:
-                # the payload sitting in channel 3 is the image, and only the
-                # holder of a line can move the image at it. ----
-                invariant [ack_excl0] ack0_g_en -> ~hold_g1(ack0_g_line)
-                invariant [ack_excl1] ack1_g_en -> ~hold_g0(ack1_g_line)
+                invariant [ack_excl0] ack0_g_en & ack0_g_dty ->
+                    ~holds1(ack0_g_line)
+                invariant [ack_excl1] ack1_g_en & ack1_g_dty ->
+                    ~holds0(ack1_g_line)
+
+                # ---- German's at-most-one-exclusive corollary, over the
+                # permission ghosts: `~(cacheExclusive(C) & cacheExclusive(D))`
+                # for the two clients.  Falls out of `[d_ex*]` + `[dex_one]`. ----
+                invariant [g_one_excl] ~(exclusive0(H) & exclusive1(H))
+
+                # ---- `[commit_safe]`: exclusivity empties every other
+                # holder.  Logically nothing beyond SWMR -- it is the
+                # single-writer clause of it -- and it is kept as its own
+                # named invariant purely as the isolate-boundary cut, so every
+                # `*_img` preservation case cites ONE lemma instead of
+                # re-deriving the backbone.  A store commit is an instance:
+                # `[ca_st_excl_*]` turns `c0_st_en` into `exclusive0(c0_st_h)`.
+                #
+                # Keyed on the permission ghost and NOT on the commit wire
+                # itself: `c0_st_en` is driven by a cache definition this
+                # isolate cannot see, so in the post-state it is an
+                # unconstrained boolean and an invariant guarded by it is not
+                # provable here at all (measured: the query does not fail, it
+                # runs for minutes).  The commit-edge reading is recovered at
+                # the cache, where the wire has a definition. ----
+                invariant [commit_safe0] exclusive0(H) ->
+                      ~holds1(H)
+                    & ~(ack1_g_en & ack1_g_dty & ack1_g_line = H)
+                    & ~(c1_gr_valid & c1_gr_line = H)
+                invariant [commit_safe1] exclusive1(H) ->
+                      ~holds0(H)
+                    & ~(ack0_g_en & ack0_g_dty & ack0_g_line = H)
+                    & ~(c0_gr_valid & c0_gr_line = H)
             }
 
             implementation {
                 wire d_idle   : dstate
+                wire d_inv    : dstate
                 wire d_rd_lo  : dstate
                 wire d_rdw_lo : dstate
                 wire d_rd_hi  : dstate
@@ -2321,12 +2710,13 @@ export action posedge
                 wire d_grant  : dstate
                 wire d_gwt    : dstate
                 definition d_idle   = 0
-                definition d_rd_lo  = 1
-                definition d_rdw_lo = 2
-                definition d_rd_hi  = 3
-                definition d_rdw_hi = 4
-                definition d_grant  = 5
-                definition d_gwt    = 6
+                definition d_inv    = 1
+                definition d_rd_lo  = 2
+                definition d_rdw_lo = 3
+                definition d_rd_hi  = 4
+                definition d_rdw_hi = 5
+                definition d_grant  = 6
+                definition d_gwt    = 7
 
                 wire wb_idle : wbstate
                 wire wb_lo   : wbstate
@@ -2339,13 +2729,16 @@ export action posedge
                 definition wb_fin  = 3
                 definition wb_ret  = 4
 
-                # ---- the current request ----
-                var dstate_r : dstate
-                var cr_cpu   : bit
-                var cr_line  : line
-                var cr_excl  : bool
-                var dfb_lo   : four_words
-                var dfb_hi   : four_words
+                # ---- the current request, and who still has to give the
+                # line up before it can be served ----
+                var dstate_r  : dstate
+                var cr_cpu    : bit
+                var cr_line   : line
+                var cr_excl   : bool
+                var inv_need0 : bool
+                var inv_need1 : bool
+                var dfb_lo    : four_words
+                var dfb_hi    : four_words
 
                 # ---- the one grant slot, routed to `cr_cpu` ----
                 var gr_v : bool
@@ -2353,11 +2746,15 @@ export action posedge
                 var gr_l : line
                 var gr_d : cache_line
 
+                # ---- one held invalidate slot per cache ----
+                var inv0_v : bool
+                var inv0_l : line
+                var inv1_v : bool
+                var inv1_l : line
+
                 # ---- the writeback sequencer.  `wb_lo_done`/`wb_hi_done`
                 # are GHOST: the beat has LANDED in memory, not merely been
-                # issued.  Recorded at the top of the edge off the command
-                # wires, the same nets `cachemem`'s ownership clear is keyed
-                # on, so the two agree by construction. ----
+                # issued. ----
                 var wb_st      : wbstate
                 var wb_cpu     : bit
                 var wb_line    : line
@@ -2365,20 +2762,23 @@ export action posedge
                 var wb_hi_done : bool
 
                 # ==========================================================
-                # The sharer bits, one per line per CPU.  NOT the plan's
-                # 8 sets x 8 ways of entries: the entry accounting -- the
-                # two-role injective map and the `[d_room]` bound that makes
-                # 8 ways exactly tight -- is the one genuinely novel argument
-                # in the plan and it is NOT attempted here.  What is proved
-                # is the thing that argument exists to support: the bits are
-                # EXACT, so a line with no bit is in no cache.
+                # The sharer bits, and ONE exclusive bit beside them: the
+                # owner is not stored, it is `dex(H) & dshC(H)` -- exactly
+                # one sharer bit can be set under `dex` (`[dex_one]`), so
+                # naming the owner with a `bit` register and comparing it
+                # against `wb_cpu` bought nothing and cost the solver a
+                # great deal (with an owner index, `[wb_done0]` stopped
+                # coming back).  It is also what makes the retire arm's
+                # clear unconditional: a cache with a sharer bit and an ack
+                # in flight IS the exclusive holder if there is one.
                 #
-                # Exactness is why every eviction is non-silent: a silently
-                # dropped clean line would leave a bit set with nothing
-                # behind it.
+                # The bits are EXACT in the direction the protocol needs: a
+                # line with no bit is in no cache, and a line with no
+                # exclusive bit is writable by nobody.
                 # ==========================================================
                 var dsh0(H : line) : bool
                 var dsh1(H : line) : bool
+                var dex(H : line)  : bool
 
                 # ---- the command port's registers ----
                 var ev_cmd      : bool
@@ -2388,9 +2788,13 @@ export action posedge
 
                 after init {
                     dsh0(H) := false; dsh1(H) := false;
+                    dex(H) := false;
                     dstate_r := 0; cr_cpu := 0; cr_line := 0; cr_excl := false;
+                    inv_need0 := false; inv_need1 := false;
                     dfb_lo := 0; dfb_hi := 0;
                     gr_v := false; gr_x := false; gr_l := 0; gr_d := 0;
+                    inv0_v := false; inv0_l := 0;
+                    inv1_v := false; inv1_l := 0;
                     wb_st := 0; wb_cpu := 0; wb_line := 0;
                     wb_lo_done := false; wb_hi_done := false;
                     ev_cmd := false; ev_cmd_wen := false;
@@ -2405,22 +2809,18 @@ export action posedge
                 definition gr_excl1  = gr_x
                 definition gr_line1  = gr_l
                 definition gr_data1  = gr_d
+                definition inv_valid0 = inv0_v
+                definition inv_line0  = inv0_l
+                definition inv_valid1 = inv1_v
+                definition inv_line1  = inv1_l
 
-                # ---- a request is served only for a line NEITHER cache has
-                # an entry for.  CPU 0 first; fairness is a non-goal. ----
+                # ---- EVERY request is picked; `d_inv` is what makes room
+                # for it.  CPU 0 first; fairness is a non-goal. ----
                 wire pick_ok : bool
                 definition pick_ok = (dstate_r = d_idle) & (wb_st = wb_idle) & ~gr_v
                 definition req_taken0 = pick_ok & c0_req_en
-                    & ~dsh0(c0_req_line) & ~dsh1(c0_req_line)
-                definition req_taken1 = pick_ok & c1_req_en
-                    & ~dsh0(c1_req_line) & ~dsh1(c1_req_line)
-                    & ~(c0_req_en & ~dsh0(c0_req_line) & ~dsh1(c0_req_line))
+                definition req_taken1 = pick_ok & c1_req_en & ~c0_req_en
 
-                # ---- every ack goes through the sequencer, a clean one
-                # straight to `wb_ret`.  The retire pulse is a function of
-                # this isolate's OWN registers, so `[wb_done*]` is a claim
-                # about state the directory can reason about after the edge
-                # rather than about a cache's free wires. ----
                 definition ack_taken0 = (wb_st = wb_ret) & wb_cpu = 0
                 definition ack_taken1 = (wb_st = wb_ret) & wb_cpu = 1
 
@@ -2442,7 +2842,13 @@ export action posedge
 
                     ev_cmd := false;
 
-                    # ---- channel 2 retires, and the bit goes up ----
+                    # ---- an invalidate retires when its cache posts the
+                    # reply; the reply itself drains through channel 3. ----
+                    if inv0_v & c0_inv_taken { inv0_v := false; };
+                    if inv1_v & c1_inv_taken { inv1_v := false; };
+
+                    # ---- channel 2 retires, and the bits go up: the sharer
+                    # bit always, the exclusive bit for an Exclusive grant. ----
                     if gr_v & ((cr_cpu = 0 & c0_gr_taken)
                                | (cr_cpu = 1 & c1_gr_taken)) {
                         if cr_cpu = 0 {
@@ -2450,15 +2856,16 @@ export action posedge
                         } else {
                             dsh1(H) := (true if H = gr_l else dsh1(H));
                         };
+                        if gr_x {
+                            dex(H) := (true if H = gr_l else dex(H));
+                        };
                         gr_v := false;
                         if dstate_r = d_gwt {
                             dstate_r := d_idle;
                         };
                     };
 
-                    # ---- the read ladder.  AHEAD of the command port, so
-                    # the state a response advances is the state the port
-                    # then issues from. ----
+                    # ---- the read ladder. ----
                     if rsp_valid & hw_high(rsp_addr) = cr_line {
                         if dstate_r = d_rdw_lo & hw_beat_of(hw_low(rsp_addr)) = 0 {
                             dfb_lo   := rsp_data;
@@ -2471,25 +2878,21 @@ export action posedge
 
                     # ---- the one command port.  Writeback beats first, and
                     # AHEAD of the channel-3 pickup below so a beat is never
-                    # issued on the edge its ack was posted: `cachemem`'s
-                    # channel-3 record is written by a monitor that runs
-                    # before this one, and on that edge the cache's promise
-                    # about the payload is a statement about the PRE-edge
-                    # record. ----
+                    # issued on the edge its ack was posted. ----
                     if cmd_ready {
                         if wb_st = wb_lo {
                             ev_cmd      := true;
                             ev_cmd_wen  := true;
                             ev_cmd_addr := hw_concatbv3(wb_line, hw_concatbv2(0, 0));
-                            ev_cmd_data := hw_llo(ack0_g_data if wb_cpu = 0
-                                                  else ack1_g_data);
+                            ev_cmd_data := hw_llo(c0_ack_dat if wb_cpu = 0
+                                                  else c1_ack_dat);
                             wb_st       := wb_hi;
                         } else { if wb_st = wb_hi {
                             ev_cmd      := true;
                             ev_cmd_wen  := true;
                             ev_cmd_addr := hw_concatbv3(wb_line, hw_concatbv2(1, 0));
-                            ev_cmd_data := hw_lhi(ack0_g_data if wb_cpu = 0
-                                                  else ack1_g_data);
+                            ev_cmd_data := hw_lhi(c0_ack_dat if wb_cpu = 0
+                                                  else c1_ack_dat);
                             wb_st       := wb_fin;
                         } else { if dstate_r = d_rd_lo {
                             ev_cmd      := true;
@@ -2506,35 +2909,85 @@ export action posedge
                         } } } };
                     };
 
-                    # ---- channel 3.  CPU 0 first. ----
+                    # ---- channel 3 is always on -- an ack answers an
+                    # invalidate, a self-downgrade or a fill-eviction, and
+                    # the arm cannot tell them apart.  CPU 0 first. ----
                     if wb_st = wb_idle {
-                        if ack0_g_en {
+                        if c0_ack_en {
                             wb_cpu     := 0;
-                            wb_line    := ack0_g_line;
+                            wb_line    := c0_ack_line;
                             wb_lo_done := false;
                             wb_hi_done := false;
-                            if ack0_g_dty { wb_st := wb_lo; }
+                            if c0_ack_dty { wb_st := wb_lo; }
                             else { wb_st := wb_ret; };
-                        } else { if ack1_g_en {
+                        } else { if c1_ack_en {
                             wb_cpu     := 1;
-                            wb_line    := ack1_g_line;
+                            wb_line    := c1_ack_line;
                             wb_lo_done := false;
                             wb_hi_done := false;
-                            if ack1_g_dty { wb_st := wb_lo; }
+                            if c1_ack_dty { wb_st := wb_lo; }
                             else { wb_st := wb_ret; };
                         } };
                     } else { if wb_st = wb_fin & wb_lo_done & wb_hi_done {
                         wb_st := wb_ret;
                     } else { if wb_st = wb_ret {
+                        dex(H) := (false if H = wb_line else dex(H));
                         if wb_cpu = 0 {
                             dsh0(H) := (false if H = wb_line else dsh0(H));
+                            if dstate_r = d_inv & cr_line = wb_line {
+                                inv_need0 := false;
+                            };
+                            if inv0_v & inv0_l = wb_line { inv0_v := false; };
                         } else {
                             dsh1(H) := (false if H = wb_line else dsh1(H));
+                            if dstate_r = d_inv & cr_line = wb_line {
+                                inv_need1 := false;
+                            };
+                            if inv1_v & inv1_l = wb_line { inv1_v := false; };
                         };
                         wb_st      := wb_idle;
                         wb_lo_done := false;
                         wb_hi_done := false;
                     } } };
+
+                    # ---- make room for the request.  An invalidate is sent
+                    # only to a cache with no ack of its own in flight: a bit
+                    # backed by an ack already in the channel needs no
+                    # invalidate, it clears itself when that ack retires.
+                    #
+                    # The wait is on the BITS, never on the invalidate slots,
+                    # and it always includes the requester's own bit -- which
+                    # can only be a stale one, since a cache never requests a
+                    # line it holds.  That is what makes the grant land on a
+                    # line with no record of the requester at all. ----
+                    if dstate_r = d_inv {
+                        if inv_need0 & ~inv0_v & ~c0_ack_en {
+                            inv0_v := true; inv0_l := cr_line;
+                            inv_need0 := false;
+                        };
+                        if inv_need1 & ~inv1_v & ~c1_ack_en {
+                            inv1_v := true; inv1_l := cr_line;
+                            inv_need1 := false;
+                        };
+                        if cr_excl {
+                            if ~dsh0(cr_line) & ~dsh1(cr_line) {
+                                inv_need0 := false; inv_need1 := false;
+                                dstate_r := d_rd_lo;
+                            };
+                        } else {
+                            if cr_cpu = 0 {
+                                if ~dsh0(cr_line) & ~dex(cr_line) {
+                                    inv_need0 := false; inv_need1 := false;
+                                    dstate_r := d_rd_lo;
+                                };
+                            } else {
+                                if ~dsh1(cr_line) & ~dex(cr_line) {
+                                    inv_need0 := false; inv_need1 := false;
+                                    dstate_r := d_rd_lo;
+                                };
+                            };
+                        };
+                    };
 
                     # ---- the grant ----
                     if dstate_r = d_grant {
@@ -2546,24 +2999,36 @@ export action posedge
                     };
 
                     # ---- pick a new request.  Last, so the slot a grant
-                    # freed this edge is not reused on the same edge. ----
+                    # freed this edge is not reused on the same edge.  An
+                    # Exclusive request must displace every holder; a Shared
+                    # one only the exclusive holder. ----
                     if dstate_r = d_idle & wb_st = wb_idle & ~gr_v {
-                        if c0_req_en & ~dsh0(c0_req_line) & ~dsh1(c0_req_line) {
+                        if c0_req_en {
                             cr_cpu   := 0;
                             cr_line  := c0_req_line;
                             cr_excl  := c0_req_excl;
-                            dstate_r := d_rd_lo;
-                        } else { if c1_req_en & ~dsh0(c1_req_line) & ~dsh1(c1_req_line) {
+                            inv_need0 := dsh0(c0_req_line)
+                                         & (c0_req_excl | dex(c0_req_line));
+                            inv_need1 := dsh1(c0_req_line)
+                                         & (c0_req_excl | dex(c0_req_line));
+                            dstate_r := d_inv;
+                        } else { if c1_req_en {
                             cr_cpu   := 1;
                             cr_line  := c1_req_line;
                             cr_excl  := c1_req_excl;
-                            dstate_r := d_rd_lo;
+                            inv_need0 := dsh0(c1_req_line)
+                                         & (c1_req_excl | dex(c1_req_line));
+                            inv_need1 := dsh1(c1_req_line)
+                                         & (c1_req_excl | dex(c1_req_line));
+                            dstate_r := d_inv;
                         } };
                     };
                 }
 
                 # ==========================================================
-                # 6.1  Structure of the two sequencers.
+                # 6.1  Structure of the two sequencers.  Unchanged from the
+                # exclusive-only directory: channel 3 never knew what kind of
+                # surrender it was carrying.
                 # ==========================================================
                 invariant [d_gr_state] gr_v -> dstate_r = d_gwt
                 invariant [d_gwt_gr] dstate_r = d_gwt -> gr_v
@@ -2575,7 +3040,7 @@ export action posedge
                       (wb_cpu = 0 & ack0_g_en & ack0_g_line = wb_line)
                     | (wb_cpu = 1 & ack1_g_en & ack1_g_line = wb_line)
                 invariant [wb_ret_clean] wb_st = wb_ret ->
-                    ~owns0(wb_line, O) & ~owns1(wb_line, O)
+                    ~dirtied0(wb_line, O) & ~dirtied1(wb_line, O)
 
                 invariant [wb_cmd] ev_cmd & ev_cmd_wen ->
                     high(ev_cmd_addr) = wb_line
@@ -2588,49 +3053,160 @@ export action posedge
                     & high(ev_cmd_addr) = cr_line
 
                 invariant [wb_lo_clean] wb_lo_done & beat_of(O) = 0
-                    -> ~owns0(wb_line, O) & ~owns1(wb_line, O)
+                    -> ~dirtied0(wb_line, O) & ~dirtied1(wb_line, O)
                 invariant [wb_hi_clean] wb_hi_done & beat_of(O) = 1
-                    -> ~owns0(wb_line, O) & ~owns1(wb_line, O)
+                    -> ~dirtied0(wb_line, O) & ~dirtied1(wb_line, O)
                 invariant [wb_ghost_idle] wb_st = wb_idle
                     -> ~wb_lo_done & ~wb_hi_done
 
                 # ==========================================================
-                # 6.2  The directory's picture is EXACT, and that is SWMR.
+                # 6.2  The bits are exact, and the exclusive bit is what
+                # SWMR now rests on.
                 #
-                # A held line always has its bit set, and a request is only
-                # picked for a line with no bit at all, so the grant that
-                # ends a transaction lands on a line no cache holds.
+                # `[dex_sh*]` is the whole coherence argument in one line: an
+                # exclusive bit excludes the other cache's sharer bit, and
+                # `[d_exact*]` turns that into "the other cache does not hold
+                # the line".  Shared bits are free to coexist.
                 # ==========================================================
-                invariant [d_exact0] hold_g0(H) -> dsh0(H)
-                invariant [d_exact1] hold_g1(H) -> dsh1(H)
+                invariant [d_exact0] holds0(H) -> dsh0(H)
+                invariant [d_exact1] holds1(H) -> dsh1(H)
                 invariant [dsh_ack0] ack0_g_en -> dsh0(ack0_g_line)
                 invariant [dsh_ack1] ack1_g_en -> dsh1(ack1_g_line)
 
-                # ---- the two entry sets are disjoint: a request is only
-                # picked for a line with no entry anywhere, and the grant
-                # that ends it sets exactly one bit.  `[swmr]` is this plus
-                # `[d_exact*]`. ----
-                invariant [d_excl] ~(dsh0(H) & dsh1(H))
+                # ---- and the converse: no STALE bits.  A set bit is backed
+                # by a copy the cache still holds, or by an ack already in the
+                # channel.  With the send guard (`~ackN_g_en`) this is what
+                # makes "the directory only invalidates a holder" a theorem:
+                # `[inv_live*]` says a live invalidate names a line whose bit
+                # is set, and this says such a line is really there. ----
+                invariant [d_back0] dsh0(H) ->
+                    holds0(H) | (ack0_g_en & ack0_g_line = H)
+                invariant [d_back1] dsh1(H) ->
+                    holds1(H) | (ack1_g_en & ack1_g_line = H)
+                # ==========================================================
+                # 6.5  German's backbone, transcribed per line.
+                #
+                # These are the classic invariants of `german.ivy` /
+                # `german_evict.ivy` restated over this file's holder
+                # relations, and they are the audit trail for the
+                # correspondence rather than load-bearing lemmas -- each is a
+                # consequence of the exactness block above.  They are stated
+                # HERE and not in the specification only because `dsh*`/`dex`/
+                # `dstate_r`/`inv*_v` are private to this section.
+                #
+                #   german.ivy                            this file
+                #   ------------------------------------  ---------------------
+                #   cacheShared(C) -> homeSharerList(C)   [g_cacheS_dir*]
+                #     & ~homeExclusiveGranted
+                #   cacheExclusive(C) -> homeSharerList   [d_ex0], [d_ex1]
+                #     & homeExclusiveGranted & C = owner
+                #   homeExclusiveGranted                  [dex_owned], [dex_one]
+                #     & homeSharerList(C) -> C = owner
+                #   invalidateAck(C) -> ~cacheS/E(C)      [ca_ack_idle_p*]
+                #     & homeSharerList(C)                 [dsh_ack0], [dsh_ack1]
+                #   invalidate(C) -> homeCurrentReq       [g_inv_of_cr*]
+                #     & homeSharerList(C)                 [inv_live0], [inv_live1]
+                #   ~(invalidate(C) & grant*(C))          [g_no_gr_inv*]
+                #   homeSharerList(C) -> C holds it or a  [d_back0], [d_back1]
+                #     message for it is in flight
+                #   at most one exclusive                 [g_one_excl] (exported)
+                #   grant answers the picked request      [grant_kind]
+                # ==========================================================
 
-                invariant [d_nosh] dstate_r ~= d_idle ->
-                    ~dsh0(cr_line) & ~dsh1(cr_line)
-                invariant [gr_of_cr] gr_v -> gr_l = cr_line
+                # ---- an exclusive bit has an owner: some sharer bit backs
+                # it, and `[dex_one]` says only one can. ----
+                invariant [dex_owned] dex(H) -> dsh0(H) | dsh1(H)
 
-                # ---- `[rd_clean]`: nothing owns the line under a request,
-                # from the edge it is picked to the edge it is granted. ----
-                invariant [rd_clean] dstate_r ~= d_idle ->
-                    ~owns0(cr_line, O) & ~owns1(cr_line, O)
+                # ---- a SHARED holder implies nobody holds the line
+                # exclusively.  The other direction of `[d_ex*]`, and the
+                # concrete form of `cacheShared -> ~homeExclusiveGranted`. ----
+                invariant [g_cacheS_dir0] holds0(H) & ~exclusive0(H) -> ~dex(H)
+                invariant [g_cacheS_dir1] holds1(H) & ~exclusive1(H) -> ~dex(H)
+
+                # ---- an invalidate belongs to the request in progress: it is
+                # posted in `d_inv` for `cr_line` and retired before the
+                # transaction can leave `d_inv`, so the stale-invalidate case
+                # the eviction extension had to absorb abstractly cannot arise
+                # here.  With it, channel 2's grant and the invalidate slot are
+                # mutually exclusive per CPU. ----
+                invariant [g_inv_of_cr0] inv0_v -> dstate_r = d_inv & inv0_l = cr_line
+                invariant [g_inv_of_cr1] inv1_v -> dstate_r = d_inv & inv1_l = cr_line
+                invariant [g_no_gr_inv0] gr_v & cr_cpu = 0 -> ~inv0_v
+                invariant [g_no_gr_inv1] gr_v & cr_cpu = 1 -> ~inv1_v
+
+                # ---- a pending invalidate still names a set bit: that is
+                # what carries "the bit was set when the request was picked"
+                # forward to the edge the invalidate is actually sent. ----
+                # The `(cr_excl | dex ...)` clause is the CONFLICT the
+                # invalidate was sent for, carried alongside it: without it a
+                # Shared request could reach `d_rd_lo` -- whose completion test
+                # only names the exclusive bit -- while the other cache's
+                # invalidate slot was still live.
+                invariant [inv_need0_ok] inv_need0 ->
+                    dstate_r = d_inv & dsh0(cr_line)
+                    & (cr_excl | dex(cr_line))
+                invariant [inv_need1_ok] inv_need1 ->
+                    dstate_r = d_inv & dsh1(cr_line)
+                    & (cr_excl | dex(cr_line))
+                invariant [inv_live0] inv0_v ->
+                    dsh0(inv0_l) & (cr_excl | dex(inv0_l))
+                invariant [inv_live1] inv1_v ->
+                    dsh1(inv1_l) & (cr_excl | dex(inv1_l))
+
+                invariant [d_ex0] exclusive0(H) -> dex(H) & dsh0(H)
+                invariant [d_ex1] exclusive1(H) -> dex(H) & dsh1(H)
+                invariant [dex_one] dex(H) -> ~(dsh0(H) & dsh1(H))
+
+                # ---- a dirty ack comes from the cache that had write
+                # permission, and its exclusive bit is still set: the home
+                # has not consumed the ack yet. ----
+                invariant [dirty_ack_ex0] ack0_g_en & ack0_g_dty ->
+                    dex(ack0_g_line)
+                invariant [dirty_ack_ex1] ack1_g_en & ack1_g_dty ->
+                    dex(ack1_g_line)
 
                 # ==========================================================
-                # 6.3  The fetch buffers, and the grant they become.
+                # 6.3  The request in progress.
+                #
+                # `[rd_perm]` is what the whole `d_inv` phase exists to
+                # establish, and it holds from the edge the read ladder
+                # starts to the edge the grant is consumed: the bits it names
+                # can only rise on a grant consumption, and there is one
+                # grant slot.
                 # ==========================================================
-                invariant [dfb_img_lo]
-                    (dstate_r = d_rd_hi | dstate_r = d_rdw_hi
-                     | dstate_r = d_grant | dstate_r = d_gwt)
-                    -> wsel4(dfb_lo, J) = img(cr_line, concatbv2(0, J))
-                invariant [dfb_img_hi]
-                    (dstate_r = d_grant | dstate_r = d_gwt)
-                    -> wsel4(dfb_hi, J) = img(cr_line, concatbv2(1, J))
+                invariant [rd_perm] dstate_r >= d_rd_lo ->
+                      (cr_excl & ~dsh0(cr_line) & ~dsh1(cr_line))
+                    | (~cr_excl & ~dex(cr_line)
+                       & ((cr_cpu = 0 & ~dsh0(cr_line))
+                          | (cr_cpu = 1 & ~dsh1(cr_line))))
+
+                # ---- `[grant_kind]`: a grant in ch2(C) answers C's picked
+                # request -- same line, same Shared/Exclusive kind.  The
+                # routing half is syntactic (`gr_valid0 = gr_v & cr_cpu = 0`),
+                # and this is what lets a fill set `tag_exc` off the grant and
+                # `[rq_store_excl_*]` trust an Exclusive one. ----
+                invariant [grant_kind] gr_v -> gr_l = cr_line & gr_x = cr_excl
+
+                # ---- `[rd_clean]`: no word of a line under request is dirtied.
+                # A store needs the exclusive bit (`[ca_st_excl_*]` through
+                # `[d_ex*]`), and `[rd_perm]` has cleared it. ----
+                invariant [rd_clean] dstate_r >= d_rd_lo ->
+                    ~dirtied0(cr_line, O) & ~dirtied1(cr_line, O)
+
+                # ---- the mid-fetch clause of `[commit_safe]`: the line the
+                # directory is fetching is nobody's to write. ----
+                invariant [commit_notfetch0] dstate_r >= d_rd_lo & exclusive0(H) ->
+                    cr_line ~= H
+                invariant [commit_notfetch1] dstate_r >= d_rd_lo & exclusive1(H) ->
+                    cr_line ~= H
+
+                # ==========================================================
+                # 6.4  The fetch buffers, and the grant they become.
+                # ==========================================================
+                invariant [dfb_img_lo] dstate_r >= d_rd_hi ->
+                    wsel4(dfb_lo, J) = img(cr_line, concatbv2(0, J))
+                invariant [dfb_img_hi] dstate_r >= d_grant ->
+                    wsel4(dfb_hi, J) = img(cr_line, concatbv2(1, J))
             }
 
         } with this, mc_body, cache0_body, cache1_body, addr_thy, basis, data_impl
@@ -2646,15 +3222,22 @@ export action posedge
         definition c0_gr_line   = dir_body.gr_line0
         definition c0_gr_data   = dir_body.gr_data0
         definition c0_gr_taken  = cache0_body.gr_taken
+        definition c0_inv_valid = dir_body.inv_valid0
+        definition c0_inv_line  = dir_body.inv_line0
+        definition c0_inv_taken = cache0_body.inv_taken
+        definition c0_ack_en   = cache0_body.ack_en
+        definition c0_ack_line = cache0_body.ack_line
+        definition c0_ack_dty  = cache0_body.ack_dty
+        definition c0_ack_dat  = cache0_body.ack_dat
         definition c0_ack_taken = dir_body.ack_taken0
         definition c0_st_en     = cache0_body.st_en
         definition c0_st_h      = cache0_body.st_h
         definition c0_st_o      = cache0_body.st_o
         definition c0_st_d      = cache0_body.st_d
-        definition c0_gv_en     = cache0_body.gv_en
-        definition c0_gv_l      = cache0_body.gv_l
-        definition c0_gv_d      = cache0_body.gv_d
-        definition c0_gv_dat    = cache0_body.gv_dat
+        definition c0_give_en   = cache0_body.give_en
+        definition c0_give_line = cache0_body.give_line
+        definition c0_give_dty  = cache0_body.give_dty
+        definition c0_give_dat  = cache0_body.give_dat
 
         definition c1_req_en    = cache1_body.req_en
         definition c1_req_line  = cache1_body.req_line
@@ -2665,15 +3248,22 @@ export action posedge
         definition c1_gr_line   = dir_body.gr_line1
         definition c1_gr_data   = dir_body.gr_data1
         definition c1_gr_taken  = cache1_body.gr_taken
+        definition c1_inv_valid = dir_body.inv_valid1
+        definition c1_inv_line  = dir_body.inv_line1
+        definition c1_inv_taken = cache1_body.inv_taken
+        definition c1_ack_en   = cache1_body.ack_en
+        definition c1_ack_line = cache1_body.ack_line
+        definition c1_ack_dty  = cache1_body.ack_dty
+        definition c1_ack_dat  = cache1_body.ack_dat
         definition c1_ack_taken = dir_body.ack_taken1
         definition c1_st_en     = cache1_body.st_en
         definition c1_st_h      = cache1_body.st_h
         definition c1_st_o      = cache1_body.st_o
         definition c1_st_d      = cache1_body.st_d
-        definition c1_gv_en     = cache1_body.gv_en
-        definition c1_gv_l      = cache1_body.gv_l
-        definition c1_gv_d      = cache1_body.gv_d
-        definition c1_gv_dat    = cache1_body.gv_dat
+        definition c1_give_en   = cache1_body.give_en
+        definition c1_give_line = cache1_body.give_line
+        definition c1_give_dty  = cache1_body.give_dty
+        definition c1_give_dat  = cache1_body.give_dat
 
         # ---- the two LSQ-side channels ----
         definition cache0_body.lsq_to_cache_req_en0    = lsq_to_cache_req_en0
