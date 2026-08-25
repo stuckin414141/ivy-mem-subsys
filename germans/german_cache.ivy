@@ -736,26 +736,6 @@ export action posedge
                     cache_to_lsq_resp_data0 = img(cache_to_lsq_resp_h0,
                                                  cache_to_lsq_resp_o0)
 
-                # the data we give to the LSQ is valid. 
-                invariant [resp_quiet_p0] cache_to_lsq_resp_valid0
-                    & ~in_progress(cache_to_lsq_resp_h0) ->
-                    cache_to_lsq_resp_data0 = img(cache_to_lsq_resp_h0,
-                                                 cache_to_lsq_resp_o0)
-
-                invariant [resp_inprog_p0] cache_to_lsq_resp_valid0
-                    & in_progress(cache_to_lsq_resp_h0) ->
-                      cache_to_lsq_resp_data0 = img(cache_to_lsq_resp_h0,
-                                                   cache_to_lsq_resp_o0)
-                    | (ps_v & ps_h = cache_to_lsq_resp_h0
-                       & ps_o = cache_to_lsq_resp_o0
-                       & cache_to_lsq_resp_data0 = ps_d)
-                    | (p0_v & p0_h = cache_to_lsq_resp_h0
-                       & p0_o = cache_to_lsq_resp_o0
-                       & cache_to_lsq_resp_data0 = p0_d)
-                    | (p1_v & p1_h = cache_to_lsq_resp_h0
-                       & p1_o = cache_to_lsq_resp_o0
-                       & cache_to_lsq_resp_data0 = p1_d)
-
                 
                 # The cache only surrenders lines it holds
                 invariant [ca_gv_hold_p0] c0_give_en -> holds0(c0_give_line)
@@ -1586,27 +1566,6 @@ export action posedge
                 invariant [resp_img_int_p1] cache_to_lsq_resp_valid1 ->
                     cache_to_lsq_resp_data1 = img(cache_to_lsq_resp_h1,
                                                  cache_to_lsq_resp_o1)
-
-                # the data we give to the LSQ is valid. 
-                invariant [resp_quiet_p1] cache_to_lsq_resp_valid1
-                    & ~in_progress(cache_to_lsq_resp_h1) ->
-                    cache_to_lsq_resp_data1 = img(cache_to_lsq_resp_h1,
-                                                 cache_to_lsq_resp_o1)
-
-                invariant [resp_inprog_p1] cache_to_lsq_resp_valid1
-                    & in_progress(cache_to_lsq_resp_h1) ->
-                      cache_to_lsq_resp_data1 = img(cache_to_lsq_resp_h1,
-                                                   cache_to_lsq_resp_o1)
-                    | (ps_v & ps_h = cache_to_lsq_resp_h1
-                       & ps_o = cache_to_lsq_resp_o1
-                       & cache_to_lsq_resp_data1 = ps_d)
-                    | (p0_v & p0_h = cache_to_lsq_resp_h1
-                       & p0_o = cache_to_lsq_resp_o1
-                       & cache_to_lsq_resp_data1 = p0_d)
-                    | (p1_v & p1_h = cache_to_lsq_resp_h1
-                       & p1_o = cache_to_lsq_resp_o1
-                       & cache_to_lsq_resp_data1 = p1_d)
-
                 
                 # The cache only surrenders lines it holds
                 invariant [ca_gv_hold_p1] c1_give_en -> holds1(c1_give_line)
