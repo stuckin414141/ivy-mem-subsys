@@ -650,10 +650,8 @@ export action posedge
         # ==================================================================
         # CPU 0's cache.  8 sets x 2 ways, 2 MSHRs, whole-line data.
         #
-        # EVERY eviction is non-silent (plan decision 1): clean or dirty,
-        # the victim goes out on channel 3, so the directory's sharer bit is
-        # exact and it never has to recall a line it has lost track of.  A
-        # give-up therefore cannot start until the channel-3 slot is free.
+        # Cache lines are at the same granularity as the directory/LLC. 
+        # All evictions trigger a notification to the directory. 
         # ==================================================================
         isolate cache0_body = {
 
@@ -1454,24 +1452,8 @@ export action posedge
         # ==================================================================
         # CPU 1's cache.  8 sets x 2 ways, 2 MSHRs, whole-line data.
         #
-        # The beat machinery is gone from this side entirely: a line is
-        # fetched in ONE grant and written back in ONE ack, so the two-beat
-        # ladder that used to live in the MSHR now lives once, in the
-        # directory's memory-facing sequencer.  What is left of an MSHR is
-        # `m_req -> m_wait -> m_fill -> m_replay`: hold channel 1, latch the
-        # grant into a whole-line fill buffer, clear a way for it, then serve
-        # the request that missed against the array.
-        #
-        # ONE array action per edge.  The arbiter takes the staged request if
-        # its gate is open and otherwise steps the first MSHR that wants the
-        # array, and that is what lets a single `c_st_*` net carry both
-        # commit shapes -- the store-hit drain and the replay store-apply --
-        # without them ever racing.
-        #
-        # EVERY eviction is non-silent (plan decision 1): clean or dirty,
-        # the victim goes out on channel 3, so the directory's sharer bit is
-        # exact and it never has to recall a line it has lost track of.  A
-        # give-up therefore cannot start until the channel-3 slot is free.
+        # Cache lines are at the same granularity as the directory/LLC. 
+        # All evictions trigger a notification to the directory. 
         # ==================================================================
         isolate cache1_body = {
 
@@ -1545,27 +1527,15 @@ export action posedge
             wire give_dty  : bool
             wire give_dat  : cache_line
 
-            # ==============================================================
-            # The contract.
-            #
-            # `[resp_img]` is the LSQ-facing half: the datum handed back is
-            # the image at the address the response echoes.  Responses always
-            # come out of the array and `[c_img_p1]` pins the array to `img`, so
-            # it holds unconditionally -- phase 4 restates it weakly, over
-            # `in_progress`, without the implementation changing.
-            #
-            # The rest is the directory-facing half, and it is the same seven
-            # facts the phase-2 stand-in exported, generalised from one held
-            # line to a set: a line under request is not held and has no ack
-            # outstanding; a store only ever lands in a held line; a give-up
-            # does not collide with a live ack or with a store; and -- the
-            # cache's half of the old `[unowned]` -- a dirtied word lives in
-            # a held line or in the dirty ack carrying it.
-            # ==============================================================
             specification {
+                # This holds since `img` is only updated after stores commit. It is possible
+                # that one of the caches holds stale data while the other cache has an ongoing write.
+                # In that case, `img` does not reflect the in-progress write. This works since we have
+                # depth-1 MSHRs and don't implement store-to-load forwarding
                 invariant [resp_img_int_p1] cache_to_lsq_resp_valid1 ->
                     cache_to_lsq_resp_data1 = img(cache_to_lsq_resp_h1,
                                                  cache_to_lsq_resp_o1)
+
                 
                 # The cache only surrenders lines it holds
                 invariant [ca_gv_hold_p1] c1_give_en -> holds1(c1_give_line)
@@ -1612,6 +1582,10 @@ export action posedge
                 # If we send an invalidate acknowledgement, then we don't hold the line
                 invariant [ca_ack_idle_p1] ack1_g_en -> ~holds1(ack1_g_line)
 
+                # Data we send as part of the invalidate is valid
+                # 
+                # This works since all dirtied lines are a result of completed stores,
+                # which means that they are reflected in `img`.
                 invariant [ack_img_p1] ack1_g_en & ack1_g_dty ->
                     lsel(ack1_g_data, O) = img(ack1_g_line, O)
 
