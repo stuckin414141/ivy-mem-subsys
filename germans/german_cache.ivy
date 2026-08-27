@@ -49,6 +49,8 @@
 #
 #            cache0_body        cache1_body
 #          ch1 / ch2 / ch3    ch1 / ch2 / ch3
+#                  xbar_body                    (arbitrates channels 1 and 3,
+#                x_* arbitrated bus              routes channel 2)
 #                  dir_body                     (grants Shared or Exclusive,
 #                four_words beats                invalidates, dirty writebacks)
 #                  mc_body                      (UNCHANGED)
@@ -62,15 +64,18 @@
 #   a Shared line SELF-DOWNGRADES: it surrenders that clean copy on channel 3
 #   through the normal victim path and re-requests the line Exclusive.
 #
-#   Invalidates.  One held slot per cache, alongside the grant slot rather
-#   than sharing it (`gaps.md`: a shared slot brings back the
-#   `~(invalidate & grantShared)` mutual-exclusion invariants and buys
-#   nothing).  The arm has array and channel-3 priority over everything the
-#   cache does, and it answers for a resident copy or for either MSHR's
-#   post-grant window -- an invalidate that names a line an MSHR was granted
-#   but has not installed bounces that MSHR back to `m_req` with its request
-#   still parked, and the reply is clean because a parked store applies only
-#   at replay.
+#   Invalidates.  ONE held slot at the directory, addressed by `inv_c` and
+#   sharing channel 2 with the grant: a grant and an invalidate are never
+#   live on the same edge (`[g_no_gr_inv]`, immediate from `[d_gr_state]`
+#   and `[g_inv_of_cr]`), so one message whose `typ` field names the kind
+#   carries both.  The invalidate is answered on channel 3 -- the ack the
+#   consume produces retires the slot -- so channel 2 needs no handshake for
+#   it.  The arm has array and channel-3 priority over everything the cache
+#   does, and it answers for a resident copy or for either MSHR's post-grant
+#   window -- an invalidate that names a line an MSHR was granted but has
+#   not installed bounces that MSHR back to `m_req` with its request still
+#   parked, and the reply is clean because a parked store applies only at
+#   replay.
 #
 #   SWMR, per permission.  `[swmr0]`/`[swmr1]`: an exclusive holder excludes
 #   every copy in the other cache.  Shared holders coexist -- that is the
@@ -102,6 +107,12 @@ type word
 type line
 type bit
 type bv2
+
+# ---- channel 2's message kind: grant-Shared, grant-Exclusive or
+# invalidate.  A type of its own rather than the existing `bv2`, which is
+# the word-within-beat index: `wsel4(M, c0_ch2_msg_typ)` must not
+# typecheck. ----
+type ch2typ
 type mshr_id
 
 type store_idx
@@ -181,6 +192,7 @@ isolate basis = {
     interpret key -> bv[3]
     interpret bit -> bv[1]
     interpret bv2 -> bv[2]
+    interpret ch2typ -> bv[2]
     interpret mshr_id -> bv[1]
     interpret store_idx -> bv[3]
     interpret load_idx -> bv[3]
@@ -466,18 +478,28 @@ export action posedge
         wire c0_req_line  : line
         wire c0_req_excl  : bool
         wire c0_req_taken : bool
+        # ---- channel 2 is ONE message per cache, and the kind rides in
+        # `typ`: a grant, Shared or Exclusive, or a request to invalidate.
+        # `data` is unused if it is an invalidate, and the handshake back is
+        # the grant's alone -- an invalidate is answered on channel 3. ----
+        wire c0_ch2_msg_valid : bool
+        wire c0_ch2_msg_typ   : ch2typ
+        wire c0_ch2_msg_line  : line
+        wire c0_ch2_msg_data  : cache_line
+        wire c0_ch2_msg_taken : bool
+        # ---- and the six VIEWS of that message the cache actually reads,
+        # decoded at the port one hop from the code that reads them. ----
         wire c0_gr_valid  : bool
         wire c0_gr_excl   : bool
         wire c0_gr_line   : line
         wire c0_gr_data   : cache_line
-        wire c0_gr_taken  : bool
+        wire c0_inv_valid : bool
+        wire c0_inv_line  : line
+        wire c0_inv_taken : bool
         wire c0_ack_en    : bool
         wire c0_ack_line  : line
         wire c0_ack_dty   : bool
         wire c0_ack_dat   : cache_line
-        wire c0_inv_valid : bool
-        wire c0_inv_line  : line
-        wire c0_inv_taken : bool
         wire c0_ack_taken : bool
         wire c0_st_en     : bool
         wire c0_st_h      : line
@@ -492,18 +514,22 @@ export action posedge
         wire c1_req_line  : line
         wire c1_req_excl  : bool
         wire c1_req_taken : bool
+        wire c1_ch2_msg_valid : bool
+        wire c1_ch2_msg_typ   : ch2typ
+        wire c1_ch2_msg_line  : line
+        wire c1_ch2_msg_data  : cache_line
+        wire c1_ch2_msg_taken : bool
         wire c1_gr_valid  : bool
         wire c1_gr_excl   : bool
         wire c1_gr_line   : line
         wire c1_gr_data   : cache_line
-        wire c1_gr_taken  : bool
+        wire c1_inv_valid : bool
+        wire c1_inv_line  : line
+        wire c1_inv_taken : bool
         wire c1_ack_en    : bool
         wire c1_ack_line  : line
         wire c1_ack_dty   : bool
         wire c1_ack_dat   : cache_line
-        wire c1_inv_valid : bool
-        wire c1_inv_line  : line
-        wire c1_inv_taken : bool
         wire c1_ack_taken : bool
         wire c1_st_en     : bool
         wire c1_st_h      : line
@@ -513,6 +539,44 @@ export action posedge
         wire c1_give_line : line
         wire c1_give_dty  : bool
         wire c1_give_dat  : cache_line
+
+        # ==================================================================
+        # The ARBITRATED bus between the crossbar and the directory.  ONE set
+        # per channel, because the directory has one set per channel now:
+        # `xbar_body` arbitrates channels 1 and 3 -- the contended direction,
+        # two caches and one directory -- and ROUTES channel 2, which is
+        # directory-driven.
+        #
+        # `x_src` is a real port, not a proof device: both of the directory's
+        # pickups latch it, which is what collapses their two hardcoded
+        # priority branches into one.  It is also the exported witness of the
+        # arbiter's `own`, which is what keeps `[xb_wb_own]` stated over nets
+        # alone and the arbiter's registers private.
+        # ==================================================================
+        wire x_src           : bit
+        wire x_req_en        : bool
+        wire x_req_line      : line
+        wire x_req_excl      : bool
+        wire x_req_taken     : bool
+        wire x_ack_en        : bool
+        wire x_ack_line      : line
+        wire x_ack_dty       : bool
+        wire x_ack_dat       : cache_line
+        wire x_ack_taken     : bool
+        wire x_busy          : bool
+        wire x_ch2_msg_valid : bool
+        wire x_ch2_msg_typ   : ch2typ
+        wire x_ch2_msg_cpu   : bit
+        wire x_ch2_msg_line  : line
+        wire x_ch2_msg_data  : cache_line
+        wire x_ch2_msg_taken : bool
+
+        # ---- channel 2's three kinds, named once at THIS level so the
+        # directory that drives them and the decode that reads them cannot
+        # disagree. ----
+        wire ch2_gsh : ch2typ        # grant, Shared
+        wire ch2_gex : ch2typ        # grant, Exclusive
+        wire ch2_inv : ch2typ        # invalidate
 
         specification {
 
@@ -633,7 +697,7 @@ export action posedge
                     holds0(H) := (false if H = c0_give_line else holds0(H));
                     exclusive0(H) := (false if H = c0_give_line else exclusive0(H));
                 };
-                if c0_gr_valid & c0_gr_taken {
+                if c0_gr_valid & c0_ch2_msg_taken {
                     holds0(H) := (true if H = c0_gr_line else holds0(H));
                     exclusive0(H) := (c0_gr_excl if H = c0_gr_line else exclusive0(H));
                 };
@@ -641,7 +705,7 @@ export action posedge
                     holds1(H) := (false if H = c1_give_line else holds1(H));
                     exclusive1(H) := (false if H = c1_give_line else exclusive1(H));
                 };
-                if c1_gr_valid & c1_gr_taken {
+                if c1_gr_valid & c1_ch2_msg_taken {
                     holds1(H) := (true if H = c1_gr_line else holds1(H));
                     exclusive1(H) := (c1_gr_excl if H = c1_gr_line else exclusive1(H));
                 };
@@ -678,7 +742,7 @@ export action posedge
             wire req_en    : bool
             wire req_line  : line
             wire req_excl  : bool
-            wire gr_taken  : bool
+            wire ch2_msg_taken : bool
             wire inv_taken : bool
 
             # ---- channel 3 as REAL hardware, held by its producer (plan
@@ -1089,7 +1153,7 @@ export action posedge
                 # MSHR, and only if its kind covers what that MSHR parked:
                 # `gr_line = m_base` is unambiguous because the two MSHRs
                 # never fetch the same line (`[mshr_distinct_p0]`) ----
-                definition gr_taken = c0_gr_valid & ~c0_inv_valid
+                definition ch2_msg_taken = c0_gr_valid & ~c0_inv_valid
                     & ((s0_m_state = m_wait & s0_m_base = c0_gr_line
                         & (~s0_rq_wen | c0_gr_excl))
                        | (s1_m_state = m_wait & s1_m_base = c0_gr_line
@@ -1448,7 +1512,7 @@ export action posedge
 
             }
 
-        } with this, dir_body, addr_thy, basis, data_impl
+        } with this, dir_body, xbar_body, addr_thy, basis, data_impl
         # ==================================================================
         # CPU 1's cache.  8 sets x 2 ways, 2 MSHRs, whole-line data.
         #
@@ -1480,7 +1544,7 @@ export action posedge
             wire req_en    : bool
             wire req_line  : line
             wire req_excl  : bool
-            wire gr_taken  : bool
+            wire ch2_msg_taken : bool
             wire inv_taken : bool
 
             # ---- channel 3 as REAL hardware, held by its producer (plan
@@ -1891,7 +1955,7 @@ export action posedge
                 # MSHR, and only if its kind covers what that MSHR parked:
                 # `gr_line = m_base` is unambiguous because the two MSHRs
                 # never fetch the same line (`[mshr_distinct_p1]`) ----
-                definition gr_taken = c1_gr_valid & ~c1_inv_valid
+                definition ch2_msg_taken = c1_gr_valid & ~c1_inv_valid
                     & ((s0_m_state = m_wait & s0_m_base = c1_gr_line
                         & (~s0_rq_wen | c1_gr_excl))
                        | (s1_m_state = m_wait & s1_m_base = c1_gr_line
@@ -2250,7 +2314,7 @@ export action posedge
 
             }
 
-        } with this, dir_body, addr_thy, basis, data_impl
+        } with this, dir_body, xbar_body, addr_thy, basis, data_impl
         isolate mc_body = {
 
             # ---- directory command channel: the command comes from the
@@ -2451,8 +2515,11 @@ export action posedge
         # sharing one command port -- writebacks first.
         #
         # Blocking, single slot everywhere (decision 2): one request start to
-        # finish, one grant outstanding, one writeback at a time; channel 3
-        # is per CPU and the sequencer serves CPU 0 first.
+        # finish, one grant outstanding, one writeback at a time, one
+        # invalidate in flight.  There is ONE port set per channel:
+        # `xbar_body` arbitrates channels 1 and 3 and routes channel 2, so
+        # the sequencer reads `x_src` and never chooses between the clients
+        # itself.
         #
         # SHARED AND EXCLUSIVE.  Every request is picked; `d_inv` is what
         # makes room for it.  An Exclusive request displaces every holder, a
@@ -2472,23 +2539,22 @@ export action posedge
         # ==================================================================
         isolate dir_body = {
 
-            # ---- the ports this directory drives, per CPU ----
-            wire req_taken0 : bool
-            wire gr_valid0  : bool
-            wire gr_excl0   : bool
-            wire gr_line0   : line
-            wire gr_data0   : cache_line
-            wire inv_valid0 : bool
-            wire inv_line0  : line
-            wire ack_taken0 : bool
-            wire req_taken1 : bool
-            wire gr_valid1  : bool
-            wire gr_excl1   : bool
-            wire gr_line1   : line
-            wire gr_data1   : cache_line
-            wire inv_valid1 : bool
-            wire inv_line1  : line
-            wire ack_taken1 : bool
+            # ---- the ports this directory drives.  ONE set per channel:
+            # the crossbar arbitrates the contended ones, and channel 2 is a
+            # single addressed message whose `typ` names its kind, because a
+            # grant and an invalidate are never live on the same edge. ----
+            wire req_taken : bool
+            wire ack_taken : bool
+            # ---- "a writeback is in flight".  The crossbar holds the uplink
+            # on this and on nothing else: channel 3 is the one channel read
+            # across more than one edge, and the module that knows how long
+            # that window is is this one. ----
+            wire busy : bool
+            wire ch2_msg_valid : bool
+            wire ch2_msg_typ   : ch2typ      # ch2_gsh | ch2_gex | ch2_inv
+            wire ch2_msg_cpu   : bit
+            wire ch2_msg_line  : line
+            wire ch2_msg_data  : cache_line  # grant only
 
             # ---- memory command channel ----
             wire cmd_en    : bool
@@ -2627,11 +2693,12 @@ export action posedge
                 var gr_l : line
                 var gr_d : cache_line
 
-                # ---- one held invalidate slot per cache ----
-                var inv0_v : bool
-                var inv0_l : line
-                var inv1_v : bool
-                var inv1_l : line
+                # ---- ONE held invalidate slot, addressed the way the grant
+                # is addressed by `cr_cpu`.  One slot is one invalidate in
+                # flight, so invalidates to the two caches serialize. ----
+                var inv_v : bool
+                var inv_l : line
+                var inv_c : bit
 
                 # ---- the writeback sequencer.  `wb_lo_done`/`wb_hi_done`
                 # are GHOST: the beat has LANDED in memory, not merely been
@@ -2674,36 +2741,51 @@ export action posedge
                     inv_need0 := false; inv_need1 := false;
                     dfb_lo := 0; dfb_hi := 0;
                     gr_v := false; gr_x := false; gr_l := 0; gr_d := 0;
-                    inv0_v := false; inv0_l := 0;
-                    inv1_v := false; inv1_l := 0;
+                    inv_v := false; inv_l := 0; inv_c := 0;
                     wb_st := 0; wb_cpu := 0; wb_line := 0;
                     wb_lo_done := false; wb_hi_done := false;
                     ev_cmd := false; ev_cmd_wen := false;
                     ev_cmd_addr := 0; ev_cmd_data := 0;
                 }
 
-                definition gr_valid0 = gr_v & cr_cpu = 0
-                definition gr_excl0  = gr_x
-                definition gr_line0  = gr_l
-                definition gr_data0  = gr_d
-                definition gr_valid1 = gr_v & cr_cpu = 1
-                definition gr_excl1  = gr_x
-                definition gr_line1  = gr_l
-                definition gr_data1  = gr_d
-                definition inv_valid0 = inv0_v
-                definition inv_line0  = inv0_l
-                definition inv_valid1 = inv1_v
-                definition inv_line1  = inv1_l
+                # ---- channel 2: one message, one port set.  The sharing is
+                # structural, not a scheduling accident -- `[d_gr_state]`
+                # pins a valid grant to `d_gwt` and `[g_inv_of_cr]` pins a
+                # valid invalidate to `d_inv`, so the sequencer itself
+                # time-multiplexes the channel and this mux never has to
+                # choose.  `ch2_msg_data` needs no mux: nothing reads it
+                # under `ch2_inv`. ----
+                definition ch2_msg_valid = gr_v | inv_v
+                definition ch2_msg_typ   = (ch2_inv if inv_v
+                                            else (ch2_gex if gr_x else ch2_gsh))
+                definition ch2_msg_cpu   = (inv_c if inv_v else cr_cpu)
+                definition ch2_msg_line  = (inv_l if inv_v else gr_l)
+                definition ch2_msg_data  = gr_d
 
                 # ---- EVERY request is picked; `d_inv` is what makes room
-                # for it.  CPU 0 first; fairness is a non-goal. ----
+                # for it.  WHICH client is asking is the crossbar's business:
+                # the uplink presents one request and `x_src` names its
+                # source, so no priority is left here. ----
+                # `~busy` is `wb_st = wb_idle`, spelled through the port the
+                # crossbar holds on so that ONE definition carries the
+                # window: a definition is admitted into a query only where
+                # the defined symbol occurs, and `[xb_wb_own]` needs this one
+                # unfolded here (450-464 again). ----
                 wire pick_ok : bool
-                definition pick_ok = (dstate_r = d_idle) & (wb_st = wb_idle) & ~gr_v
-                definition req_taken0 = pick_ok & c0_req_en
-                definition req_taken1 = pick_ok & c1_req_en & ~c0_req_en
+                definition pick_ok = (dstate_r = d_idle) & ~busy & ~gr_v
+                definition req_taken = pick_ok & x_req_en
 
-                definition ack_taken0 = (wb_st = wb_ret) & wb_cpu = 0
-                definition ack_taken1 = (wb_st = wb_ret) & wb_cpu = 1
+                # ---- and one `taken` back on channel 3.  It needs no CPU
+                # test: `[xb_wb_own]` says the bus still shows `wb_cpu`, so
+                # the crossbar's demux lands the pulse on the cache this
+                # writeback was picked from. ----
+                definition ack_taken = (wb_st = wb_ret)
+
+                # ---- the uplink hold.  Read by the crossbar AFTER this
+                # handler, so it is the POST-edge window: the pickup below
+                # raises it on the edge it latches `wb_cpu`, and the `wb_ret`
+                # arm drops it on the edge it retires the ack. ----
+                definition busy = (wb_st ~= wb_idle)
 
                 definition cmd_en   = ev_cmd
                 definition cmd_wen  = ev_cmd_wen
@@ -2723,15 +2805,15 @@ export action posedge
 
                     ev_cmd := false;
 
-                    # ---- an invalidate retires when its cache posts the
-                    # reply; the reply itself drains through channel 3. ----
-                    if inv0_v & c0_inv_taken { inv0_v := false; };
-                    if inv1_v & c1_inv_taken { inv1_v := false; };
-
-                    # ---- channel 2 retires, and the bits go up: the sharer
-                    # bit always, the exclusive bit for an Exclusive grant. ----
-                    if gr_v & ((cr_cpu = 0 & c0_gr_taken)
-                               | (cr_cpu = 1 & c1_gr_taken)) {
+                    # ---- channel 2's ONE handshake, and only the grant uses
+                    # it: an invalidate is answered on channel 3, and the ack
+                    # that answer produces retires the slot in the `wb_ret`
+                    # arm below.  Under `gr_v`, `[g_no_gr_inv]` gives
+                    # `~inv_v`, so `x_ch2_msg_cpu` is `cr_cpu` and the demux
+                    # has already selected the cache this grant was
+                    # addressed to.  The bits go up with it: the sharer bit
+                    # always, the exclusive bit for an Exclusive grant. ----
+                    if gr_v & x_ch2_msg_taken {
                         if cr_cpu = 0 {
                             dsh0(H) := (true if H = gr_l else dsh0(H));
                         } else {
@@ -2765,15 +2847,13 @@ export action posedge
                             ev_cmd      := true;
                             ev_cmd_wen  := true;
                             ev_cmd_addr := hw_concatbv3(wb_line, hw_concatbv2(0, 0));
-                            ev_cmd_data := hw_llo(c0_ack_dat if wb_cpu = 0
-                                                  else c1_ack_dat);
+                            ev_cmd_data := hw_llo(x_ack_dat);
                             wb_st       := wb_hi;
                         } else { if wb_st = wb_hi {
                             ev_cmd      := true;
                             ev_cmd_wen  := true;
                             ev_cmd_addr := hw_concatbv3(wb_line, hw_concatbv2(1, 0));
-                            ev_cmd_data := hw_lhi(c0_ack_dat if wb_cpu = 0
-                                                  else c1_ack_dat);
+                            ev_cmd_data := hw_lhi(x_ack_dat);
                             wb_st       := wb_fin;
                         } else { if dstate_r = d_rd_lo {
                             ev_cmd      := true;
@@ -2792,23 +2872,18 @@ export action posedge
 
                     # ---- channel 3 is always on -- an ack answers an
                     # invalidate, a self-downgrade or a fill-eviction, and
-                    # the arm cannot tell them apart.  CPU 0 first. ----
+                    # the arm cannot tell them apart.  ONE branch now: the
+                    # crossbar has already picked whose ack is on the bus,
+                    # and `x_src` says which. ----
                     if wb_st = wb_idle {
-                        if c0_ack_en {
-                            wb_cpu     := 0;
-                            wb_line    := c0_ack_line;
+                        if x_ack_en {
+                            wb_cpu     := x_src;
+                            wb_line    := x_ack_line;
                             wb_lo_done := false;
                             wb_hi_done := false;
-                            if c0_ack_dty { wb_st := wb_lo; }
+                            if x_ack_dty { wb_st := wb_lo; }
                             else { wb_st := wb_ret; };
-                        } else { if c1_ack_en {
-                            wb_cpu     := 1;
-                            wb_line    := c1_ack_line;
-                            wb_lo_done := false;
-                            wb_hi_done := false;
-                            if c1_ack_dty { wb_st := wb_lo; }
-                            else { wb_st := wb_ret; };
-                        } };
+                        };
                     } else { if wb_st = wb_fin & wb_lo_done & wb_hi_done {
                         wb_st := wb_ret;
                     } else { if wb_st = wb_ret {
@@ -2818,13 +2893,13 @@ export action posedge
                             if dstate_r = d_inv & cr_line = wb_line {
                                 inv_need0 := false;
                             };
-                            if inv0_v & inv0_l = wb_line { inv0_v := false; };
+                            if inv_v & inv_c = 0 & inv_l = wb_line { inv_v := false; };
                         } else {
                             dsh1(H) := (false if H = wb_line else dsh1(H));
                             if dstate_r = d_inv & cr_line = wb_line {
                                 inv_need1 := false;
                             };
-                            if inv1_v & inv1_l = wb_line { inv1_v := false; };
+                            if inv_v & inv_c = 1 & inv_l = wb_line { inv_v := false; };
                         };
                         wb_st      := wb_idle;
                         wb_lo_done := false;
@@ -2836,18 +2911,31 @@ export action posedge
                     # backed by an ack already in the channel needs no
                     # invalidate, it clears itself when that ack retires.
                     #
-                    # The wait is on the BITS, never on the invalidate slots,
+                    # The wait is on the BITS, never on the invalidate slot,
                     # and it always includes the requester's own bit -- which
                     # can only be a stale one, since a cache never requests a
                     # line it holds.  That is what makes the grant land on a
-                    # line with no record of the requester at all. ----
+                    # line with no record of the requester at all.
+                    #
+                    # ONE slot, addressed by `inv_c`, so the two posts
+                    # SEQUENCE: the second arm reads the `inv_v` the first
+                    # just wrote, CPU 0 goes first and CPU 1 waits for the
+                    # slot.  That is a priority on the directory's own SEND
+                    # order, not on the bus, and it cannot wedge -- the slot
+                    # clears when the addressed cache's ack retires, in the
+                    # `wb_ret` arm above, and that is now the only place it
+                    # clears.  The guard keeps reading `cN_ack_en` and is NOT
+                    # routed: it means "this cache already has an ack posted,
+                    # so its sharer bit will clear itself when that ack
+                    # retires" -- a property of the cache's register, not of
+                    # who holds the bus. ----
                     if dstate_r = d_inv {
-                        if inv_need0 & ~inv0_v & ~c0_ack_en {
-                            inv0_v := true; inv0_l := cr_line;
+                        if inv_need0 & ~inv_v & ~c0_ack_en {
+                            inv_v := true; inv_l := cr_line; inv_c := 0;
                             inv_need0 := false;
                         };
-                        if inv_need1 & ~inv1_v & ~c1_ack_en {
-                            inv1_v := true; inv1_l := cr_line;
+                        if inv_need1 & ~inv_v & ~c1_ack_en {
+                            inv_v := true; inv_l := cr_line; inv_c := 1;
                             inv_need1 := false;
                         };
                         if cr_excl {
@@ -2882,27 +2970,19 @@ export action posedge
                     # ---- pick a new request.  Last, so the slot a grant
                     # freed this edge is not reused on the same edge.  An
                     # Exclusive request must displace every holder; a Shared
-                    # one only the exclusive holder. ----
+                    # one only the exclusive holder.  ONE branch: the uplink
+                    # carries one request and `x_src` names its source. ----
                     if dstate_r = d_idle & wb_st = wb_idle & ~gr_v {
-                        if c0_req_en {
-                            cr_cpu   := 0;
-                            cr_line  := c0_req_line;
-                            cr_excl  := c0_req_excl;
-                            inv_need0 := dsh0(c0_req_line)
-                                         & (c0_req_excl | dex(c0_req_line));
-                            inv_need1 := dsh1(c0_req_line)
-                                         & (c0_req_excl | dex(c0_req_line));
+                        if x_req_en {
+                            cr_cpu   := x_src;
+                            cr_line  := x_req_line;
+                            cr_excl  := x_req_excl;
+                            inv_need0 := dsh0(x_req_line)
+                                         & (x_req_excl | dex(x_req_line));
+                            inv_need1 := dsh1(x_req_line)
+                                         & (x_req_excl | dex(x_req_line));
                             dstate_r := d_inv;
-                        } else { if c1_req_en {
-                            cr_cpu   := 1;
-                            cr_line  := c1_req_line;
-                            cr_excl  := c1_req_excl;
-                            inv_need0 := dsh0(c1_req_line)
-                                         & (c1_req_excl | dex(c1_req_line));
-                            inv_need1 := dsh1(c1_req_line)
-                                         & (c1_req_excl | dex(c1_req_line));
-                            dstate_r := d_inv;
-                        } };
+                        };
                     };
                 }
 
@@ -2914,6 +2994,37 @@ export action posedge
                 invariant [d_gr_state] gr_v -> dstate_r = d_gwt
                 invariant [d_gwt_gr] dstate_r = d_gwt -> gr_v
 
+                # ---- the one fact the crossbar owes the directory.  Channel
+                # 3 is the only channel read across more than one edge: the
+                # pickup latches `wb_cpu`/`wb_line`, but `x_ack_dat` is
+                # fetched combinationally at `wb_lo` and `wb_hi` cycles
+                # later, so a per-cycle arbiter could swap the source out
+                # from under a writeback in flight and `[wb_img]` would be
+                # false.  With `x_src = wb_cpu` in hand that unfolding lands
+                # on `(c0_ack_dat if wb_cpu = 0 else c1_ack_dat)` -- today's
+                # expression, character for character -- and the channel-3
+                # `taken` demux lands on the cache the ack came from.
+                #
+                # Base case: the pickup is guarded by `x_ack_en`, and the
+                # crossbar's release arm is guarded by `~ack_en` -- the SAME
+                # expression, so "the pickup fired" gives both `own_v` and
+                # "the bus was not handed away on this edge" syntactically.
+                # That second term is not decoration: a `wire` reads at the
+                # state boundary, so on the pickup edge `x_busy` is still the
+                # pre-edge low, and releasing on `~x_busy` alone falsifies
+                # this invariant.
+                #
+                # Preservation: from the edge after the pickup to the edge
+                # that retires the ack, `x_busy` is this isolate's own
+                # `wb_st ~= wb_idle`, so the release arm cannot fire and
+                # `own_v`/`own` stand still.  Every symbol in the argument
+                # resolves inside an isolate this query can see, which is why
+                # neither term is the client's `cN_ack_en`: that resolves
+                # into `cacheN_body`'s implementation, whose transition this
+                # query cannot see, and the lemma would have nothing to be
+                # preserved by. ----
+                invariant [xb_wb_own] busy ->
+                    xbar_body.own_v & x_src = wb_cpu
                 invariant [wb_ack] wb_st ~= wb_idle & wb_st ~= wb_ret ->
                       (wb_cpu = 0 & ack0_g_en & ack0_g_dty & ack0_g_line = wb_line)
                     | (wb_cpu = 1 & ack1_g_en & ack1_g_dty & ack1_g_line = wb_line)
@@ -2973,7 +3084,7 @@ export action posedge
                 # correspondence rather than load-bearing lemmas -- each is a
                 # consequence of the exactness block above.  They are stated
                 # HERE and not in the specification only because `dsh*`/`dex`/
-                # `dstate_r`/`inv*_v` are private to this section.
+                # `dstate_r`/`inv_v` are private to this section.
                 #
                 #   german.ivy                            this file
                 #   ------------------------------------  ---------------------
@@ -2985,9 +3096,9 @@ export action posedge
                 #     & homeSharerList(C) -> C = owner
                 #   invalidateAck(C) -> ~cacheS/E(C)      [ca_ack_idle_p*]
                 #     & homeSharerList(C)                 [dsh_ack0], [dsh_ack1]
-                #   invalidate(C) -> homeCurrentReq       [g_inv_of_cr*]
+                #   invalidate(C) -> homeCurrentReq       [g_inv_of_cr]
                 #     & homeSharerList(C)                 [inv_live0], [inv_live1]
-                #   ~(invalidate(C) & grant*(C))          [g_no_gr_inv*]
+                #   ~(invalidate(C) & grant*(C))          [g_no_gr_inv]
                 #   homeSharerList(C) -> C holds it or a  [d_back0], [d_back1]
                 #     message for it is in flight
                 #   at most one exclusive                 [g_one_excl] (exported)
@@ -3008,12 +3119,14 @@ export action posedge
                 # posted in `d_inv` for `cr_line` and retired before the
                 # transaction can leave `d_inv`, so the stale-invalidate case
                 # the eviction extension had to absorb abstractly cannot arise
-                # here.  With it, channel 2's grant and the invalidate slot are
-                # mutually exclusive per CPU. ----
-                invariant [g_inv_of_cr0] inv0_v -> dstate_r = d_inv & inv0_l = cr_line
-                invariant [g_inv_of_cr1] inv1_v -> dstate_r = d_inv & inv1_l = cr_line
-                invariant [g_no_gr_inv0] gr_v & cr_cpu = 0 -> ~inv0_v
-                invariant [g_no_gr_inv1] gr_v & cr_cpu = 1 -> ~inv1_v
+                # here.  With `[d_gr_state]` it is also what channel 2's
+                # shared port rests on: `d_gwt` and `d_inv` are distinct
+                # constants, so a grant and an invalidate are never live
+                # together and `ch2_msg_typ` never has to choose.
+                # `[g_no_gr_inv]` is stronger than the two per-CPU forms it
+                # replaces, which that same pair already implied. ----
+                invariant [g_inv_of_cr] inv_v -> dstate_r = d_inv & inv_l = cr_line
+                invariant [g_no_gr_inv] gr_v -> ~inv_v
 
                 # ---- a pending invalidate still names a set bit: that is
                 # what carries "the bit was set when the request was picked"
@@ -3029,10 +3142,10 @@ export action posedge
                 invariant [inv_need1_ok] inv_need1 ->
                     dstate_r = d_inv & dsh1(cr_line)
                     & (cr_excl | dex(cr_line))
-                invariant [inv_live0] inv0_v ->
-                    dsh0(inv0_l) & (cr_excl | dex(inv0_l))
-                invariant [inv_live1] inv1_v ->
-                    dsh1(inv1_l) & (cr_excl | dex(inv1_l))
+                invariant [inv_live0] inv_v & inv_c = 0 ->
+                    dsh0(inv_l) & (cr_excl | dex(inv_l))
+                invariant [inv_live1] inv_v & inv_c = 1 ->
+                    dsh1(inv_l) & (cr_excl | dex(inv_l))
 
                 invariant [d_ex0] exclusive0(H) -> dex(H) & dsh0(H)
                 invariant [d_ex1] exclusive1(H) -> dex(H) & dsh1(H)
@@ -3063,7 +3176,8 @@ export action posedge
 
                 # ---- `[grant_kind]`: a grant in ch2(C) answers C's picked
                 # request -- same line, same Shared/Exclusive kind.  The
-                # routing half is syntactic (`gr_valid0 = gr_v & cr_cpu = 0`),
+                # routing half is syntactic (`ch2_msg_cpu = cr_cpu` whenever
+                # `~inv_v`, which `[g_no_gr_inv]` gives under `gr_v`),
                 # and this is what lets a fill set `tag_exc` off the grant and
                 # `[rq_store_excl_*]` trust an Exclusive one. ----
                 invariant [grant_kind] gr_v -> gr_l = cr_line & gr_x = cr_excl
@@ -3090,27 +3204,209 @@ export action posedge
                     wsel4(dfb_hi, J) = img(cr_line, concatbv2(1, J))
             }
 
-        } with this, mc_body, cache0_body, cache1_body, addr_thy, basis, data_impl
+        } with this, mc_body, cache0_body, cache1_body, xbar_body, addr_thy, basis, data_impl
+
+        # ==================================================================
+        # The crossbar.  Two clients, one directory: channels 1 and 3 are the
+        # contended direction, so this block ARBITRATES them and presents one
+        # uplink; channel 2 is directory-driven, so it is ROUTED and never
+        # arbitrated.  Channel 3 IS the invalidate acknowledgement channel,
+        # so acknowledging an invalidate is arbitrated for exactly the reason
+        # a request is and needs no mechanism of its own.
+        #
+        # Declared LAST, after `dir_body`, so on any edge the directory
+        # samples the PRE-edge arbiter state -- the state the combinational
+        # bus value it read was built from -- and the arbiter settles
+        # afterwards against post-edge cache state.  This is the file's
+        # existing discipline, not a new convention (see the comment above
+        # the channel-3 pickup); declaring the arbiter first would invert it
+        # and break `[xb_wb_own]`.
+        # ==================================================================
+        isolate xbar_body = {
+
+            # ---- the ports this crossbar drives.  Uplink to the directory
+            # first: ONE set, because the directory has one set now. ----
+            wire src       : bit
+            wire req_en    : bool
+            wire req_line  : line
+            wire req_excl  : bool
+            wire ack_en    : bool
+            wire ack_line  : line
+            wire ack_dty   : bool
+            wire ack_dat   : cache_line
+
+            # ---- channel 2's handshake, muxed back by destination.  One
+            # wire, unused if the message is an invalidate. ----
+            wire ch2_msg_taken : bool
+
+            # ---- the uplink's `taken` returns, demuxed by `own` ----
+            wire req_taken0 : bool
+            wire ack_taken0 : bool
+            wire req_taken1 : bool
+            wire ack_taken1 : bool
+
+            # ---- and channel 2 out to the two caches: one message, no
+            # separate grant and invalidate.  The type is either a grant --
+            # Shared or Exclusive -- or a request to invalidate, and `data`
+            # is unused if it is an invalidate. ----
+            wire ch2_msg_valid0 : bool
+            wire ch2_msg_typ0   : ch2typ
+            wire ch2_msg_line0  : line
+            wire ch2_msg_data0  : cache_line
+            wire ch2_msg_valid1 : bool
+            wire ch2_msg_typ1   : ch2typ
+            wire ch2_msg_line1  : line
+            wire ch2_msg_data1  : cache_line
+
+            # ---- the arbiter's own state, and it is at the isolate's TOP
+            # LEVEL rather than behind `implementation`.  That is forced, not
+            # a style choice: a definition inside an `implementation` block is
+            # private to its isolate, and the directory's query has to unfold
+            # `x_ack_en`, `x_src` and `x_ack_dat` through this mux to reach
+            # `cN_ack_*` at all -- behind `implementation` those three would
+            # be opaque constants, `[grant_img_lo0]` would have nothing to
+            # unfold to and `[xb_wb_own]` would have no transition to be
+            # preserved by.  Public is what a crossbar has to be.
+            #
+            # These are still REAL registers, not specification state, so
+            # `ivy_to_rtl` sees them and the directory's datapath reads no
+            # ghost. ----
+            var own_v : bool     # the uplink is held
+            var own   : bit      # by whom
+            var last  : bit      # who used it last
+
+            after init {
+                own_v := false; own := 0; last := 0;
+            }
+
+            # ---- `want` decides who gets the bus; `hold` decides who keeps
+            # it, and they are not the same signal.  Channel 3 is the only
+            # thing that must not change hands mid-flight, so the hold is
+            # exactly the channel-3 transaction, and it takes TWO terms
+            # because the transaction straddles an edge boundary:
+            #
+            #   `x_busy`  -- the directory's own `wb_st ~= wb_idle`, which
+            #                covers every edge from the one AFTER the pickup
+            #                to the one that retires the ack;
+            #   `ack_en`  -- this crossbar's own uplink enable, which covers
+            #                the pickup edge itself.  A `wire` reads at the
+            #                state boundary, not at the point of use, so on
+            #                the edge the pickup fires `x_busy` is still the
+            #                PRE-edge low.  Releasing on `~x_busy` alone
+            #                hands the bus away underneath the writeback it
+            #                just started, and `[xb_wb_own]` is false --
+            #                measured, not hypothesised.
+            #
+            # `ack_en` is the same expression the directory's pickup is
+            # guarded by, so "the pickup fired" implies "the bus is held"
+            # syntactically, with nothing imported from `cacheN_body`.  That
+            # is also why the hold is NOT the client's `cN_ack_en` on its
+            # own: that resolves into `cacheN_body`'s implementation, whose
+            # transition `dir_body`'s query cannot see, so the lemma would
+            # have nothing to be preserved by.
+            #
+            # A request still never holds -- `want` is where channel 1
+            # belongs, and it only ever decides a grant.  It must not hold:
+            # `pick_ok` is false whenever the directory is busy, so a cache
+            # pinning the bus for a request it cannot get taken yet would pin
+            # it against the very ack `d_inv` is waiting for, and channel 3
+            # is the only way a sharer bit ever clears. ----
+            wire want0 : bool
+            wire want1 : bool
+            definition want0 = c0_req_en | c0_ack_en
+            definition want1 = c1_req_en | c1_ack_en
+
+            # ---- the uplink mux, selected by `own`.  `src` publishes the
+            # selector itself. ----
+            definition src      = own
+            definition req_en   = own_v & (c0_req_en if own = 0
+                                           else c1_req_en)
+            definition req_line = (c0_req_line if own = 0
+                                   else c1_req_line)
+            definition req_excl = (c0_req_excl if own = 0
+                                   else c1_req_excl)
+            definition ack_en   = own_v & (c0_ack_en if own = 0
+                                           else c1_ack_en)
+            definition ack_line = (c0_ack_line if own = 0
+                                   else c1_ack_line)
+            definition ack_dty  = (c0_ack_dty if own = 0
+                                   else c1_ack_dty)
+            definition ack_dat  = (c0_ack_dat if own = 0
+                                   else c1_ack_dat)
+
+            # ---- the uplink's two `taken` pulses, demuxed back ----
+            definition req_taken0 = x_req_taken & own_v & own = 0
+            definition req_taken1 = x_req_taken & own_v & own = 1
+            definition ack_taken0 = x_ack_taken & own_v & own = 0
+            definition ack_taken1 = x_ack_taken & own_v & own = 1
+
+            # ---- channel 2, demuxed by `x_ch2_msg_cpu`: `valid` gated by
+            # destination, the rest fanout, the one `taken` muxed back by the
+            # same selector -- NOT by `own`, because the directory drives this
+            # channel and there is one slot, so a `taken` belongs to the
+            # destination rather than to whoever holds the bus.  Two
+            # independent fabrics, an arbitrated uplink and a routed channel
+            # 2.  Nothing here reads `typ`: the fabric routes the message, the
+            # cache's port decodes it. ----
+            definition ch2_msg_valid0 = x_ch2_msg_valid & x_ch2_msg_cpu = 0
+            definition ch2_msg_typ0   = x_ch2_msg_typ
+            definition ch2_msg_line0  = x_ch2_msg_line
+            definition ch2_msg_data0  = x_ch2_msg_data
+            definition ch2_msg_valid1 = x_ch2_msg_valid & x_ch2_msg_cpu = 1
+            definition ch2_msg_typ1   = x_ch2_msg_typ
+            definition ch2_msg_line1  = x_ch2_msg_line
+            definition ch2_msg_data1  = x_ch2_msg_data
+            definition ch2_msg_taken  = (c0_ch2_msg_taken
+                                         if x_ch2_msg_cpu = 0
+                                         else c1_ch2_msg_taken)
+
+            # ---- the policy.  One cache wants the bus and it gets it; both
+            # want it and the one that is not `last` gets it; the owner has a
+            # writeback in flight and it keeps the bus until that writeback
+            # retires; the owner has only a request pending and it releases,
+            # `last` handing over.  `last` is written at release rather than
+            # at grant: `own` cannot change while held, so the two are the
+            # same bit and release is the cheaper place.
+            #
+            # Cost is one dead cycle of turnaround between transactions.
+            # Fusing them costs more logic than it is worth in a file whose
+            # header already lists liveness as a non-goal. ----
+            after posedge {
+                if own_v {
+                    if ~x_busy & ~ack_en {
+                        last  := own;
+                        own_v := false;
+                    };
+                } else {
+                    if want0 & want1 {
+                        own_v := true;
+                        own   := (1 if last = 0 else 0);
+                    } else { if want0 {
+                        own_v := true; own := 0;
+                    } else { if want1 {
+                        own_v := true; own := 1;
+                    } } };
+                };
+            }
+        } with this, dir_body, cache0_body, cache1_body, basis
 
         # ---- each net aliased to the port that drives it, and to nothing
         # else: the far side reads the net itself. ----
         definition c0_req_en    = cache0_body.req_en
         definition c0_req_line  = cache0_body.req_line
         definition c0_req_excl  = cache0_body.req_excl
-        definition c0_req_taken = dir_body.req_taken0
-        definition c0_gr_valid  = dir_body.gr_valid0
-        definition c0_gr_excl   = dir_body.gr_excl0
-        definition c0_gr_line   = dir_body.gr_line0
-        definition c0_gr_data   = dir_body.gr_data0
-        definition c0_gr_taken  = cache0_body.gr_taken
-        definition c0_inv_valid = dir_body.inv_valid0
-        definition c0_inv_line  = dir_body.inv_line0
-        definition c0_inv_taken = cache0_body.inv_taken
+        definition c0_req_taken = xbar_body.req_taken0
         definition c0_ack_en   = cache0_body.ack_en
         definition c0_ack_line = cache0_body.ack_line
         definition c0_ack_dty  = cache0_body.ack_dty
         definition c0_ack_dat  = cache0_body.ack_dat
-        definition c0_ack_taken = dir_body.ack_taken0
+        definition c0_ack_taken = xbar_body.ack_taken0
+        definition c0_ch2_msg_valid = xbar_body.ch2_msg_valid0
+        definition c0_ch2_msg_typ   = xbar_body.ch2_msg_typ0
+        definition c0_ch2_msg_line  = xbar_body.ch2_msg_line0
+        definition c0_ch2_msg_data  = xbar_body.ch2_msg_data0
+        definition c0_ch2_msg_taken = cache0_body.ch2_msg_taken
+        definition c0_inv_taken = cache0_body.inv_taken
         definition c0_st_en     = cache0_body.st_en
         definition c0_st_h      = cache0_body.st_h
         definition c0_st_o      = cache0_body.st_o
@@ -3123,20 +3419,18 @@ export action posedge
         definition c1_req_en    = cache1_body.req_en
         definition c1_req_line  = cache1_body.req_line
         definition c1_req_excl  = cache1_body.req_excl
-        definition c1_req_taken = dir_body.req_taken1
-        definition c1_gr_valid  = dir_body.gr_valid1
-        definition c1_gr_excl   = dir_body.gr_excl1
-        definition c1_gr_line   = dir_body.gr_line1
-        definition c1_gr_data   = dir_body.gr_data1
-        definition c1_gr_taken  = cache1_body.gr_taken
-        definition c1_inv_valid = dir_body.inv_valid1
-        definition c1_inv_line  = dir_body.inv_line1
-        definition c1_inv_taken = cache1_body.inv_taken
+        definition c1_req_taken = xbar_body.req_taken1
         definition c1_ack_en   = cache1_body.ack_en
         definition c1_ack_line = cache1_body.ack_line
         definition c1_ack_dty  = cache1_body.ack_dty
         definition c1_ack_dat  = cache1_body.ack_dat
-        definition c1_ack_taken = dir_body.ack_taken1
+        definition c1_ack_taken = xbar_body.ack_taken1
+        definition c1_ch2_msg_valid = xbar_body.ch2_msg_valid1
+        definition c1_ch2_msg_typ   = xbar_body.ch2_msg_typ1
+        definition c1_ch2_msg_line  = xbar_body.ch2_msg_line1
+        definition c1_ch2_msg_data  = xbar_body.ch2_msg_data1
+        definition c1_ch2_msg_taken = cache1_body.ch2_msg_taken
+        definition c1_inv_taken = cache1_body.inv_taken
         definition c1_st_en     = cache1_body.st_en
         definition c1_st_h      = cache1_body.st_h
         definition c1_st_o      = cache1_body.st_o
@@ -3145,6 +3439,54 @@ export action posedge
         definition c1_give_line = cache1_body.give_line
         definition c1_give_dty  = cache1_body.give_dty
         definition c1_give_dat  = cache1_body.give_dat
+
+        # ---- the kind is decoded at the cache's port: six views of the one
+        # message, defined here rather than driven as nets.  The two valids
+        # come out SYNTACTICALLY disjoint -- `typ = ch2_inv` against
+        # `typ ~= ch2_inv` -- inside the cache's own query, with no directory
+        # invariant imported.  That is what makes the `~cN_inv_valid`
+        # conjuncts in `ch2_msg_taken` and on the fill path redundant; they
+        # stay.  Grant payload is read only under `cN_gr_valid`, so the extra
+        # `~inv_v` the decode carries weakens nothing. ----
+        definition c0_gr_valid  = c0_ch2_msg_valid & (c0_ch2_msg_typ ~= ch2_inv)
+        definition c0_gr_excl   = (c0_ch2_msg_typ = ch2_gex)
+        definition c0_gr_line   = c0_ch2_msg_line
+        definition c0_gr_data   = c0_ch2_msg_data
+        definition c0_inv_valid = c0_ch2_msg_valid & (c0_ch2_msg_typ = ch2_inv)
+        definition c0_inv_line  = c0_ch2_msg_line
+        definition c1_gr_valid  = c1_ch2_msg_valid & (c1_ch2_msg_typ ~= ch2_inv)
+        definition c1_gr_excl   = (c1_ch2_msg_typ = ch2_gex)
+        definition c1_gr_line   = c1_ch2_msg_line
+        definition c1_gr_data   = c1_ch2_msg_data
+        definition c1_inv_valid = c1_ch2_msg_valid & (c1_ch2_msg_typ = ch2_inv)
+        definition c1_inv_line  = c1_ch2_msg_line
+
+        # ---- the arbitrated bus: the crossbar drives the uplink and channel
+        # 2 out, the directory drives the uplink's `taken` returns and
+        # channel 2 in, and the crossbar muxes channel 2's one handshake back
+        # by destination. ----
+        definition x_src           = xbar_body.src
+        definition x_req_en        = xbar_body.req_en
+        definition x_req_line      = xbar_body.req_line
+        definition x_req_excl      = xbar_body.req_excl
+        definition x_req_taken     = dir_body.req_taken
+        definition x_ack_en        = xbar_body.ack_en
+        definition x_ack_line      = xbar_body.ack_line
+        definition x_ack_dty       = xbar_body.ack_dty
+        definition x_ack_dat       = xbar_body.ack_dat
+        definition x_ack_taken     = dir_body.ack_taken
+        definition x_busy          = dir_body.busy
+        definition x_ch2_msg_valid = dir_body.ch2_msg_valid
+        definition x_ch2_msg_typ   = dir_body.ch2_msg_typ
+        definition x_ch2_msg_cpu   = dir_body.ch2_msg_cpu
+        definition x_ch2_msg_line  = dir_body.ch2_msg_line
+        definition x_ch2_msg_data  = dir_body.ch2_msg_data
+        definition x_ch2_msg_taken = xbar_body.ch2_msg_taken
+
+        # ---- and channel 2's three kinds ----
+        definition ch2_gsh = 0
+        definition ch2_gex = 1
+        definition ch2_inv = 2
 
         # ---- the two LSQ-side channels ----
         definition cache0_body.lsq_to_cache_req_en0    = lsq_to_cache_req_en0
