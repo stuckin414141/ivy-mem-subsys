@@ -495,14 +495,6 @@ export action posedge
         # The crossbar's old `x_busy` hold is gone with it: the payload is
         # latched into the queue on the edge it is taken, so nothing is read
         # off the bus across an edge boundary any more. ----
-        wire x_ack_done      : bool
-        wire x_ack_done_cpu  : bit
-        wire x_ack_done_line : line
-        # ---- and which queue slot each of the two channel-3 handshakes
-        # touches.  The ghost mirror above is per SLOT, so it has to be told;
-        # `[q3g_*]` in `dir_body` is what makes the mirror faithful. ----
-        wire x_ack_enq_slot  : qidx
-        wire x_ack_done_slot : qidx
         wire x_ch2_msg_valid : bool
         wire x_ch2_msg_typ   : ch2typ
         wire x_ch2_msg_cpu   : bit
@@ -599,7 +591,7 @@ export action posedge
             # only when `process_ch2` pops it.  This record is that window,
             # and it is the window `[d_back*]` needed a third disjunct for,
             # before those two were withdrawn (see the note beside
-            # `[dsh_ack1]` in `dir_body`).
+            # `[dsh_ack]` in `dir_body`).
             #
             # ONE record is exact: a grant is sent only into an EMPTY channel-2
             # queue, so a cache can never have two queued at once.  That is a
@@ -712,28 +704,6 @@ export action posedge
                 # are not, and `dir_body` has to know WHICH line its queue
                 # just took.  `[ack_sync_line_p*]` is what makes the two the
                 # same line. ----
-                # ---- the queue mirror, slot for slot.  Emptied first,
-                # filled second; the two can never be the same slot (the head
-                # is emptied, the tail is filled, and they coincide only when
-                # the queue is full, where nothing is taken). ----
-                if x_ack_done & x_ack_done_slot = 0 { g3a_v := false; };
-                if x_ack_done & x_ack_done_slot = 1 { g3b_v := false; };
-                if c0_ack_taken & x_ack_enq_slot = 0 {
-                    g3a_v := true;            g3a_c := 0;
-                    g3a_l := ack0_g_line;     g3a_d := ack0_g_dty;
-                };
-                if c0_ack_taken & x_ack_enq_slot = 1 {
-                    g3b_v := true;            g3b_c := 0;
-                    g3b_l := ack0_g_line;     g3b_d := ack0_g_dty;
-                };
-                if c1_ack_taken & x_ack_enq_slot = 0 {
-                    g3a_v := true;            g3a_c := 1;
-                    g3a_l := ack1_g_line;     g3a_d := ack1_g_dty;
-                };
-                if c1_ack_taken & x_ack_enq_slot = 1 {
-                    g3b_v := true;            g3b_c := 1;
-                    g3b_l := ack1_g_line;     g3b_d := ack1_g_dty;
-                };
                 if c0_ack_taken { ack0_g_en := false; };
                 if c1_ack_taken { ack1_g_en := false; };
                 if c0_give_en {
@@ -1739,7 +1709,7 @@ export action posedge
                 #
                 # `[q2_gq_*]` is the two-way tie between the queue and that
                 # record: every head grant IS `gq0_*`, and `gq0_*` has a head
-                # grant behind it.  `dsh0` went up when the message was sent,
+                # grant behind it.  `dsh` went up when the message was sent,
                 # so without the second direction a pop would clear the record
                 # while the home still believed the line was here.
                 #
@@ -2741,7 +2711,7 @@ export action posedge
                 #
                 # `[q2_gq_*]` is the two-way tie between the queue and that
                 # record: every head grant IS `gq1_*`, and `gq1_*` has a head
-                # grant behind it.  `dsh1` went up when the message was sent,
+                # grant behind it.  `dsh` went up when the message was sent,
                 # so without the second direction a pop would clear the record
                 # while the home still believed the line was here.
                 #
@@ -2998,7 +2968,7 @@ export action posedge
         # invalidate, it clears itself when that ack retires.  With
         # the send guard, "the directory only ever invalidates a holder" is a
         # convention here rather than a theorem: `[d_back*]`, which would
-        # have made it one, is withdrawn (see the note beside `[dsh_ack1]`).
+        # have made it one, is withdrawn (see the note beside `[dsh_ack]`).
         # ==================================================================
         isolate dir_body = {
 
@@ -3020,7 +2990,6 @@ export action posedge
             # latches the payload on the edge it takes it, so there is
             # nothing left to pin. ----
             wire ack_done      : bool
-            wire ack_done_cpu  : bit
             wire ack_done_line : line
             wire ack_enq_slot  : qidx
             wire ack_done_slot : qidx
@@ -3066,8 +3035,7 @@ export action posedge
             # `[gr_msg_notdsh*]` is one unfolding of `inv_settled`, and the
             # consumer composes it with `[d_exact*]` in its OWN pre-state,
             # where both are simply assumptions. ----
-            var dsh0(H : line) : bool
-            var dsh1(H : line) : bool
+            var dsh(C : bit, H : line) : bool
             var dex(H : line)  : bool
 
             # caches consume SWMR only for their data half.
@@ -3093,80 +3061,43 @@ export action posedge
                     wsel4(cmd_data, J) =
                         img(high(cmd_addr), concatbv2(beat_of(low(cmd_addr)), J))
 
-                # TODO: this whole thing is too complex
-                # ==========================================================
-                # What the channel-3 queue owes its producers.
-                #
-                # These are not decoration.  A cache's query cannot see this
-                # isolate's implementation, so `ack_taken`, `ack_done` and
-                # the two slot indices are opaque symbols there: without
-                # these it has to allow a `taken` with no acknowledgement
-                # behind it -- which would overwrite a mirror slot that a
-                # line's write debt still depends on -- and a retire that
-                # empties a slot unrelated to the line it names.  Either way
-                # `[ca_dirtied_p*]` is not merely unproved, it is false.
-                # ==========================================================
+                # ---- the queue mirror, slot for slot.  Emptied first,
+                # filled second; the two can never be the same slot (the head
+                # is emptied, the tail is filled, and they coincide only when
+                # the queue is full, where nothing is taken). ----
+                before posedge {
+                    if ack_done & ack_done_slot = 0 { g3a_v := false; };
+                    if ack_done & ack_done_slot = 1 { g3b_v := false; };
+                    if ack_taken & ack_enq_slot = 0 {
+                        g3a_v := true;            g3a_c := x_src;
+                        g3a_l := (ack0_g_line if x_src = 0 else ack1_g_line);
+                        g3a_d := (ack0_g_dty  if x_src = 0 else ack1_g_dty);
+                    };
+                    if ack_taken & ack_enq_slot = 1 {
+                        g3b_v := true;            g3b_c := x_src;
+                        g3b_l := (ack0_g_line if x_src = 0 else ack1_g_line);
+                        g3b_d := (ack0_g_dty  if x_src = 0 else ack1_g_dty);
+                    };
+                }
+
+                # Popping acknowledgements from ch3 queue is reflected in the ghost.
                 invariant [ack_taken_en] ack_taken -> x_ack_en
                 invariant [enq_free0] ack_taken & ack_enq_slot = 0 -> ~g3a_v
                 invariant [enq_free1] ack_taken & ack_enq_slot = 1 -> ~g3b_v
                 invariant [done_slot0] ack_done & ack_done_slot = 0 ->
-                    g3a_v & g3a_c = ack_done_cpu & g3a_l = ack_done_line
+                    g3a_v & g3a_l = ack_done_line
                 invariant [done_slot1] ack_done & ack_done_slot = 1 ->
-                    g3b_v & g3b_c = ack_done_cpu & g3b_l = ack_done_line
+                    g3b_v & g3b_l = ack_done_line
 
                 # ---- when the directory lets go of an acknowledgement, the
                 # write debt it was carrying is settled.  This is what the
                 # caches' `[ca_dirtied_p*]` is preserved by on the edge the
                 # mirror slot empties. ----
-                invariant [wb_done0] ack_done & ack_done_cpu = 0 ->
-                      ~dirtied(0, ack_done_line, O)
-                    & ~dirtied(1, ack_done_line, O)
-                invariant [wb_done1] ack_done & ack_done_cpu = 1 ->
-                      ~dirtied(0, ack_done_line, O)
-                    & ~dirtied(1, ack_done_line, O)
+                invariant [wb_done] ack_done ->
+                    ~dirtied(C, ack_done_line, O)
 
-                # ==========================================================
-                # What a QUEUED grant means.
-                #
-                # The home forgets a transaction on the edge it sends the
-                # grant, so these are stated over `gq*_*` -- the record of
-                # "cache C has a grant in its channel-2 queue" -- and not over
-                # any register of this isolate.  They are what the cache reads
-                # at the pop, an arbitrary number of edges later: possession
-                # is still exclusive, the line is still nobody's write debt,
-                # and no acknowledgement of its own is in flight for it.
-                #
-                # `[gq_nothold*]` is the pair to them, and it is what keeps
-                # the queued payload accurate: the grantee does not hold the
-                # line yet, so it cannot store into it, and the other cache
-                # cannot either because a queued grant already owns the
-                # sharer bit.
-                # ==========================================================
-                # ==========================================================
-                # What a grant MESSAGE means, and what the queued RECORD of
-                # one means.  BOTH forms, because they are needed on different
-                # edges and neither implies the other.
-                #
-                # The message form is the one the home can prove directly:
-                # `grant_now` carries `inv_settled`, so on the edge the
-                # message is driven the requester has no bit, no copy and no
-                # acknowledgement of its own for the line, and the other cache
-                # has been displaced as far as the request demanded.
-                #
-                # The record form carries those same facts across the
-                # arbitrary number of edges the grant then SITS in the
-                # consumer's channel-2 queue.  Its consecution at the ENQUEUE
-                # is where the message form is consumed: `gq*_v` is false in
-                # the pre-state there, so a record-only statement says
-                # precisely nothing on the one edge that establishes it, and
-                # the query does not fail -- it runs forever.  (Measured:
-                # `[gr_notack_g1]` alone did not come back inside fifteen
-                # minutes with the record form alone.)
-                #
-                # The caches consume the message form too, and for the same
-                # reason: `[q2_img_*]` has to know the payload it is latching
-                # is accurate to the image AFTER this edge's stores.
-                # ==========================================================
+                # TODO: having an invalidate list + better idea of sharers should resolve this.
+                # If a grant is sent out, there isn't an invalidate acknowledgement for it running at the same time
                 invariant [gr_msg_notack_g] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
                       ~(ack0_g_en & ack0_g_line = x_ch2_msg_line)
                     & ~(ack1_g_en & ack1_g_line = x_ch2_msg_line)
@@ -3184,10 +3115,8 @@ export action posedge
                 # `[d_exact*]` just below, the consumer gets `~holds*` and then
                 # `~exclusive*` entirely inside its own pre-state. ----
                 invariant [gr_msg_notdsh] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
-                      (x_ch2_msg_cpu ~= 0 | ~dsh0(x_ch2_msg_line))
-                    & (x_ch2_msg_cpu ~= 1 | ~dsh1(x_ch2_msg_line))
-                invariant [d_exact] holds(C, H) ->
-                    (C ~= 0 | dsh0(H)) & (C ~= 1 | dsh1(H))
+                    ~dsh(x_ch2_msg_cpu, x_ch2_msg_line)
+                invariant [d_exact] holds(C, H) -> dsh(C, H)
 
                 # ---- split per STAGE of channel 3.  `~ackN_any` is a
                 # conjunction of the producer's slot and the home's queue, and
@@ -3197,10 +3126,8 @@ export action posedge
                 invariant [gr_notack_q0] gq0_v -> ~ack0_q(gq0_l)
                 invariant [gr_notack_g1] gq1_v -> ~(ack1_g_en & ack1_g_line = gq1_l)
                 invariant [gr_notack_q1] gq1_v -> ~ack1_q(gq1_l)
-                invariant [gr_clean0] gq0_v ->
-                    ~dirtied(0, gq0_l, O) & ~dirtied(1, gq0_l, O)
-                invariant [gr_clean1] gq1_v ->
-                    ~dirtied(0, gq1_l, O) & ~dirtied(1, gq1_l, O)
+                invariant [gr_clean0] gq0_v -> ~dirtied(C, gq0_l, O)
+                invariant [gr_clean1] gq1_v -> ~dirtied(C, gq1_l, O)
 
                 invariant [gr_excl0i] gq0_v & gq0_x -> ~holds(1, gq0_l)
                 invariant [gr_excl1i] gq1_v & gq1_x -> ~holds(0, gq1_l)
@@ -3219,24 +3146,20 @@ export action posedge
                 invariant [gr_push_empty0] c0_gr_valid -> c0_ch2_empty
                 invariant [gr_push_empty1] c1_gr_valid -> c1_ch2_empty
 
-                invariant [ack_excl0] ack0_dty(H) -> ~holds(1, H)
-                invariant [ack_excl1] ack1_dty(H) -> ~holds(0, H)
+                invariant [ack_excl] holds(C, H) ->
+                    (C ~= 0 | ~ack1_dty(H)) & (C ~= 1 | ~ack0_dty(H))
 
                 # ---- German's at-most-one-exclusive corollary, over the
                 # permission ghosts: `~(cacheExclusive(C) & cacheExclusive(D))`
                 # for the two clients.  Falls out of `[d_ex*]` + `[dex_one]`. ----
-                invariant [g_one_excl] ~(exclusive(0, H) & exclusive(1, H))
+                invariant [g_one_excl] exclusive(C, H) & exclusive(D, H) -> C = D
 
-                invariant [commit_safe0] exclusive(0, H) ->
-                      ~holds(1, H)
-                    & ~ack1_dty(H)
-                    & ~(gq1_v & gq1_l = H)
-                    & ~(c1_gr_valid & c1_gr_line = H)
-                invariant [commit_safe1] exclusive(1, H) ->
-                      ~holds(0, H)
-                    & ~ack0_dty(H)
-                    & ~(gq0_v & gq0_l = H)
-                    & ~(c0_gr_valid & c0_gr_line = H)
+                invariant [commit_safe] exclusive(C, H) & D ~= C ->
+                      ~holds(D, H)
+                    & (D ~= 0 | ~ack0_dty(H) & ~(gq0_v & gq0_l = H)
+                              & ~(c0_gr_valid & c0_gr_line = H))
+                    & (D ~= 1 | ~ack1_dty(H) & ~(gq1_v & gq1_l = H)
+                              & ~(c1_gr_valid & c1_gr_line = H))
             }
 
             implementation {
@@ -3392,7 +3315,7 @@ export action posedge
                 # one sharer bit can be set under `dex` (`[dex_one]`), so
                 # naming the owner with a `bit` register and comparing it
                 # against `wb_cpu` bought nothing and cost the solver a
-                # great deal (with an owner index, `[wb_done0]` stopped
+                # great deal (with an owner index, `[wb_done]` stopped
                 # coming back).  It is also what makes the retire arm's
                 # clear unconditional: a cache with a sharer bit and an ack
                 # in flight IS the exclusive holder if there is one.
@@ -3411,7 +3334,7 @@ export action posedge
                 var ev_cmd_data : four_words
 
                 after init {
-                    dsh0(H) := false; dsh1(H) := false;
+                    dsh(C, H) := false;
                     dex(H) := false;
                     dstate_r := 0; cr_cpu := 0; cr_line := 0;
                     inv_need0 := false; inv_need1 := false;
@@ -3470,8 +3393,8 @@ export action posedge
                 # clear, a Shared one needs the exclusive bit clear and the
                 # requester's own -- necessarily stale -- bit with it. ----
                 definition inv_settled = ~inv_need0 & ~inv_need1
-                    & (~dsh0(cr_line) | (dstate_r ~= d_req_excl & cr_cpu ~= 0))
-                    & (~dsh1(cr_line) | (dstate_r ~= d_req_excl & cr_cpu ~= 1))
+                    & (~dsh(0, cr_line) | (dstate_r ~= d_req_excl & cr_cpu ~= 0))
+                    & (~dsh(1, cr_line) | (dstate_r ~= d_req_excl & cr_cpu ~= 1))
                     & (dstate_r = d_req_excl | ~dex(cr_line))
                 definition ch2_empty_t = (c0_ch2_empty if cr_cpu = 0
                                           else c1_ch2_empty)
@@ -3542,7 +3465,6 @@ export action posedge
                 # is still the entry at that point: it is popped at the
                 # bottom of the same arm. ----
                 definition ack_done      = (wb_st = wb_ret)
-                definition ack_done_cpu  = wb_cpu
                 definition ack_done_line = wb_line
                 definition ack_enq_slot  = qi(q3_tail)
                 definition ack_done_slot = qi(q3_head)
@@ -3579,11 +3501,8 @@ export action posedge
                     # and the home is idle.  `grant_now` implies
                     # `ch2_empty_t`, so the enqueue cannot fail. ----
                     if grant_now {
-                        if cr_cpu = 0 {
-                            dsh0(H) := (true if H = cr_line else dsh0(H));
-                        } else {
-                            dsh1(H) := (true if H = cr_line else dsh1(H));
-                        };
+                        dsh(C, H) := (true if C = cr_cpu & H = cr_line
+                                      else dsh(C, H));
                         if dstate_r = d_req_excl {
                             dex(H) := (true if H = cr_line else dex(H));
                         };
@@ -3688,21 +3607,21 @@ export action posedge
                             d_have := true;
                         };
                         dex(H) := (false if H = wb_line else dex(H));
+                        dsh(C, H) := (false if C = wb_cpu & H = wb_line
+                                      else dsh(C, H));
                         if wb_cpu = 0 {
-                            dsh0(H) := (false if H = wb_line else dsh0(H));
                             # ---- the bit this transaction was waiting on
                             # just cleared, so whatever it still owed for that
                             # line is moot: an invalidate not yet sent is
                             # dropped, and one already sent is answered.  This
                             # is the "overtaken by a self-eviction" case, and
                             # it is what keeps `[inv_need0_ok]` and
-                            # `[inv_live0]` inductive across a retire. ----
+                            # `[inv_live]` inductive across a retire. ----
                             if dstate_r ~= d_idle & cr_line = wb_line {
                                 inv_need0 := false;
                             };
                             if inv_v & inv_c = 0 & inv_l = wb_line { inv_v := false; };
                         } else {
-                            dsh1(H) := (false if H = wb_line else dsh1(H));
                             if dstate_r ~= d_idle & cr_line = wb_line {
                                 inv_need1 := false;
                             };
@@ -3772,8 +3691,8 @@ export action posedge
                         var px : bool := q1_excl(pk);
                         cr_cpu   := q1_src(pk);
                         cr_line  := pl;
-                        inv_need0 := dsh0(pl) & (px | dex(pl));
-                        inv_need1 := dsh1(pl) & (px | dex(pl));
+                        inv_need0 := dsh(0, pl) & (px | dex(pl));
+                        inv_need1 := dsh(1, pl) & (px | dex(pl));
                         dstate_r := (d_req_excl if px else d_req_shared);
                         d_have   := false;
                         q1_head  := q1_head + 1;
@@ -3887,7 +3806,7 @@ export action posedge
                     | wb_st = wb_rhi | wb_st = wb_rwhi ->
                     dstate_r ~= d_idle & ~d_have & inv_settled
                 invariant [wb_ret_clean] wb_st = wb_ret ->
-                    ~dirtied(0, wb_line, O) & ~dirtied(1, wb_line, O)
+                    ~dirtied(C, wb_line, O)
 
                 invariant [wb_cmd] ev_cmd & ev_cmd_wen ->
                     high(ev_cmd_addr) = wb_line
@@ -3906,9 +3825,9 @@ export action posedge
                     & high(ev_cmd_addr) = cr_line
 
                 invariant [wb_lo_clean] wb_lo_done & beat_of(O) = 0
-                    -> ~dirtied(0, wb_line, O) & ~dirtied(1, wb_line, O)
+                    -> ~dirtied(C, wb_line, O)
                 invariant [wb_hi_clean] wb_hi_done & beat_of(O) = 1
-                    -> ~dirtied(0, wb_line, O) & ~dirtied(1, wb_line, O)
+                    -> ~dirtied(C, wb_line, O)
                 invariant [wb_ghost_idle] wb_st = wb_idle
                     -> ~wb_lo_done & ~wb_hi_done
 
@@ -3921,8 +3840,7 @@ export action posedge
                 # `[d_exact*]` turns that into "the other cache does not hold
                 # the line".  Shared bits are free to coexist.
                 # ==========================================================
-                invariant [dsh_ack0] ack0_any(H) -> dsh0(H)
-                invariant [dsh_ack1] ack1_any(H) -> dsh1(H)
+                invariant [dsh_ack] (ack0_any(H) if C = 0 else ack1_any(H)) -> dsh(C, H)
 
                 # ==========================================================
                 # WITHDRAWN: `[d_back0]`/`[d_back1]`, the converse -- no STALE
@@ -3977,8 +3895,8 @@ export action posedge
                 # bit is already up, the exclusive bit too if the grant is an
                 # Exclusive one, and one record per cache is exact because a
                 # grant is only sent into an EMPTY channel-2 queue. ----
-                invariant [gq_dsh0] gq0_v -> dsh0(gq0_l)
-                invariant [gq_dsh1] gq1_v -> dsh1(gq1_l)
+                invariant [gq_dsh0] gq0_v -> dsh(0, gq0_l)
+                invariant [gq_dsh1] gq1_v -> dsh(1, gq1_l)
                 invariant [gq_dex0] gq0_v & gq0_x -> dex(gq0_l)
                 invariant [gq_dex1] gq1_v & gq1_x -> dex(gq1_l)
                 invariant [gq_notidle0] gq0_v & ~gq0_x -> ~dex(gq0_l)
@@ -3998,24 +3916,24 @@ export action posedge
                 #   ------------------------------------  ---------------------
                 #   cacheShared(C) -> homeSharerList(C)   [g_cacheS_dir*]
                 #     & ~homeExclusiveGranted
-                #   cacheExclusive(C) -> homeSharerList   [d_ex0], [d_ex1]
+                #   cacheExclusive(C) -> homeSharerList   [d_ex]
                 #     & homeExclusiveGranted & C = owner
                 #   homeExclusiveGranted                  [dex_owned], [dex_one]
                 #     & homeSharerList(C) -> C = owner
                 #   invalidateAck(C) -> ~cacheS/E(C)      [ca_ack_idle_p*]
-                #     & homeSharerList(C)                 [dsh_ack0], [dsh_ack1]
+                #     & homeSharerList(C)                 [dsh_ack]
                 #   invalidate(C) -> homeCurrentReq       [g_inv_of_cr]
-                #     & homeSharerList(C)                 [inv_live0], [inv_live1]
+                #     & homeSharerList(C)                 [inv_live]
                 #   ~(invalidate(C) & grant*(C))          [g_no_gr_inv]
                 #   homeSharerList(C) -> C holds it or a  WITHDRAWN -- see the
-                #     message for it is in flight         note at [dsh_ack1]
+                #     message for it is in flight         note at [dsh_ack]
                 #   at most one exclusive                 [g_one_excl] (exported)
                 #   grant answers the picked request      [grant_kind]
                 # ==========================================================
 
                 # ---- an exclusive bit has an owner: some sharer bit backs
                 # it, and `[dex_one]` says only one can. ----
-                invariant [dex_owned] dex(H) -> dsh0(H) | dsh1(H)
+                invariant [dex_owned] dex(H) -> dsh(0, H) | dsh(1, H)
 
                 # ---- a SHARED holder implies nobody holds the line
                 # exclusively.  The other direction of `[d_ex*]`, and the
@@ -4045,19 +3963,16 @@ export action posedge
                 # only names the exclusive bit -- while the other cache's
                 # invalidate slot was still live.
                 invariant [inv_need0_ok] inv_need0 ->
-                    dstate_r ~= d_idle & dsh0(cr_line)
+                    dstate_r ~= d_idle & dsh(0, cr_line)
                     & (cr_excl | dex(cr_line))
                 invariant [inv_need1_ok] inv_need1 ->
-                    dstate_r ~= d_idle & dsh1(cr_line)
+                    dstate_r ~= d_idle & dsh(1, cr_line)
                     & (cr_excl | dex(cr_line))
-                invariant [inv_live0] inv_v & inv_c = 0 ->
-                    dsh0(inv_l) & (cr_excl | dex(inv_l))
-                invariant [inv_live1] inv_v & inv_c = 1 ->
-                    dsh1(inv_l) & (cr_excl | dex(inv_l))
+                invariant [inv_live] inv_v ->
+                    dsh(inv_c, inv_l) & (cr_excl | dex(inv_l))
 
-                invariant [d_ex0] exclusive(0, H) -> dex(H) & dsh0(H)
-                invariant [d_ex1] exclusive(1, H) -> dex(H) & dsh1(H)
-                invariant [dex_one] dex(H) -> ~(dsh0(H) & dsh1(H))
+                invariant [d_ex] exclusive(C, H) -> dex(H) & dsh(C, H)
+                invariant [dex_one] dex(H) -> ~(dsh(0, H) & dsh(1, H))
 
                 # ---- a dirty ack comes from the cache that had write
                 # permission, and its exclusive bit is still set: the home
@@ -4103,7 +4018,7 @@ export action posedge
                 invariant [dfb_img_hi] d_have ->
                     lsel(dfb, concatbv2(1, J)) = img(cr_line, concatbv2(1, J))
                 invariant [dfb_clean] d_have ->
-                    ~dirtied(0, cr_line, O) & ~dirtied(1, cr_line, O)
+                    ~dirtied(C, cr_line, O)
                 invariant [dfb_idle] dstate_r = d_idle -> ~d_have
 
                 # ---- the read ladder's half-filled buffer.  `dfb` is not
@@ -4115,7 +4030,7 @@ export action posedge
                     & (wb_st = wb_rlo | wb_st = wb_rwlo | wb_st = wb_rhi
                        | wb_st = wb_rwhi) ->
                       ~dex(cr_line)
-                    & ~dirtied(0, cr_line, O) & ~dirtied(1, cr_line, O)
+                    & ~dirtied(C, cr_line, O)
             }
 
         } with this, mc_body, cache0_body, cache1_body, xbar_body, addr_thy, basis, data_impl
@@ -4371,11 +4286,6 @@ export action posedge
         definition x_ack_dty       = xbar_body.ack_dty
         definition x_ack_dat       = xbar_body.ack_dat
         definition x_ack_taken     = dir_body.ack_taken
-        definition x_ack_done      = dir_body.ack_done
-        definition x_ack_done_cpu  = dir_body.ack_done_cpu
-        definition x_ack_done_line = dir_body.ack_done_line
-        definition x_ack_enq_slot  = dir_body.ack_enq_slot
-        definition x_ack_done_slot = dir_body.ack_done_slot
         definition x_ch2_msg_valid = dir_body.ch2_msg_valid
         definition x_ch2_msg_typ   = dir_body.ch2_msg_typ
         definition x_ch2_msg_cpu   = dir_body.ch2_msg_cpu
