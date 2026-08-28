@@ -390,12 +390,8 @@ export action posedge
         # ---- what the consumer publishes about its channel-2 QUEUE.
         # `ready` is the producer's stall signal and `empty` is the one the
         # directory waits on before it sends a grant -- "emptiness observed by
-        # a wire that both caches expose".  `has_grant` and its payload are
-        # `process_ch2`'s output: the head, popped, decoded. ----
+        # a wire that both caches expose". ----
         wire c0_ch2_empty   : bool
-        wire c0_has_grant   : bool
-        wire c0_grant_excl  : bool
-        wire c0_grant_line  : line
         # ---- and the six VIEWS of that message the cache actually reads,
         # decoded at the port one hop from the code that reads them. ----
         wire c0_gr_valid  : bool
@@ -421,25 +417,26 @@ export action posedge
         wire c0_give_dty  : bool
         wire c0_give_dat  : cache_line
 
+        # Requests for a line from cache 1 -> crossbar
+        #TODO: rename these to be c1_ch1_*
         wire c1_req_en    : bool
         wire c1_req_line  : line
         wire c1_req_excl  : bool
         wire c1_req_taken : bool
+
         wire c1_ch2_msg_valid : bool
         wire c1_ch2_msg_typ   : ch2typ
         wire c1_ch2_msg_line  : line
         wire c1_ch2_msg_data  : cache_line
         wire c1_ch2_msg_taken : bool
+
         # ---- what the consumer publishes about its channel-2 QUEUE.
         # `ready` is the producer's stall signal and `empty` is the one the
         # directory waits on before it sends a grant -- "emptiness observed by
-        # a wire that both caches expose".  `has_grant` and its payload are
-        # `process_ch2`'s output: the head, popped, decoded. ----
+        # a wire that both caches expose". ----
         wire c1_ch2_empty   : bool
-        wire c1_inv_pop_line : line
-        wire c1_has_grant   : bool
-        wire c1_grant_excl  : bool
-        wire c1_grant_line  : line
+        # ---- and the six VIEWS of that message the cache actually reads,
+        # decoded at the port one hop from the code that reads them. ----
         wire c1_gr_valid  : bool
         wire c1_gr_excl   : bool
         wire c1_gr_line   : line
@@ -452,10 +449,12 @@ export action posedge
         wire c1_ack_dty   : bool
         wire c1_ack_dat   : cache_line
         wire c1_ack_taken : bool
+        # TODO: expand instances of `st` to `store`
         wire c1_st_en     : bool
         wire c1_st_h      : line
         wire c1_st_o      : woffset
         wire c1_st_d      : word
+        # Ghost wires for what cache0 sends in an invalidate acknowledgement
         wire c1_give_en   : bool
         wire c1_give_line : line
         wire c1_give_dty  : bool
@@ -524,17 +523,14 @@ export action posedge
             # This is only updated when stores finish (their lines are written to the cache). 
             function img(H : line, O : woffset) : word
 
-            function dirtied0(H : line, O : woffset) : bool
-            function dirtied1(H : line, O : woffset) : bool
+            function dirtied(C : bit, H : line, O : woffset) : bool
 
-            # What each cache owns, as tracked in the cache. `holds0` starts when a grant
+            # What each cache owns, as tracked in the cache. `holds` starts when a grant
             # for `H` is acknowledged by the cache
-            function holds0(H : line) : bool
-            function holds1(H : line) : bool
+            function holds(C : bit, H : line) : bool
             # ---- permission is tracked beside possession.  Shared copies
             # may coexist; an exclusive copy excludes every other holder. ----
-            function exclusive0(H : line) : bool
-            function exclusive1(H : line) : bool
+            function exclusive(C : bit, H : line) : bool
 
             # ==========================================================
             # Channel 3 in flight, in TWO pieces, because the channel now
@@ -641,12 +637,9 @@ export action posedge
 
             after init {
                 img(H, O)     := init_img(H, O);
-                dirtied0(H, O)   := false;
-                dirtied1(H, O)   := false;
-                holds0(H)     := false;
-                holds1(H)     := false;
-                exclusive0(H) := false;
-                exclusive1(H) := false;
+                dirtied(C, H, O) := false;
+                holds(C, H)     := false;
+                exclusive(C, H) := false;
                 ack0_g_en := false; ack0_g_line := 0; ack0_g_dty := false;
                 ack1_g_en := false; ack1_g_line := 0; ack1_g_dty := false;
                 g3a_v := false; g3a_c := 0; g3a_l := 0; g3a_d := false;
@@ -663,14 +656,10 @@ export action posedge
                 # with the image at those words no matter which cache had
                 # been holding them. ----
                 if mc_body.cmd_en & mc_body.cmd_wen {
-                    dirtied0(H, O) := (false
+                    dirtied(C, H, O) := (false
                                     if (H = high(mc_body.cmd_addr)
                                         & beat_of(O) = beat_of(low(mc_body.cmd_addr)))
-                                    else dirtied0(H, O));
-                    dirtied1(H, O) := (false
-                                    if (H = high(mc_body.cmd_addr)
-                                        & beat_of(O) = beat_of(low(mc_body.cmd_addr)))
-                                    else dirtied1(H, O));
+                                    else dirtied(C, H, O));
                 };
 
                 # ---- a load answer is BINDING on the image.  With
@@ -700,17 +689,17 @@ export action posedge
                     img(H, O) := (c0_st_d
                                   if (H = c0_st_h & O = c0_st_o)
                                   else img(H, O));
-                    dirtied0(H, O) := (true
-                                    if (H = c0_st_h & O = c0_st_o)
-                                    else dirtied0(H, O));
+                    dirtied(C, H, O) := (true
+                                    if (C = 0 & H = c0_st_h & O = c0_st_o)
+                                    else dirtied(C, H, O));
                 };
                 if c1_st_en {
                     img(H, O) := (c1_st_d
                                   if (H = c1_st_h & O = c1_st_o)
                                   else img(H, O));
-                    dirtied1(H, O) := (true
-                                    if (H = c1_st_h & O = c1_st_o)
-                                    else dirtied1(H, O));
+                    dirtied(C, H, O) := (true
+                                    if (C = 1 & H = c1_st_h & O = c1_st_o)
+                                    else dirtied(C, H, O));
                 };
 
                 # ---- channel 3, per CPU: retire, then hand off, then
@@ -762,8 +751,6 @@ export action posedge
                 # enqueued, emptied when `process_ch2` pops it.  The two can
                 # never fire together -- a grant is only sent into an empty
                 # queue and a pop needs a non-empty one. ----
-                if c0_has_grant { gq0_v := false; };
-                if c1_has_grant { gq1_v := false; };
                 if c0_ch2_msg_taken & c0_ch2_msg_typ ~= ch2_inv {
                     gq0_v := true;
                     gq0_x := (c0_ch2_msg_typ = ch2_gex);
@@ -778,22 +765,12 @@ export action posedge
                 # ---- possession and permission follow POPPED grants and
                 # every channel-3 surrender, including invalidate replies. ----
                 if c0_give_en {
-                    holds0(H) := (false if H = c0_give_line else holds0(H));
-                    exclusive0(H) := (false if H = c0_give_line else exclusive0(H));
-                };
-                if c0_has_grant {
-                    holds0(H) := (true if H = c0_grant_line else holds0(H));
-                    exclusive0(H) := (c0_grant_excl if H = c0_grant_line
-                                      else exclusive0(H));
+                    holds(C, H) := (false if C = 0 & H = c0_give_line else holds(C, H));
+                    exclusive(C, H) := (false if C = 0 & H = c0_give_line else exclusive(C, H));
                 };
                 if c1_give_en {
-                    holds1(H) := (false if H = c1_give_line else holds1(H));
-                    exclusive1(H) := (false if H = c1_give_line else exclusive1(H));
-                };
-                if c1_has_grant {
-                    holds1(H) := (true if H = c1_grant_line else holds1(H));
-                    exclusive1(H) := (c1_grant_excl if H = c1_grant_line
-                                      else exclusive1(H));
+                    holds(C, H) := (false if C = 1 & H = c1_give_line else holds(C, H));
+                    exclusive(C, H) := (false if C = 1 & H = c1_give_line else exclusive(C, H));
                 };
             }
         }
@@ -894,13 +871,13 @@ export action posedge
 
                 
                 # The cache only surrenders lines it holds
-                invariant [ca_gv_hold_p0] c0_give_en -> holds0(c0_give_line)
+                invariant [ca_gv_hold_p0] c0_give_en -> holds(0, c0_give_line)
                 # Guarantee to the directory that if we don't hold a line, then
                 # it is not exclusive
-                invariant [ca_excl_hold_p0] exclusive0(H) -> holds0(H)
+                invariant [ca_excl_hold_p0] cachemem.exclusive(0, H) -> holds(0, H)
 
                 # Storing a line implies that we have exclusive perms
-                invariant [ca_st_excl_p0] c0_st_en -> exclusive0(c0_st_h)
+                invariant [ca_st_excl_p0] c0_st_en -> cachemem.exclusive(0, c0_st_h)
 
                 # We never start to give a new invalidate acknowledgement while there is an old invalidate
                 # acknowledgement waiting to be sent. 
@@ -912,29 +889,29 @@ export action posedge
                 # line is dirtied, so the directory may keep trusting its
                 # own copy of it.
                 invariant [ca_gv_clean_p0] c0_give_en & ~c0_give_dty ->
-                    ~dirtied0(c0_give_line, O)
+                    ~dirtied(0, c0_give_line, O)
                 # A dirty surrender is believable as the whole image only
                 # under SWMR: dirty implies the copy was Exclusive.
                 invariant [ca_gv_dirty_excl_p0] c0_give_en & c0_give_dty ->
-                    exclusive0(c0_give_line)
+                    cachemem.exclusive(0, c0_give_line)
 
                 # Write debt never floats unaccounted: a word is dirtied
                 # only while its line is held or while the dirty ack
                 # carrying it is in flight.
                 invariant [ca_dirtied_p0]
-                      ~holds0(H)
+                      ~holds(0, H)
                     & ~ack0_dty(H)
-                    -> ~dirtied0(H, O)
-                invariant [ca_dirtied_excl_p0] dirtied0(H, O) ->
-                      exclusive0(H)
+                    -> ~dirtied(0, H, O)
+                invariant [ca_dirtied_excl_p0] dirtied(0, H, O) ->
+                      cachemem.exclusive(0, H)
                     | ack0_dty(H)
 
                 # A clean ack vouches for nothing: no word of its line is dirtied.
                 invariant [ca_clean_ack_p0] ack0_any(H) & ~ack0_dty(H) ->
-                    ~dirtied0(H, O)
+                    ~dirtied(0, H, O)
 
                 # If we send an invalidate acknowledgement, then we don't hold the line
-                invariant [ca_ack_idle_p0] ack0_any(H) -> ~holds0(H)
+                invariant [ca_ack_idle_p0] ack0_any(H) -> ~holds(0, H)
 
                 # Data we send as part of the invalidate is valid
                 # 
@@ -950,16 +927,21 @@ export action posedge
                 invariant [ack_sync_dty_p0] ack0_g_en ->
                     c0_ack_dty = ack0_g_dty
 
-                # TODO: WTF do these do?
-                # Define `c0_ch2_msg_valid` such that the grant has been taken. 
+                # `c0_ch2_msg_valid` is true if we acknowledge the grant. 
                 invariant [ca_ch2_taken_valid_p0] c0_ch2_msg_taken ->
                     c0_ch2_msg_valid
-                # Ghost grant state matches what's at the top of the queue. 
-                # 
-                # It is necessary to maintain a ghost state about popped grants so that we can
-                # update `holds`
-                invariant [ca_gr_gq_p0] c0_has_grant ->
-                    gq0_v & c0_grant_line = gq0_l & c0_grant_excl = gq0_x
+                # Popped grants are from the top of the queue
+                invariant [ca_gr_gq_p0] has_grant ->
+                    gq0_v & grant_line = gq0_l & grant_excl = gq0_x
+
+                after posedge {
+                    if has_grant {
+                        gq0_v := false;
+                        holds(C, H) := (true if C = 0 & H = grant_line else holds(C, H));
+                        cachemem.exclusive(C, H) := (grant_excl if C = 0 & H = grant_line
+                                          else cachemem.exclusive(C, H));
+                    };
+                }
             }
 
             implementation {
@@ -1645,12 +1627,12 @@ export action posedge
                 invariant [c_img_p0] occupied(K, W) ->
                     val(K, W, O) = img(ltag(K, W), O)
                 invariant [c_clean_p0] occupied(K, W) & ~dirty(K, W) ->
-                    ~dirtied0(ltag(K, W), O)
+                    ~dirtied(0, ltag(K, W), O)
                 invariant [dirty_excl_p0] occupied(K, W) & dirty(K, W) ->
                     exclusive(K, W)
-                invariant [hold_inf_a_p0] occupied(K, W) -> holds0(ltag(K, W))
+                invariant [hold_inf_a_p0] occupied(K, W) -> holds(0, ltag(K, W))
                 invariant [excl_inf_a_p0] occupied(K, W) & exclusive(K, W) ->
-                    exclusive0(ltag(K, W))
+                    cachemem.exclusive(0, ltag(K, W))
 
                 # ==========================================================
                 # 3.2  The two MSHRs do not alias the array, or each other.
@@ -1692,9 +1674,9 @@ export action posedge
                 # 3.3  The fill buffers.
                 # ==========================================================
                 invariant [fill_clean_0_p0] s0_m_state = m_fill ->
-                    ~dirtied0(s0_m_base, O)
+                    ~dirtied(0, s0_m_base, O)
                 invariant [fill_clean_1_p0] s1_m_state = m_fill ->
-                    ~dirtied0(s1_m_base, O)
+                    ~dirtied(0, s1_m_base, O)
                 invariant [mfb_img_0_p0] s0_m_state = m_fill ->
                     lsel(s0_mfb, O) = img(s0_m_base, O)
                 invariant [mfb_img_1_p0] s1_m_state = m_fill ->
@@ -1702,25 +1684,27 @@ export action posedge
 
                 invariant [hold_inf_0_p0]
                     (s0_m_state = m_fill | s0_m_state = m_replay) ->
-                    holds0(s0_m_base)
+                    holds(0, s0_m_base)
                 invariant [hold_inf_1_p0]
                     (s1_m_state = m_fill | s1_m_state = m_replay) ->
-                    holds0(s1_m_base)
+                    holds(0, s1_m_base)
                 invariant [excl_inf_0_p0]
                     (s0_m_state = m_fill | s0_m_state = m_replay) & s0_m_excl ->
-                    exclusive0(s0_m_base)
+                    cachemem.exclusive(0, s0_m_base)
                 invariant [excl_inf_1_p0]
                     (s1_m_state = m_fill | s1_m_state = m_replay) & s1_m_excl ->
-                    exclusive0(s1_m_base)
+                    cachemem.exclusive(0, s1_m_base)
 
                 # ==========================================================
                 # 3.4  The channel-2 queue, and channel 2's NET NAMES.
                 #
-                # `[gr_push_empty0]` and `[grant_img_*0]` are the home's
-                # promises about the message on this cache's channel 2, and
-                # they are stated -- as they must be -- over the net names
-                # `c0_gr_valid`, `c0_gr_line`, `c0_gr_data` and
-                # `c0_ch2_empty`.  A definition is admitted into an isolate's
+                # `[gr_push_empty0]` and `[grant_img_*]` are the home's
+                # promises about the message on this cache's channel 2.
+                # The first is stated -- as it must be -- over the net names
+                # `c0_gr_valid` and `c0_ch2_empty`; the second is stated once
+                # over the uplink `x_ch2_msg_*` and reaches this cache only
+                # by unfolding through `c0_gr_valid`, `c0_gr_line` and
+                # `c0_gr_data`.  A definition is admitted into an isolate's
                 # query only when the defined symbol occurs in that isolate's
                 # OWN code or invariants; an occurrence inside an invariant
                 # imported from a sibling does NOT count (the note above the
@@ -1774,7 +1758,7 @@ export action posedge
                     q2_typ(qi(q2_head + 1)) = ch2_inv
 
                 # ---- and per BEAT, which is the granularity the home's
-                # promise arrives at (`[grant_img_lo0]`/`[grant_img_hi0]`).
+                # promise arrives at (`[grant_img_lo]`/`[grant_img_hi]`).
                 # Kept at that granularity all the way through the queue so
                 # the push is a SYNTACTIC match against the promise -- no
                 # `p_cover` round trip on an edge that is also moving two
@@ -1889,18 +1873,16 @@ export action posedge
 
                 
                 # The cache only surrenders lines it holds
-                invariant [ca_gv_hold_p1] c1_give_en -> holds1(c1_give_line)
-                # Guarantee to the directory that if we don't hold, then
-                # not exclusive
-                invariant [ca_excl_hold_p1] exclusive1(H) -> holds1(H)
+                invariant [ca_gv_hold_p1] c1_give_en -> holds(1, c1_give_line)
+                # Guarantee to the directory that if we don't hold a line, then
+                # it is not exclusive
+                invariant [ca_excl_hold_p1] cachemem.exclusive(1, H) -> holds(1, H)
 
                 # Storing a line implies that we have exclusive perms
-                invariant [ca_st_excl_p1] c1_st_en -> exclusive1(c1_st_h)
+                invariant [ca_st_excl_p1] c1_st_en -> cachemem.exclusive(1, c1_st_h)
 
-                # Cache only takes the invalidate line if it has a line to invalidate
-                invariant [ca_inv_reply_p1] c1_inv_taken ->
-                    c1_give_en & c1_give_line = c1_inv_pop_line
-
+                # We never start to give a new invalidate acknowledgement while there is an old invalidate
+                # acknowledgement waiting to be sent. 
                 invariant [ca_gv_nodouble_p1] c1_give_en -> ~ack1_g_en
 
                 invariant [ca_gv_nost_p1] c1_give_en -> ~c1_st_en
@@ -1909,36 +1891,34 @@ export action posedge
                 # line is dirtied, so the directory may keep trusting its
                 # own copy of it.
                 invariant [ca_gv_clean_p1] c1_give_en & ~c1_give_dty ->
-                    ~dirtied1(c1_give_line, O)
+                    ~dirtied(1, c1_give_line, O)
                 # A dirty surrender is believable as the whole image only
                 # under SWMR: dirty implies the copy was Exclusive.
                 invariant [ca_gv_dirty_excl_p1] c1_give_en & c1_give_dty ->
-                    exclusive1(c1_give_line)
+                    cachemem.exclusive(1, c1_give_line)
 
                 # Write debt never floats unaccounted: a word is dirtied
                 # only while its line is held or while the dirty ack
                 # carrying it is in flight.
                 invariant [ca_dirtied_p1]
-                      ~holds1(H)
+                      ~holds(1, H)
                     & ~ack1_dty(H)
-                    -> ~dirtied1(H, O)
-                invariant [ca_dirtied_excl_p1] dirtied1(H, O) ->
-                      exclusive1(H)
+                    -> ~dirtied(1, H, O)
+                invariant [ca_dirtied_excl_p1] dirtied(1, H, O) ->
+                      cachemem.exclusive(1, H)
                     | ack1_dty(H)
 
                 # A clean ack vouches for nothing: no word of its line is dirtied.
                 invariant [ca_clean_ack_p1] ack1_any(H) & ~ack1_dty(H) ->
-                    ~dirtied1(H, O)
+                    ~dirtied(1, H, O)
 
                 # If we send an invalidate acknowledgement, then we don't hold the line
-                invariant [ca_ack_idle_p1] ack1_any(H) -> ~holds1(H)
+                invariant [ca_ack_idle_p1] ack1_any(H) -> ~holds(1, H)
 
                 # Data we send as part of the invalidate is valid
                 # 
                 # This works since all dirtied lines are a result of completed stores,
                 # which means that they are reflected in `img`.
-                # ---- accurate at the PORT, where the directory latches
-                # it, and at the surrender that produced it. ----
                 invariant [ack_img_p1] c1_ack_en & c1_ack_dty ->
                     lsel(c1_ack_dat, O) = img(c1_ack_line, O)
 
@@ -1948,18 +1928,22 @@ export action posedge
                     c1_ack_line = ack1_g_line
                 invariant [ack_sync_dty_p1] ack1_g_en ->
                     c1_ack_dty = ack1_g_dty
-                # ---- the popped grant IS the home's queued-grant record,
-                # and an enqueue only happens when a message is really being
-                # sent.  Both are consequences of definitions PRIVATE to this
-                # isolate, and `cachemem`'s monitor moves `gq1_*`,
-                # `holds1` and `exclusive1` off exactly these wires: in the
-                # directory's query `c1_ch2_msg_taken` and `c1_has_grant`
-                # are opaque, so without these it must allow a grant record
-                # to materialise with no grant behind it. ----
+
+                # `c1_ch2_msg_valid` is true if we acknowledge the grant. 
                 invariant [ca_ch2_taken_valid_p1] c1_ch2_msg_taken ->
                     c1_ch2_msg_valid
-                invariant [ca_gr_gq_p1] c1_has_grant ->
-                    gq1_v & c1_grant_line = gq1_l & c1_grant_excl = gq1_x
+                # Popped grants are from the top of the queue
+                invariant [ca_gr_gq_p1] has_grant ->
+                    gq1_v & grant_line = gq1_l & grant_excl = gq1_x
+
+                after posedge {
+                    if has_grant {
+                        gq1_v := false;
+                        holds(C, H) := (true if C = 1 & H = grant_line else holds(C, H));
+                        cachemem.exclusive(C, H) := (grant_excl if C = 1 & H = grant_line
+                                          else cachemem.exclusive(C, H));
+                    };
+                }
             }
 
             implementation {
@@ -2645,12 +2629,12 @@ export action posedge
                 invariant [c_img_p1] occupied(K, W) ->
                     val(K, W, O) = img(ltag(K, W), O)
                 invariant [c_clean_p1] occupied(K, W) & ~dirty(K, W) ->
-                    ~dirtied1(ltag(K, W), O)
+                    ~dirtied(1, ltag(K, W), O)
                 invariant [dirty_excl_p1] occupied(K, W) & dirty(K, W) ->
                     exclusive(K, W)
-                invariant [hold_inf_a_p1] occupied(K, W) -> holds1(ltag(K, W))
+                invariant [hold_inf_a_p1] occupied(K, W) -> holds(1, ltag(K, W))
                 invariant [excl_inf_a_p1] occupied(K, W) & exclusive(K, W) ->
-                    exclusive1(ltag(K, W))
+                    cachemem.exclusive(1, ltag(K, W))
 
                 # ==========================================================
                 # 3.2  The two MSHRs do not alias the array, or each other.
@@ -2692,9 +2676,9 @@ export action posedge
                 # 3.3  The fill buffers.
                 # ==========================================================
                 invariant [fill_clean_0_p1] s0_m_state = m_fill ->
-                    ~dirtied1(s0_m_base, O)
+                    ~dirtied(1, s0_m_base, O)
                 invariant [fill_clean_1_p1] s1_m_state = m_fill ->
-                    ~dirtied1(s1_m_base, O)
+                    ~dirtied(1, s1_m_base, O)
                 invariant [mfb_img_0_p1] s0_m_state = m_fill ->
                     lsel(s0_mfb, O) = img(s0_m_base, O)
                 invariant [mfb_img_1_p1] s1_m_state = m_fill ->
@@ -2702,25 +2686,27 @@ export action posedge
 
                 invariant [hold_inf_0_p1]
                     (s0_m_state = m_fill | s0_m_state = m_replay) ->
-                    holds1(s0_m_base)
+                    holds(1, s0_m_base)
                 invariant [hold_inf_1_p1]
                     (s1_m_state = m_fill | s1_m_state = m_replay) ->
-                    holds1(s1_m_base)
+                    holds(1, s1_m_base)
                 invariant [excl_inf_0_p1]
                     (s0_m_state = m_fill | s0_m_state = m_replay) & s0_m_excl ->
-                    exclusive1(s0_m_base)
+                    cachemem.exclusive(1, s0_m_base)
                 invariant [excl_inf_1_p1]
                     (s1_m_state = m_fill | s1_m_state = m_replay) & s1_m_excl ->
-                    exclusive1(s1_m_base)
+                    cachemem.exclusive(1, s1_m_base)
 
                 # ==========================================================
                 # 3.4  The channel-2 queue, and channel 2's NET NAMES.
                 #
-                # `[gr_push_empty1]` and `[grant_img_*1]` are the home's
-                # promises about the message on this cache's channel 2, and
-                # they are stated -- as they must be -- over the net names
-                # `c1_gr_valid`, `c1_gr_line`, `c1_gr_data` and
-                # `c1_ch2_empty`.  A definition is admitted into an isolate's
+                # `[gr_push_empty1]` and `[grant_img_*]` are the home's
+                # promises about the message on this cache's channel 2.
+                # The first is stated -- as it must be -- over the net names
+                # `c1_gr_valid` and `c1_ch2_empty`; the second is stated once
+                # over the uplink `x_ch2_msg_*` and reaches this cache only
+                # by unfolding through `c1_gr_valid`, `c1_gr_line` and
+                # `c1_gr_data`.  A definition is admitted into an isolate's
                 # query only when the defined symbol occurs in that isolate's
                 # OWN code or invariants; an occurrence inside an invariant
                 # imported from a sibling does NOT count (the note above the
@@ -2774,7 +2760,7 @@ export action posedge
                     q2_typ(qi(q2_head + 1)) = ch2_inv
 
                 # ---- and per BEAT, which is the granularity the home's
-                # promise arrives at (`[grant_img_lo1]`/`[grant_img_hi1]`).
+                # promise arrives at (`[grant_img_lo]`/`[grant_img_hi]`).
                 # Kept at that granularity all the way through the queue so
                 # the push is a SYNTACTIC match against the promise -- no
                 # `p_cover` round trip on an edge that is also moving two
@@ -2850,7 +2836,7 @@ export action posedge
                                        if (H = high(cmd_addr)
                                            & beat_of(O) = beat_of(low(cmd_addr)))
                                        else mmem(H, O));
-                        # (the matching `dirtied0`/`dirtied1` CLEAR lives in
+                        # (the matching `dirtied` CLEAR lives in
                         # `cachemem`'s monitor, ahead of the store arm, so
                         # a same-edge store-set wins)
                     };
@@ -2870,7 +2856,7 @@ export action posedge
                 # closing entirely.
                 # ==========================================================
 
-                invariant [mc_owns_img] ~dirtied0(H, O) & ~dirtied1(H, O) ->
+                invariant [mc_owns_img] ~dirtied(0, H, O) & ~dirtied(1, H, O) ->
                     mmem(H, O) = img(H, O)
 
                 before posedge {
@@ -3074,7 +3060,7 @@ export action posedge
             # cannot be writing on the edge it is driven.  Stated over
             # `holds*`/`exclusive*` that is a POST-state property of ghost
             # state the home moves off wires it cannot see, and the home
-            # cannot prove it -- the `~holds1` form of this promise did not
+            # cannot prove it -- the `~holds` form of this promise did not
             # come back.  Stated
             # over these bits it is definitional on both sides --
             # `[gr_msg_notdsh*]` is one unfolding of `inv_settled`, and the
@@ -3090,26 +3076,18 @@ export action posedge
                 function dir(H : line, O : woffset) : word
                 definition dir(H, O) = mc_body.mmem(H, O)
 
-                invariant [dir_img] ~dirtied0(H, O) & ~dirtied1(H, O) ->
+                invariant [dir_img] ~dirtied(0, H, O) & ~dirtied(1, H, O) ->
                     dir(H, O) = img(H, O)
 
                 # Shared holders may coexist.  Only an Exclusive holder
                 # excludes every copy in the other cache.
-                invariant [swmr0] exclusive0(H) -> ~holds1(H)
-                invariant [swmr1] exclusive1(H) -> ~holds0(H)
+                invariant [swmr] exclusive(C, H) & D ~= C -> ~holds(D, H)
 
-                # Granted data is accurate.  At the MESSAGE: the consumer's
-                # channel-2 queue latches it on the edge it is sent, and
-                # carries the fact forward over its own entries from there
-                # (`[q2_img_*]`).
-                invariant [grant_img_lo0] c0_gr_valid ->
-                    lsel(c0_gr_data, concatbv2(0, J)) = img(c0_gr_line, concatbv2(0, J))
-                invariant [grant_img_hi0] c0_gr_valid ->
-                    lsel(c0_gr_data, concatbv2(1, J)) = img(c0_gr_line, concatbv2(1, J))
-                invariant [grant_img_lo1] c1_gr_valid ->
-                    lsel(c1_gr_data, concatbv2(0, J)) = img(c1_gr_line, concatbv2(0, J))
-                invariant [grant_img_hi1] c1_gr_valid ->
-                    lsel(c1_gr_data, concatbv2(1, J)) = img(c1_gr_line, concatbv2(1, J))
+                # Granted data is accurate.  
+                invariant [grant_img_lo] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                    lsel(x_ch2_msg_data, concatbv2(0, J)) = img(x_ch2_msg_line, concatbv2(0, J))
+                invariant [grant_img_hi] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                    lsel(x_ch2_msg_data, concatbv2(1, J)) = img(x_ch2_msg_line, concatbv2(1, J))
 
                 invariant [wb_img] cmd_en & cmd_wen ->
                     wsel4(cmd_data, J) =
@@ -3141,11 +3119,11 @@ export action posedge
                 # caches' `[ca_dirtied_p*]` is preserved by on the edge the
                 # mirror slot empties. ----
                 invariant [wb_done0] ack_done & ack_done_cpu = 0 ->
-                      ~dirtied0(ack_done_line, O)
-                    & ~dirtied1(ack_done_line, O)
+                      ~dirtied(0, ack_done_line, O)
+                    & ~dirtied(1, ack_done_line, O)
                 invariant [wb_done1] ack_done & ack_done_cpu = 1 ->
-                      ~dirtied0(ack_done_line, O)
-                    & ~dirtied1(ack_done_line, O)
+                      ~dirtied(0, ack_done_line, O)
+                    & ~dirtied(1, ack_done_line, O)
 
                 # ==========================================================
                 # What a QUEUED grant means.
@@ -3189,35 +3167,27 @@ export action posedge
                 # reason: `[q2_img_*]` has to know the payload it is latching
                 # is accurate to the image AFTER this edge's stores.
                 # ==========================================================
-                invariant [gr_msg_notack_g0] c0_gr_valid ->
-                    ~(ack0_g_en & ack0_g_line = c0_gr_line)
-                invariant [gr_msg_notack_q0] c0_gr_valid ->
-                    ~ack0_q(c0_gr_line)
-                invariant [gr_msg_notack_g1] c1_gr_valid ->
-                    ~(ack1_g_en & ack1_g_line = c1_gr_line)
-                invariant [gr_msg_notack_q1] c1_gr_valid ->
-                    ~ack1_q(c1_gr_line)
-                invariant [gr_msg_clean0] c0_gr_valid ->
-                    ~dirtied0(c0_gr_line, O) & ~dirtied1(c0_gr_line, O)
-                invariant [gr_msg_clean1] c1_gr_valid ->
-                    ~dirtied0(c1_gr_line, O) & ~dirtied1(c1_gr_line, O)
-                invariant [gr_msg_excl0i] c0_gr_valid & c0_gr_excl ->
-                    ~holds1(c0_gr_line)
-                invariant [gr_msg_excl1i] c1_gr_valid & c1_gr_excl ->
-                    ~holds0(c1_gr_line)
-                invariant [gr_msg_shared0i] c0_gr_valid ->
-                    ~exclusive1(c0_gr_line)
-                invariant [gr_msg_shared1i] c1_gr_valid ->
-                    ~exclusive0(c1_gr_line)
+                invariant [gr_msg_notack_g] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                      ~(ack0_g_en & ack0_g_line = x_ch2_msg_line)
+                    & ~(ack1_g_en & ack1_g_line = x_ch2_msg_line)
+                invariant [gr_msg_notack_q] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                    ~ack0_q(x_ch2_msg_line) & ~ack1_q(x_ch2_msg_line)
+                invariant [gr_msg_clean] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                    ~dirtied(C, x_ch2_msg_line, O)
+                invariant [gr_msg_excl] x_ch2_msg_valid & x_ch2_msg_typ = ch2_gex ->
+                    ~holds(C, x_ch2_msg_line)
+                invariant [gr_msg_shared] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                    ~exclusive(C, x_ch2_msg_line)
                 # ---- the granted line has no sharer bit for the requester,
                 # which is `inv_settled` restated at the port: ONE unfolding,
                 # no ghost state, nothing about possession.  Paired with
                 # `[d_exact*]` just below, the consumer gets `~holds*` and then
                 # `~exclusive*` entirely inside its own pre-state. ----
-                invariant [gr_msg_notdsh0] c0_gr_valid -> ~dsh0(c0_gr_line)
-                invariant [gr_msg_notdsh1] c1_gr_valid -> ~dsh1(c1_gr_line)
-                invariant [d_exact0] holds0(H) -> dsh0(H)
-                invariant [d_exact1] holds1(H) -> dsh1(H)
+                invariant [gr_msg_notdsh] x_ch2_msg_valid & x_ch2_msg_typ ~= ch2_inv ->
+                      (x_ch2_msg_cpu ~= 0 | ~dsh0(x_ch2_msg_line))
+                    & (x_ch2_msg_cpu ~= 1 | ~dsh1(x_ch2_msg_line))
+                invariant [d_exact] holds(C, H) ->
+                    (C ~= 0 | dsh0(H)) & (C ~= 1 | dsh1(H))
 
                 # ---- split per STAGE of channel 3.  `~ackN_any` is a
                 # conjunction of the producer's slot and the home's queue, and
@@ -3228,17 +3198,17 @@ export action posedge
                 invariant [gr_notack_g1] gq1_v -> ~(ack1_g_en & ack1_g_line = gq1_l)
                 invariant [gr_notack_q1] gq1_v -> ~ack1_q(gq1_l)
                 invariant [gr_clean0] gq0_v ->
-                    ~dirtied0(gq0_l, O) & ~dirtied1(gq0_l, O)
+                    ~dirtied(0, gq0_l, O) & ~dirtied(1, gq0_l, O)
                 invariant [gr_clean1] gq1_v ->
-                    ~dirtied0(gq1_l, O) & ~dirtied1(gq1_l, O)
+                    ~dirtied(0, gq1_l, O) & ~dirtied(1, gq1_l, O)
 
-                invariant [gr_excl0i] gq0_v & gq0_x -> ~holds1(gq0_l)
-                invariant [gr_excl1i] gq1_v & gq1_x -> ~holds0(gq1_l)
-                invariant [gr_shared0i] gq0_v -> ~exclusive1(gq0_l)
-                invariant [gr_shared1i] gq1_v -> ~exclusive0(gq1_l)
+                invariant [gr_excl0i] gq0_v & gq0_x -> ~holds(1, gq0_l)
+                invariant [gr_excl1i] gq1_v & gq1_x -> ~holds(0, gq1_l)
+                invariant [gr_shared0i] gq0_v -> ~exclusive(1, gq0_l)
+                invariant [gr_shared1i] gq1_v -> ~exclusive(0, gq1_l)
 
-                invariant [gq_nothold0] gq0_v -> ~holds0(gq0_l)
-                invariant [gq_nothold1] gq1_v -> ~holds1(gq1_l)
+                invariant [gq_nothold0] gq0_v -> ~holds(0, gq0_l)
+                invariant [gq_nothold1] gq1_v -> ~holds(1, gq1_l)
 
                 # ---- a grant is sent only into an EMPTY channel-2 queue.
                 # That is what keeps a grant at the head of the consumer's
@@ -3249,21 +3219,21 @@ export action posedge
                 invariant [gr_push_empty0] c0_gr_valid -> c0_ch2_empty
                 invariant [gr_push_empty1] c1_gr_valid -> c1_ch2_empty
 
-                invariant [ack_excl0] ack0_dty(H) -> ~holds1(H)
-                invariant [ack_excl1] ack1_dty(H) -> ~holds0(H)
+                invariant [ack_excl0] ack0_dty(H) -> ~holds(1, H)
+                invariant [ack_excl1] ack1_dty(H) -> ~holds(0, H)
 
                 # ---- German's at-most-one-exclusive corollary, over the
                 # permission ghosts: `~(cacheExclusive(C) & cacheExclusive(D))`
                 # for the two clients.  Falls out of `[d_ex*]` + `[dex_one]`. ----
-                invariant [g_one_excl] ~(exclusive0(H) & exclusive1(H))
+                invariant [g_one_excl] ~(exclusive(0, H) & exclusive(1, H))
 
-                invariant [commit_safe0] exclusive0(H) ->
-                      ~holds1(H)
+                invariant [commit_safe0] exclusive(0, H) ->
+                      ~holds(1, H)
                     & ~ack1_dty(H)
                     & ~(gq1_v & gq1_l = H)
                     & ~(c1_gr_valid & c1_gr_line = H)
-                invariant [commit_safe1] exclusive1(H) ->
-                      ~holds0(H)
+                invariant [commit_safe1] exclusive(1, H) ->
+                      ~holds(0, H)
                     & ~ack0_dty(H)
                     & ~(gq0_v & gq0_l = H)
                     & ~(c0_gr_valid & c0_gr_line = H)
@@ -3917,7 +3887,7 @@ export action posedge
                     | wb_st = wb_rhi | wb_st = wb_rwhi ->
                     dstate_r ~= d_idle & ~d_have & inv_settled
                 invariant [wb_ret_clean] wb_st = wb_ret ->
-                    ~dirtied0(wb_line, O) & ~dirtied1(wb_line, O)
+                    ~dirtied(0, wb_line, O) & ~dirtied(1, wb_line, O)
 
                 invariant [wb_cmd] ev_cmd & ev_cmd_wen ->
                     high(ev_cmd_addr) = wb_line
@@ -3936,9 +3906,9 @@ export action posedge
                     & high(ev_cmd_addr) = cr_line
 
                 invariant [wb_lo_clean] wb_lo_done & beat_of(O) = 0
-                    -> ~dirtied0(wb_line, O) & ~dirtied1(wb_line, O)
+                    -> ~dirtied(0, wb_line, O) & ~dirtied(1, wb_line, O)
                 invariant [wb_hi_clean] wb_hi_done & beat_of(O) = 1
-                    -> ~dirtied0(wb_line, O) & ~dirtied1(wb_line, O)
+                    -> ~dirtied(0, wb_line, O) & ~dirtied(1, wb_line, O)
                 invariant [wb_ghost_idle] wb_st = wb_idle
                     -> ~wb_lo_done & ~wb_hi_done
 
@@ -4050,8 +4020,7 @@ export action posedge
                 # ---- a SHARED holder implies nobody holds the line
                 # exclusively.  The other direction of `[d_ex*]`, and the
                 # concrete form of `cacheShared -> ~homeExclusiveGranted`. ----
-                invariant [g_cacheS_dir0] holds0(H) & ~exclusive0(H) -> ~dex(H)
-                invariant [g_cacheS_dir1] holds1(H) & ~exclusive1(H) -> ~dex(H)
+                invariant [g_cacheS_dir] holds(C, H) & ~exclusive(C, H) -> ~dex(H)
 
                 # ---- an invalidate belongs to the request in progress: it is
                 # posted in `d_inv` for `cr_line` and retired before the
@@ -4086,8 +4055,8 @@ export action posedge
                 invariant [inv_live1] inv_v & inv_c = 1 ->
                     dsh1(inv_l) & (cr_excl | dex(inv_l))
 
-                invariant [d_ex0] exclusive0(H) -> dex(H) & dsh0(H)
-                invariant [d_ex1] exclusive1(H) -> dex(H) & dsh1(H)
+                invariant [d_ex0] exclusive(0, H) -> dex(H) & dsh0(H)
+                invariant [d_ex1] exclusive(1, H) -> dex(H) & dsh1(H)
                 invariant [dex_one] dex(H) -> ~(dsh0(H) & dsh1(H))
 
                 # ---- a dirty ack comes from the cache that had write
@@ -4116,8 +4085,8 @@ export action posedge
                 invariant [dfb_noex] d_have -> ~dex(cr_line)
                 # ---- per BEAT, not per word.  Everything that consumes this
                 # consumes it beat-granular: `dfb` IS `ch2_msg_data`, and the
-                # promise the caches read off it -- `[grant_img_lo*]` /
-                # `[grant_img_hi*]` -- is already stated at `concatbv2(B, J)`
+                # promise the caches read off it -- `[grant_img_lo]` /
+                # `[grant_img_hi]` -- is already stated at `concatbv2(B, J)`
                 # offsets, with the bridge to a word-granular `lsel(_, O)` paid
                 # once inside each cache at the fill (`[mfb_img_*]`).
                 #
@@ -4134,7 +4103,7 @@ export action posedge
                 invariant [dfb_img_hi] d_have ->
                     lsel(dfb, concatbv2(1, J)) = img(cr_line, concatbv2(1, J))
                 invariant [dfb_clean] d_have ->
-                    ~dirtied0(cr_line, O) & ~dirtied1(cr_line, O)
+                    ~dirtied(0, cr_line, O) & ~dirtied(1, cr_line, O)
                 invariant [dfb_idle] dstate_r = d_idle -> ~d_have
 
                 # ---- the read ladder's half-filled buffer.  `dfb` is not
@@ -4146,7 +4115,7 @@ export action posedge
                     & (wb_st = wb_rlo | wb_st = wb_rwlo | wb_st = wb_rhi
                        | wb_st = wb_rwhi) ->
                       ~dex(cr_line)
-                    & ~dirtied0(cr_line, O) & ~dirtied1(cr_line, O)
+                    & ~dirtied(0, cr_line, O) & ~dirtied(1, cr_line, O)
             }
 
         } with this, mc_body, cache0_body, cache1_body, xbar_body, addr_thy, basis, data_impl
@@ -4209,7 +4178,7 @@ export action posedge
             # private to its isolate, and the directory's query has to unfold
             # `x_ack_en`, `x_src` and `x_ack_dat` through this mux to reach
             # `cN_ack_*` at all -- behind `implementation` those three would
-            # be opaque constants, `[grant_img_lo0]` would have nothing to
+            # be opaque constants, `[grant_img_lo]` would have nothing to
             # unfold to and `[xb_wb_own]` would have no transition to be
             # preserved by.  Public is what a crossbar has to be.
             #
@@ -4332,9 +4301,6 @@ export action posedge
         definition c0_ch2_msg_data  = xbar_body.ch2_msg_data0
         definition c0_ch2_msg_taken = cache0_body.ch2_msg_taken
         definition c0_ch2_empty   = cache0_body.ch2_empty
-        definition c0_has_grant   = cache0_body.has_grant
-        definition c0_grant_excl  = cache0_body.grant_excl
-        definition c0_grant_line  = cache0_body.grant_line
         definition c0_inv_taken = cache0_body.inv_taken
         definition c0_st_en     = cache0_body.st_en
         definition c0_st_h      = cache0_body.st_h
@@ -4360,10 +4326,6 @@ export action posedge
         definition c1_ch2_msg_data  = xbar_body.ch2_msg_data1
         definition c1_ch2_msg_taken = cache1_body.ch2_msg_taken
         definition c1_ch2_empty   = cache1_body.ch2_empty
-        definition c1_has_grant   = cache1_body.has_grant
-        definition c1_grant_excl  = cache1_body.grant_excl
-        definition c1_grant_line  = cache1_body.grant_line
-        definition c1_inv_pop_line = cache1_body.inv_pop_line
         definition c1_inv_taken = cache1_body.inv_taken
         definition c1_st_en     = cache1_body.st_en
         definition c1_st_h      = cache1_body.st_h
